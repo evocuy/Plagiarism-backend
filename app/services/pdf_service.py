@@ -26,37 +26,60 @@ class PDFService:
             return True
         return False
 
-    def detect_skripsi_content_pages(self, doc: pymupdf.Document) -> tuple[int, int]:
+    def _is_chapter_heading(self, page_text: str, chapter_roman: str, chapter_arabic: str) -> bool:
+        """
+        Mendeteksi apakah halaman ini memuat permulaan resmi bab terkait.
+        Abaikan jika halaman tersebut adalah daftar isi atau bagian sistematika penulisan (di mana banyak bab disebut sekaligus).
+        """
+        if self._is_table_of_contents_page(page_text):
+            return False
+
+        lines = [line.strip() for line in page_text.split('\n') if line.strip()]
+        # Jika di halaman ini muncul lebih dari 1 penyebutan BAB (misalnya pada bagian sistematika penulisan 1.6 / 1.5),
+        # maka ini BUKAN halaman awal bab sesungguhnya.
+        bab_lines = [l for l in lines if re.match(r'^BAB\s+[IVX0-9]+', l, re.IGNORECASE)]
+        if len(bab_lines) > 1:
+            return False
+
+        for line in lines:
+            line_clean = line.strip().upper()
+            if line_clean == f'BAB {chapter_roman}' or line_clean == f'BAB {chapter_arabic}':
+                return True
+            if line_clean.startswith(f'BAB {chapter_roman} ') or line_clean.startswith(f'BAB {chapter_arabic} '):
+                return True
+        return False
+
+    def detect_content_pages(self, doc: pymupdf.Document, document_type: str = "skripsi") -> tuple[int, int]:
+        """
+        Mendeteksi rentang halaman yang diperiksa:
+        - Skripsi: BAB 1 sampai BAB 5 / DAFTAR PUSTAKA.
+        - Proposal / Sempro: BAB 1 sampai akhir BAB 3 (berhenti saat BAB 4 atau DAFTAR PUSTAKA ditemukan).
+        """
         total_pages = len(doc)
         if total_pages == 0:
             return (0, 0)
 
+        is_sempro = any(k in (document_type or "").lower() for k in ["sempro", "proposal"])
         start_page = 0
         end_page = total_pages - 1
 
-        bab1_pattern = re.compile(r'\bBAB\s+(?:1|I|SATU)\b', re.IGNORECASE)
-        found_start = False
-
+        # Cari halaman BAB 1 yang valid
         for page_idx in range(total_pages):
             page_text = doc[page_idx].get_text()
             if not page_text or not page_text.strip():
                 continue
 
-            if self._is_table_of_contents_page(page_text):
-                continue
-
-            if bab1_pattern.search(page_text):
+            if self._is_chapter_heading(page_text, 'I', '1'):
                 start_page = page_idx
-                found_start = True
                 break
 
+        # Pola penutup: Daftar Pustaka / Lampiran
         closing_pattern = re.compile(
             r'^\s*(?:DAFTAR\s+PUSTAKA|DAFTAR\s+REFERENSI|DAFTAR\s+LITERATUR|BIBLIOGRAPHY|LAMPIRAN)\b',
             re.IGNORECASE | re.MULTILINE
         )
 
-        search_end_start = start_page if found_start else 0
-        for page_idx in range(search_end_start, total_pages):
+        for page_idx in range(start_page, total_pages):
             page_text = doc[page_idx].get_text()
             if not page_text:
                 continue
@@ -64,7 +87,18 @@ class PDFService:
             if self._is_table_of_contents_page(page_text):
                 continue
 
-            if closing_pattern.search(page_text):
+            # Jika proposal/sempro, berhenti ketika memasuki BAB 4
+            if is_sempro and self._is_chapter_heading(page_text, 'IV', '4'):
+                if page_idx > start_page:
+                    end_page = page_idx - 1
+                else:
+                    end_page = page_idx
+                break
+
+            # Berhenti jika mencapai Daftar Pustaka / Lampiran (dan bukan di halaman rangkuman sistematika)
+            lines = [l.strip() for l in page_text.split('\n') if l.strip()]
+            bab_count = sum(1 for l in lines if re.match(r'^BAB\s+[IVX0-9]+', l, re.IGNORECASE))
+            if bab_count <= 1 and closing_pattern.search(page_text):
                 if page_idx > start_page:
                     end_page = page_idx - 1
                 else:
@@ -73,7 +107,11 @@ class PDFService:
 
         return (start_page, end_page)
 
-    def extract_text_from_pdf(self, file_path: str, filter_bab: bool = True) -> Dict[str, Any]:
+    def detect_skripsi_content_pages(self, doc: pymupdf.Document) -> tuple[int, int]:
+        """Backward-compatibility wrapper."""
+        return self.detect_content_pages(doc, document_type="skripsi")
+
+    def extract_text_from_pdf(self, file_path: str, filter_bab: bool = True, document_type: str = "skripsi") -> Dict[str, Any]:
         resolved_path = self._resolve_path(file_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
@@ -85,7 +123,7 @@ class PDFService:
         end_page = max(0, total_pages - 1)
 
         if filter_bab and total_pages > 1:
-            start_page, end_page = self.detect_skripsi_content_pages(doc)
+            start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
 
         full_text = []
         pages_data = []
@@ -112,7 +150,7 @@ class PDFService:
             'pages': pages_data
         }
 
-    def extract_sentences_with_pages(self, file_path: str, filter_bab: bool = True):
+    def extract_sentences_with_pages(self, file_path: str, filter_bab: bool = True, document_type: str = "skripsi"):
         resolved_path = self._resolve_path(file_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
@@ -123,7 +161,7 @@ class PDFService:
         end_page = max(0, total_pages - 1)
 
         if filter_bab and total_pages > 1:
-            start_page, end_page = self.detect_skripsi_content_pages(doc)
+            start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
 
         sentences_info = []
 

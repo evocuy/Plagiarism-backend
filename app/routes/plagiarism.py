@@ -38,8 +38,8 @@ def check_similarity(
     if not doc_a or not doc_b:
         raise HTTPException(status_code=404, detail="Salah satu atau kedua dokumen tidak ditemukan di database.")
 
-    data_a = pdf_service.extract_text_from_pdf(doc_a.file_path)
-    data_b = pdf_service.extract_text_from_pdf(doc_b.file_path)
+    data_a = pdf_service.extract_text_from_pdf(doc_a.file_path, document_type=doc_a.document_type)
+    data_b = pdf_service.extract_text_from_pdf(doc_b.file_path, document_type=doc_b.document_type)
 
     clean_a = preprocessor.clean_text(data_a["full_text"])
     clean_b = preprocessor.clean_text(data_b["full_text"])
@@ -67,8 +67,8 @@ def check_similarity(
     highlighted_file = None
     plagiarized_sentences = []
     try:
-        sentences_a = pdf_service.extract_sentences_with_pages(doc_a.file_path)
-        sentences_b = pdf_service.extract_sentences_with_pages(doc_b.file_path)
+        sentences_a = pdf_service.extract_sentences_with_pages(doc_a.file_path, document_type=doc_a.document_type)
+        sentences_b = pdf_service.extract_sentences_with_pages(doc_b.file_path, document_type=doc_b.document_type)
 
         clean_b_sentences = [preprocessor.clean_text(s["sentence"]) for s in sentences_b]
         valid_b_indices = [idx for idx, c in enumerate(clean_b_sentences) if len(c.strip()) > 0]
@@ -130,8 +130,14 @@ def check_against_repository(
     if not target_doc:
         raise HTTPException(status_code=404, detail="Dokumen target tidak ditemukan.")
 
-    repo_docs = db.query(Document).filter(Document.id != document_id).all()
-    effective_user_id = current_user.id if current_user else target_doc.user_id
+    # Kecualikan dokumen target dan seluruh dokumen milik user yang sama (agar file revisi tidak terdeteksi plagiat terhadap file sendiri)
+    target_owner_id = target_doc.user_id or (current_user.id if current_user else None)
+    repo_query = db.query(Document).filter(Document.id != document_id)
+    if target_owner_id is not None:
+        repo_query = repo_query.filter(Document.user_id != target_owner_id)
+
+    repo_docs = repo_query.all()
+    effective_user_id = target_owner_id
 
     # Jika repositori belum memiliki dokumen lain
     if not repo_docs:
@@ -167,7 +173,7 @@ def check_against_repository(
         }
 
     try:
-        target_data = pdf_service.extract_text_from_pdf(target_doc.file_path)
+        target_data = pdf_service.extract_text_from_pdf(target_doc.file_path, document_type=target_doc.document_type)
         clean_target = preprocessor.clean_text(target_data["full_text"])
     except Exception as e:
         logger.error(f"Gagal mengekstrak teks dari dokumen target {target_doc.id}: {e}")
@@ -184,7 +190,7 @@ def check_against_repository(
 
     for repo_doc in repo_docs:
         try:
-            repo_data = pdf_service.extract_text_from_pdf(repo_doc.file_path)
+            repo_data = pdf_service.extract_text_from_pdf(repo_doc.file_path, document_type=repo_doc.document_type)
             clean_repo = preprocessor.clean_text(repo_data["full_text"])
 
             if not clean_target.strip() or not clean_repo.strip():
@@ -205,7 +211,7 @@ def check_against_repository(
             })
 
             # Ekstrak kalimat dari repo doc untuk deteksi highlight
-            sentences_repo = pdf_service.extract_sentences_with_pages(repo_doc.file_path)
+            sentences_repo = pdf_service.extract_sentences_with_pages(repo_doc.file_path, document_type=repo_doc.document_type)
             for s in sentences_repo:
                 c_text = preprocessor.clean_text(s["sentence"])
                 if c_text.strip():
@@ -235,7 +241,7 @@ def check_against_repository(
     highlighted_file = None
     plagiarized_sentences = []
     try:
-        sentences_target = pdf_service.extract_sentences_with_pages(target_doc.file_path)
+        sentences_target = pdf_service.extract_sentences_with_pages(target_doc.file_path, document_type=target_doc.document_type)
         if repo_sentences_all and sentences_target:
             corpus_repo = [item["clean"] for item in repo_sentences_all]
             s_vec = TfidfVectorizer().fit(corpus_repo)
