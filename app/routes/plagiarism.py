@@ -117,6 +117,7 @@ def check_similarity(
         "status": check_record.status,
         "total_plagiarized_sentences": len(plagiarized_sentences),
         "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
+        "chapter_validation": data_a.get("chapter_validation"),
     }
 
 @router.post("/check-repository/{document_id}")
@@ -162,6 +163,13 @@ def check_against_repository(
         db.commit()
         db.refresh(check_record)
 
+        target_validation = None
+        try:
+            target_data_init = pdf_service.extract_text_from_pdf(target_doc.file_path, document_type=target_doc.document_type)
+            target_validation = target_data_init.get("chapter_validation")
+        except Exception:
+            pass
+
         return {
             "check_id": check_record.id,
             "target_document": target_doc.title,
@@ -170,6 +178,7 @@ def check_against_repository(
             "matches": [],
             "message": "Dokumen berhasil disimpan. Belum ada dokumen lain di repositori kampus untuk dibandingkan.",
             "highlighted_pdf_available": True,
+            "chapter_validation": target_validation,
         }
 
     try:
@@ -286,6 +295,7 @@ def check_against_repository(
         "matches": results,
         "total_plagiarized_sentences": len(plagiarized_sentences),
         "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
+        "chapter_validation": target_data.get("chapter_validation"),
     }
 
 @router.get("/history")

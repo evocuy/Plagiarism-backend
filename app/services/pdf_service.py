@@ -107,6 +107,74 @@ class PDFService:
 
         return (start_page, end_page)
 
+    def detect_chapters_in_doc(self, doc: pymupdf.Document, document_type: str = "skripsi") -> Dict[str, Any]:
+        """
+        Mendeteksi BAB apa saja yang ditemukan di dokumen dan memvalidasi kesesuaian jumlah BAB:
+        - Skripsi: standar 5 BAB. Berikan warning jika BAB kurang dari 5.
+        - Proposal / Sempro: standar 3 BAB. Berikan warning jika BAB kurang dari 3 atau lebih dari 3.
+        """
+        total = len(doc)
+        chapter_defs = [
+            (1, 'I', '1'),
+            (2, 'II', '2'),
+            (3, 'III', '3'),
+            (4, 'IV', '4'),
+            (5, 'V', '5'),
+            (6, 'VI', '6'),
+        ]
+        found_chapters = []
+        for num, roman, arabic in chapter_defs:
+            for page_idx in range(total):
+                txt = doc[page_idx].get_text()
+                if self._is_chapter_heading(txt, roman, arabic):
+                    found_chapters.append({
+                        "chapter": num,
+                        "roman": roman,
+                        "page": page_idx + 1
+                    })
+                    break
+
+        total_detected = len(found_chapters)
+        is_sempro = any(k in (document_type or "").lower() for k in ["sempro", "proposal"])
+        has_warning = False
+        warning_type = None
+        warning_message = None
+
+        if is_sempro:
+            if total_detected > 3:
+                has_warning = True
+                warning_type = "PROPOSAL_CHAPTER_OVERFLOW"
+                warning_message = (
+                    f"Perhatian: Anda mengunggah dokumen dengan tipe 'Proposal', namun sistem mendeteksi ada "
+                    f"{total_detected} BAB (ditemukan hingga BAB {found_chapters[-1]['chapter']}). "
+                    f"Apakah Anda keliru mengunggah draf Skripsi lengkap?"
+                )
+            elif total_detected < 3:
+                has_warning = True
+                warning_type = "PROPOSAL_CHAPTER_INCOMPLETE"
+                warning_message = (
+                    f"Perhatian: Anda memilih tipe 'Proposal' (Seminar Proposal), namun sistem hanya mendeteksi "
+                    f"{total_detected} BAB dari standar 3 BAB."
+                )
+        else:
+            # Mode Skripsi
+            if total_detected < 5:
+                has_warning = True
+                warning_type = "SKRIPSI_CHAPTER_INCOMPLETE"
+                warning_message = (
+                    f"Perhatian: Anda memilih tipe 'Skripsi', namun dokumen hanya memuat "
+                    f"{total_detected} BAB dari standar 5 BAB (ditemukan hanya hingga BAB {found_chapters[-1]['chapter'] if found_chapters else 0}). "
+                    f"Apakah Anda keliru mengunggah dokumen Proposal?"
+                )
+
+        return {
+            "total_chapters_detected": total_detected,
+            "detected_chapters": found_chapters,
+            "has_warning": has_warning,
+            "warning_type": warning_type,
+            "warning_message": warning_message,
+        }
+
     def detect_skripsi_content_pages(self, doc: pymupdf.Document) -> tuple[int, int]:
         """Backward-compatibility wrapper."""
         return self.detect_content_pages(doc, document_type="skripsi")
@@ -124,6 +192,8 @@ class PDFService:
 
         if filter_bab and total_pages > 1:
             start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
+
+        chapter_validation = self.detect_chapters_in_doc(doc, document_type=document_type)
 
         full_text = []
         pages_data = []
@@ -147,6 +217,7 @@ class PDFService:
                 'end_page': end_page + 1,
                 'total_checked_pages': len(pages_data),
             },
+            'chapter_validation': chapter_validation,
             'pages': pages_data
         }
 
