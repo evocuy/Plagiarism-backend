@@ -175,6 +175,23 @@ class PDFService:
             "warning_message": warning_message,
         }
 
+    def _chapter_for_page(self, page_number: int, detected_chapters: List[Dict[str, Any]]) -> Optional[str]:
+        current_chapter = None
+        sorted_chapters = sorted(
+            detected_chapters or [],
+            key=lambda item: item.get("page") or 0,
+        )
+
+        for item in sorted_chapters:
+            chapter_page = item.get("page")
+            chapter_number = item.get("chapter")
+            if chapter_page and chapter_number and page_number >= chapter_page:
+                current_chapter = f"bab_{chapter_number}"
+            elif chapter_page and page_number < chapter_page:
+                break
+
+        return current_chapter
+
     def detect_skripsi_content_pages(self, doc: pymupdf.Document) -> tuple[int, int]:
         """Backward-compatibility wrapper."""
         return self.detect_content_pages(doc, document_type="skripsi")
@@ -234,6 +251,8 @@ class PDFService:
         if filter_bab and total_pages > 1:
             start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
 
+        chapter_validation = self.detect_chapters_in_doc(doc, document_type=document_type)
+        detected_chapters = chapter_validation.get("detected_chapters", [])
         sentences_info = []
 
         for page_idx in range(start_page, end_page + 1):
@@ -249,8 +268,10 @@ class PDFService:
             for s in splits:
                 s_clean = s.strip()
                 if len(s_clean.split()) >= 4 and len(s_clean) >= 20:
+                    page_number = page_idx + 1
                     sentences_info.append({
-                        'page': page_idx + 1,
+                        'page': page_number,
+                        'chapter': self._chapter_for_page(page_number, detected_chapters),
                         'sentence': s_clean
                     })
 
@@ -268,38 +289,46 @@ class PDFService:
 
         doc = pymupdf.open(str(resolved_path))
 
-        for item in plagiarized_sentences:
-            sentence = item.get('sentence', '').strip()
-            page_target = item.get('page')
-            if not sentence:
-                continue
+        try:
+            for item in plagiarized_sentences:
+                sentence = item.get('sentence', '').strip()
+                page_target = item.get('page')
+                if not sentence:
+                    continue
 
-            pages_to_search = []
-            if page_target and 1 <= page_target <= len(doc):
-                pages_to_search.append(doc[page_target - 1])
-            else:
-                pages_to_search = list(doc)
-
-            for page in pages_to_search:
-                rects = page.search_for(sentence)
-                if not rects:
-                    words = sentence.split()
-                    chunk_size = 5
-                    for i in range(0, len(words), chunk_size):
-                        chunk = ' '.join(words[i:i + chunk_size])
-                        if len(chunk) >= 15:
-                            sub_rects = page.search_for(chunk)
-                            for r in sub_rects:
-                                annot = page.add_highlight_annot(r)
-                                annot.set_colors(stroke=[1.0, 1.0, 0.0])
-                                annot.update()
+                pages_to_search = []
+                if page_target and 1 <= page_target <= len(doc):
+                    pages_to_search.append(doc[page_target - 1])
                 else:
-                    for r in rects:
-                        annot = page.add_highlight_annot(r)
-                        annot.set_colors(stroke=[1.0, 1.0, 0.0])
-                        annot.update()
+                    pages_to_search = list(doc)
 
-        doc.save(str(output_path))
-        doc.close()
+                for page in pages_to_search:
+                    rects = page.search_for(sentence)
+                    if not rects:
+                        words = sentence.split()
+                        chunk_size = 5
+                        for i in range(0, len(words), chunk_size):
+                            chunk = ' '.join(words[i:i + chunk_size])
+                            if len(chunk) >= 15:
+                                sub_rects = page.search_for(chunk)
+                                for r in sub_rects:
+                                    self._add_highlight(page, r)
+                    else:
+                        for r in rects:
+                            self._add_highlight(page, r)
+
+            doc.save(str(output_path))
+        finally:
+            doc.close()
 
         return str(output_path)
+
+    def _add_highlight(self, page, rect) -> None:
+        try:
+            annot = page.add_highlight_annot(rect)
+            annot.set_colors(stroke=[1.0, 1.0, 0.0])
+            annot.update()
+        except Exception:
+            # Some PDFs produce invalid quad geometry for specific search rects.
+            # Keep generating the report instead of failing the whole check.
+            return

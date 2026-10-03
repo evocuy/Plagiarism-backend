@@ -4,11 +4,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, documents, plagiarism
 from app.database.session import Base, SessionLocal, engine
+from app.database.migrations import ensure_runtime_columns
 
 load_dotenv()
 
 # Buat tabel di PostgreSQL secara otomatis jika belum ada
 Base.metadata.create_all(bind=engine)
+ensure_runtime_columns()
 
 # Inisialisasi akun pengguna awal
 with SessionLocal() as db:

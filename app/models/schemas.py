@@ -1,10 +1,14 @@
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Union, Literal, Annotated
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean
+from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean, JSON
 from sqlalchemy.orm import relationship
 from ..database.session import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ==========================================
@@ -121,10 +125,36 @@ class Document(Base):
     title = Column(String, nullable=False)
     document_type = Column(String, default="skripsi")
     file_path = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    extracted_text = Column(Text, nullable=True)
+    cleaned_text = Column(Text, nullable=True)
+    extraction_metadata = Column(JSON, nullable=True)
+    text_extracted_at = Column(DateTime, nullable=True)
+    text_extraction_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now)
 
     user = relationship("User", back_populates="documents")
     checks = relationship("PlagiarismCheck", back_populates="document", cascade="all, delete-orphan")
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+    source_similarity_results = relationship("SimilarityResult", back_populates="source_document")
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_type = Column(String(50), default="sentence", nullable=False, index=True)
+    chapter = Column(String(50), nullable=True, index=True)
+    page_number = Column(Integer, nullable=True, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    raw_text = Column(Text, nullable=False)
+    cleaned_text = Column(Text, nullable=False)
+    embedding_model = Column(String(255), nullable=True, index=True)
+    embedding_generated_at = Column(DateTime, nullable=True)
+    embedding_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+
+    document = relationship("Document", back_populates="chunks")
 
 
 class PlagiarismCheck(Base):
@@ -139,10 +169,42 @@ class PlagiarismCheck(Base):
     reviewed_at = Column(DateTime, nullable=True)
     reviewer_note = Column(Text, nullable=True)
     highlighted_file_path = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     document = relationship("Document", back_populates="checks")
     user = relationship("User", back_populates="checks")
+    similarity_results = relationship("SimilarityResult", back_populates="check", cascade="all, delete-orphan")
+
+
+class SimilarityResult(Base):
+    __tablename__ = "similarity_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    check_id = Column(Integer, ForeignKey("plagiarism_checks.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    chapter = Column(String(50), nullable=True, index=True)
+    similarity_score = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+
+    check = relationship("PlagiarismCheck", back_populates="similarity_results")
+    source_document = relationship("Document", back_populates="source_similarity_results")
+    matches = relationship("SimilarityMatch", back_populates="result", cascade="all, delete-orphan")
+
+
+class SimilarityMatch(Base):
+    __tablename__ = "similarity_matches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    result_id = Column(Integer, ForeignKey("similarity_results.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_text = Column(Text, nullable=False)
+    submitted_text = Column(Text, nullable=False)
+    similarity_score = Column(Float, nullable=False)
+    page_number = Column(Integer, nullable=True, index=True)
+    start_position = Column(Integer, nullable=True)
+    end_position = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+
+    result = relationship("SimilarityResult", back_populates="matches")
 
 
 # ==========================================
