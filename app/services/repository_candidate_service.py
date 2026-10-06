@@ -17,12 +17,16 @@ class RepositoryCandidateService:
         embedding_service: Optional[EmbeddingService] = None,
         semantic_matches_per_chunk: int = 5,
         semantic_min_coverage: float = 0.95,
+        semantic_highlight_threshold: float = 0.78,
+        semantic_highlight_matches_per_chunk: int = 3,
     ):
         self.document_chunk_service = document_chunk_service or DocumentChunkService()
         self.tfidf_service = tfidf_service or TfidfService()
         self.embedding_service = embedding_service or EmbeddingService()
         self.semantic_matches_per_chunk = semantic_matches_per_chunk
         self.semantic_min_coverage = semantic_min_coverage
+        self.semantic_highlight_threshold = semantic_highlight_threshold
+        self.semantic_highlight_matches_per_chunk = semantic_highlight_matches_per_chunk
 
     def find_candidates(
         self,
@@ -292,7 +296,9 @@ class RepositoryCandidateService:
                 SELECT
                     id,
                     chapter,
+                    page_number,
                     chunk_index,
+                    raw_text,
                     cleaned_text,
                     embedding::text AS embedding
                 FROM document_chunks
@@ -309,6 +315,99 @@ class RepositoryCandidateService:
             },
         ).mappings().all()
         return [dict(row) for row in rows if row.get("embedding")]
+
+    def find_semantic_sentence_matches(
+        self,
+        target_document: Document,
+        repository_documents: Sequence[Document],
+        db: Session,
+        min_score: Optional[float] = None,
+        top_n: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if db is None or not self.embedding_service.model:
+            return []
+
+        repository_documents = [
+            document for document in repository_documents
+            if document.id is not None
+        ]
+        if not repository_documents:
+            return []
+
+        document_ids = [document.id for document in repository_documents]
+        documents_by_id = {document.id: document for document in repository_documents}
+        threshold = self.semantic_highlight_threshold if min_score is None else min_score
+        limit = top_n or self.semantic_highlight_matches_per_chunk
+
+        try:
+            target_embeddings = self._fetch_embedded_target_chunks(target_document, db)
+            if not target_embeddings:
+                return []
+
+            matches = []
+            seen = set()
+            for target in target_embeddings:
+                rows = self._query_semantic_matches(
+                    document_ids=document_ids,
+                    query_embedding=target["embedding"],
+                    db=db,
+                    limit=limit,
+                    chapter=target.get("chapter"),
+                )
+                if not rows and target.get("chapter"):
+                    rows = self._query_semantic_matches(
+                        document_ids=document_ids,
+                        query_embedding=target["embedding"],
+                        db=db,
+                        limit=limit,
+                    )
+
+                target_sentence = (target.get("raw_text") or "").strip()
+                if not target_sentence:
+                    continue
+
+                for row in rows:
+                    score = float(row.get("score") or 0.0)
+                    if score < threshold:
+                        continue
+
+                    source_document_id = row.get("document_id")
+                    source_document = documents_by_id.get(source_document_id)
+                    reference_sentence = (row.get("raw_text") or "").strip()
+                    if not source_document or not reference_sentence:
+                        continue
+
+                    key = (
+                        target.get("id"),
+                        source_document_id,
+                        row.get("chunk_index"),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    matches.append({
+                        "page": target.get("page_number"),
+                        "chapter": target.get("chapter"),
+                        "sentence": target_sentence,
+                        "submitted_sentence": target_sentence,
+                        "similarity": round(score * 100, 2),
+                        "matched_source": source_document.title,
+                        "source_document_id": source_document_id,
+                        "source_chunk_index": row.get("chunk_index"),
+                        "source_page": row.get("page_number"),
+                        "reference_sentence": reference_sentence,
+                        "reference_full_sentence": reference_sentence,
+                        "match_type": "semantic_sentence",
+                        "start_position": 0,
+                        "end_position": len(target_sentence),
+                    })
+
+            return matches
+        except Exception:
+            if hasattr(db, "rollback"):
+                db.rollback()
+            return []
 
     def _count_repository_embedding_chunks(
         self,

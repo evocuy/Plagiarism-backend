@@ -61,3 +61,68 @@ def test_sentence_matching_returns_source_metadata():
     assert matches[0]["page"] == 3
     assert matches[0]["matched_source"] == "Dokumen Repository A"
     assert matches[0]["similarity"] == 100.0
+
+
+def test_sentence_matching_returns_partial_segment_below_sentence_threshold():
+    service = SimilarityService()
+
+    matches = service.find_sentence_matches(
+        target_sentences=[
+            {
+                "page": 4,
+                "sentence": (
+                    "Sistem informasi akademik digunakan pada layanan kampus digital "
+                    "untuk memantau bimbingan skripsi mahasiswa."
+                ),
+            }
+        ],
+        reference_sentences=[
+            {
+                "page": 9,
+                "sentence": (
+                    "Sistem informasi akademik digunakan untuk mengelola data nilai "
+                    "jadwal pembayaran dosen kelas ruangan semester kurikulum."
+                ),
+            }
+        ],
+        matched_source="Dokumen Repository B",
+        threshold=0.70,
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["match_type"] == "segment"
+    assert matches[0]["sentence"] == "Sistem informasi akademik digunakan"
+    assert matches[0]["reference_sentence"] == "Sistem informasi akademik digunakan"
+    assert matches[0]["start_position"] == 0
+    assert matches[0]["end_position"] == len("Sistem informasi akademik digunakan")
+    assert matches[0]["similarity"] < 70.0
+
+
+def test_sentence_matching_does_not_highlight_whole_sentence_for_reference_subset():
+    service = SimilarityService()
+    target_sentence = (
+        "Sistem informasi akademik digunakan untuk mengelola data mahasiswa "
+        "dengan fitur tambahan laporan nilai dan jadwal kuliah."
+    )
+
+    matches = service.find_sentence_matches(
+        target_sentences=[
+            {
+                "page": 5,
+                "sentence": target_sentence,
+            }
+        ],
+        reference_sentences=[
+            {
+                "page": 12,
+                "sentence": "Sistem informasi akademik digunakan untuk mengelola data mahasiswa.",
+            }
+        ],
+        matched_source="Dokumen Repository C",
+        threshold=0.70,
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["match_type"] == "segment"
+    assert matches[0]["sentence"] != target_sentence
+    assert matches[0]["sentence"] == "Sistem informasi akademik digunakan untuk mengelola data mahasiswa"

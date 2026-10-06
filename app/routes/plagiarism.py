@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -31,6 +31,27 @@ logger = logging.getLogger(__name__)
 class SingleCheckRequest(BaseModel):
     document_id: int
     reference_document_id: int
+
+
+def _merge_highlight_matches(*match_groups: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged = []
+    seen = set()
+
+    for group in match_groups:
+        for match in group or []:
+            key = (
+                match.get("page"),
+                (match.get("sentence") or "").strip().lower(),
+                match.get("source_document_id"),
+                (match.get("reference_sentence") or "").strip().lower(),
+                match.get("match_type"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(match)
+
+    return merged
 
 
 def _summarize_embedding_index_result(result):
@@ -168,16 +189,29 @@ def check_similarity(
     highlighted_file = None
     plagiarized_sentences = []
     try:
+        _auto_index_embeddings_for_check(
+            target_doc=doc_a,
+            repo_docs=[doc_b],
+            db=db,
+            enabled=True,
+            repository_limit=1,
+        )
         sentences_a = document_chunk_service.get_or_build_sentence_chunks(doc_a, db)
         sentences_b = document_chunk_service.get_or_build_sentence_chunks(doc_b, db)
 
-        plagiarized_sentences = similarity_service.find_sentence_matches(
+        lexical_matches = similarity_service.find_sentence_matches(
             target_sentences=sentences_a,
             reference_sentences=sentences_b,
             matched_source=doc_b.title,
             source_document_id=doc_b.id,
             threshold=0.70,
         )
+        semantic_matches = repository_candidate_service.find_semantic_sentence_matches(
+            target_document=doc_a,
+            repository_documents=[doc_b],
+            db=db,
+        )
+        plagiarized_sentences = _merge_highlight_matches(lexical_matches, semantic_matches)
         similarity_result_service.create_matches(
             db=db,
             result_id=result_record.id,
@@ -385,11 +419,17 @@ def check_against_repository(
     plagiarized_sentences = []
     try:
         sentences_target = document_chunk_service.get_or_build_sentence_chunks(target_doc, db)
-        plagiarized_sentences = similarity_service.find_sentence_matches_against_references(
+        lexical_matches = similarity_service.find_sentence_matches_against_references(
             target_sentences=sentences_target,
             reference_corpus=repo_sentences_all,
             threshold=0.70,
         )
+        semantic_matches = repository_candidate_service.find_semantic_sentence_matches(
+            target_document=target_doc,
+            repository_documents=candidate_docs,
+            db=db,
+        )
+        plagiarized_sentences = _merge_highlight_matches(lexical_matches, semantic_matches)
         matches_by_source_document_id = {}
         for match in plagiarized_sentences:
             source_document_id = match.get("source_document_id")

@@ -236,6 +236,91 @@ def test_find_candidates_uses_pgvector_semantic_candidates_when_embeddings_exist
     assert {item["source_document_id"] for item in result["reference_corpus"]} == {semantic_repo.id}
 
 
+def test_find_semantic_sentence_matches_returns_highlight_items():
+    target = FakeDocument(1, "target.pdf")
+    semantic_repo = FakeDocument(2, "semantic.pdf")
+    service = RepositoryCandidateService()
+    service.embedding_service.model = "test-model"
+    service._fetch_embedded_target_chunks = lambda target_document, db: [
+        {
+            "id": 10,
+            "chapter": "bab_3",
+            "page_number": 8,
+            "chunk_index": 0,
+            "raw_text": "Aplikasi kampus membantu administrasi data peserta didik.",
+            "cleaned_text": "aplikasi kampus membantu administrasi data peserta didik",
+            "embedding": "[1,0]",
+        }
+    ]
+
+    def fake_query_semantic_matches(**kwargs):
+        assert kwargs["chapter"] == "bab_3"
+        return [
+            {
+                "document_id": semantic_repo.id,
+                "chapter": "bab_3",
+                "page_number": 12,
+                "chunk_index": 4,
+                "raw_text": "Sistem informasi akademik digunakan untuk mengelola data mahasiswa.",
+                "cleaned_text": "sistem informasi akademik digunakan mengelola data mahasiswa",
+                "score": 0.84,
+            }
+        ]
+
+    service._query_semantic_matches = fake_query_semantic_matches
+
+    matches = service.find_semantic_sentence_matches(
+        target_document=target,
+        repository_documents=[semantic_repo],
+        db=object(),
+        min_score=0.78,
+    )
+
+    assert len(matches) == 1
+    assert matches[0]["match_type"] == "semantic_sentence"
+    assert matches[0]["page"] == 8
+    assert matches[0]["sentence"] == "Aplikasi kampus membantu administrasi data peserta didik."
+    assert matches[0]["reference_sentence"] == "Sistem informasi akademik digunakan untuk mengelola data mahasiswa."
+    assert matches[0]["matched_source"] == "semantic.pdf"
+    assert matches[0]["similarity"] == 84.0
+
+
+def test_find_semantic_sentence_matches_ignores_low_scores():
+    target = FakeDocument(1, "target.pdf")
+    semantic_repo = FakeDocument(2, "semantic.pdf")
+    service = RepositoryCandidateService()
+    service.embedding_service.model = "test-model"
+    service._fetch_embedded_target_chunks = lambda target_document, db: [
+        {
+            "id": 10,
+            "chapter": None,
+            "page_number": 8,
+            "chunk_index": 0,
+            "raw_text": "Kalimat target.",
+            "cleaned_text": "kalimat target",
+            "embedding": "[1,0]",
+        }
+    ]
+    service._query_semantic_matches = lambda **kwargs: [
+        {
+            "document_id": semantic_repo.id,
+            "page_number": 12,
+            "chunk_index": 4,
+            "raw_text": "Kalimat referensi.",
+            "score": 0.61,
+        }
+    ]
+
+    matches = service.find_semantic_sentence_matches(
+        target_document=target,
+        repository_documents=[semantic_repo],
+        db=object(),
+        min_score=0.78,
+    )
+
+    assert matches == []
+
+
 def test_find_candidates_falls_back_when_repository_embedding_coverage_is_low():
     target = FakeDocument(1, "target.pdf")
     similar_repo = FakeDocument(2, "similar.pdf")
