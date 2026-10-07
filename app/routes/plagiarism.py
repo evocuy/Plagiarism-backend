@@ -188,6 +188,7 @@ def check_similarity(
     # Deteksi kalimat mirip dan beri highlight kuning stabilo di file PDF
     highlighted_file = None
     plagiarized_sentences = []
+    highlight_summary = similarity_result_service.summarize_highlight_matches([])
     try:
         _auto_index_embeddings_for_check(
             target_doc=doc_a,
@@ -210,6 +211,9 @@ def check_similarity(
         # menunjukkan teks yang benar-benar sama agar pemilik dokumen tahu
         # bagian konkret yang perlu direvisi.
         plagiarized_sentences = _merge_highlight_matches(lexical_matches)
+        highlight_summary = similarity_result_service.summarize_highlight_matches(
+            plagiarized_sentences
+        )
         similarity_result_service.create_matches(
             db=db,
             result_id=result_record.id,
@@ -248,6 +252,7 @@ def check_similarity(
         "similarity_percentage": f"{round(score * 100, 2)}%",
         "status": check_record.status,
         "total_plagiarized_sentences": len(plagiarized_sentences),
+        "highlight_summary": highlight_summary,
         "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
         "chapter_validation": data_a.get("chapter_validation"),
     }
@@ -343,6 +348,7 @@ def check_against_repository(
             "chapter_aware": False,
             "target_chapters": [],
             "matches": [],
+            "highlight_summary": similarity_result_service.summarize_highlight_matches([]),
             "message": "Dokumen berhasil disimpan. Belum ada dokumen lain di repositori kampus untuk dibandingkan.",
             "highlighted_pdf_available": True,
             "chapter_validation": target_validation,
@@ -415,6 +421,7 @@ def check_against_repository(
     # Deteksi kalimat plagiat & buat Highlight Kuning Stabilo di PDF
     highlighted_file = None
     plagiarized_sentences = []
+    highlight_summary = similarity_result_service.summarize_highlight_matches([])
     try:
         sentences_target = document_chunk_service.get_or_build_sentence_chunks(target_doc, db)
         lexical_matches = similarity_service.find_sentence_matches_against_references(
@@ -425,6 +432,9 @@ def check_against_repository(
         # Semantic similarity tetap digunakan saat memilih kandidat repository.
         # PDF hanya menyorot kecocokan teks leksikal yang persis.
         plagiarized_sentences = _merge_highlight_matches(lexical_matches)
+        highlight_summary = similarity_result_service.summarize_highlight_matches(
+            plagiarized_sentences
+        )
         matches_by_source_document_id = {}
         for match in plagiarized_sentences:
             source_document_id = match.get("source_document_id")
@@ -484,6 +494,7 @@ def check_against_repository(
         "target_chapters": candidate_result["target_chapters"],
         "matches": results,
         "total_plagiarized_sentences": len(plagiarized_sentences),
+        "highlight_summary": highlight_summary,
         "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
         "chapter_validation": target_data.get("chapter_validation"),
     }

@@ -62,3 +62,63 @@ def test_create_result_and_matches_persists_similarity_detail():
     assert stored_match.submitted_text == "Kalimat target mirip."
     assert stored_match.similarity_score == 0.915
     assert stored_match.page_number == 7
+
+
+def test_summarize_highlight_matches_reports_words_pages_and_sources():
+    service = SimilarityResultService()
+
+    summary = service.summarize_highlight_matches(
+        [
+            {
+                "sentence": "Sistem informasi akademik",
+                "matched_source": "Sumber A.pdf",
+                "source_document_id": 11,
+                "page": 3,
+                "start_position": 0,
+                "end_position": 26,
+            },
+            {
+                # Target segment yang sama muncul terhadap sumber lain. PDF
+                # hanya memberi satu stabilo untuk segment ini.
+                "sentence": "Sistem informasi akademik",
+                "matched_source": "Sumber B.pdf",
+                "source_document_id": 12,
+                "page": 3,
+                "start_position": 0,
+                "end_position": 26,
+            },
+            {
+                "sentence": "data mahasiswa",
+                "matched_source": "Sumber A.pdf",
+                "source_document_id": 11,
+                "page": 5,
+                "start_position": 30,
+                "end_position": 45,
+            },
+        ]
+    )
+
+    assert summary["detected_match_count"] == 3
+    assert summary["detected_word_count"] == 8
+    assert summary["highlighted_match_count"] == 2
+    assert summary["highlighted_word_count"] == 5
+    assert summary["highlighted_page_numbers"] == [3, 5]
+    assert summary["highlighted_page_count"] == 2
+    assert summary["source_documents"] == [
+        {
+            "document_id": 11,
+            "title": "Sumber A.pdf",
+            "match_count": 2,
+            "matched_word_count": 5,
+            "page_numbers": [3, 5],
+            "page_count": 2,
+        },
+        {
+            "document_id": 12,
+            "title": "Sumber B.pdf",
+            "match_count": 1,
+            "matched_word_count": 3,
+            "page_numbers": [3],
+            "page_count": 1,
+        },
+    ]
