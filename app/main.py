@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import auth, documents, plagiarism
+from app.routes import auth, dashboard, documents, plagiarism
 from app.database.session import Base, SessionLocal, engine
 from app.database.migrations import ensure_runtime_columns
 
@@ -33,6 +33,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(documents.router, prefix="/api/documents", tags=["Documents"])
 app.include_router(plagiarism.router, prefix="/api/plagiarism", tags=["Plagiarism"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
 
 @app.get("/api/health")
 def health_check():
