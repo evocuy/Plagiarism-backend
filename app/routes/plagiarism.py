@@ -206,12 +206,10 @@ def check_similarity(
             source_document_id=doc_b.id,
             threshold=0.70,
         )
-        semantic_matches = repository_candidate_service.find_semantic_sentence_matches(
-            target_document=doc_a,
-            repository_documents=[doc_b],
-            db=db,
-        )
-        plagiarized_sentences = _merge_highlight_matches(lexical_matches, semantic_matches)
+        # Embedding dipakai untuk memilih kandidat, sedangkan stabilo hanya
+        # menunjukkan teks yang benar-benar sama agar pemilik dokumen tahu
+        # bagian konkret yang perlu direvisi.
+        plagiarized_sentences = _merge_highlight_matches(lexical_matches)
         similarity_result_service.create_matches(
             db=db,
             result_id=result_record.id,
@@ -424,12 +422,9 @@ def check_against_repository(
             reference_corpus=repo_sentences_all,
             threshold=0.70,
         )
-        semantic_matches = repository_candidate_service.find_semantic_sentence_matches(
-            target_document=target_doc,
-            repository_documents=candidate_docs,
-            db=db,
-        )
-        plagiarized_sentences = _merge_highlight_matches(lexical_matches, semantic_matches)
+        # Semantic similarity tetap digunakan saat memilih kandidat repository.
+        # PDF hanya menyorot kecocokan teks leksikal yang persis.
+        plagiarized_sentences = _merge_highlight_matches(lexical_matches)
         matches_by_source_document_id = {}
         for match in plagiarized_sentences:
             source_document_id = match.get("source_document_id")

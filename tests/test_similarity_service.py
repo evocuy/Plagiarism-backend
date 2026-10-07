@@ -126,3 +126,26 @@ def test_sentence_matching_does_not_highlight_whole_sentence_for_reference_subse
     assert matches[0]["match_type"] == "segment"
     assert matches[0]["sentence"] != target_sentence
     assert matches[0]["sentence"] == "Sistem informasi akademik digunakan untuk mengelola data mahasiswa"
+
+
+def test_sentence_matching_ignores_segment_that_only_matches_after_stopword_removal():
+    service = SimilarityService()
+
+    matches = service.find_sentence_matches(
+        target_sentences=[
+            {
+                "page": 2,
+                "sentence": "Sistem informasi akademik terintegrasi kampus digital modern.",
+            }
+        ],
+        reference_sentences=[
+            {
+                "page": 4,
+                "sentence": "Sistem untuk informasi bagi akademik dengan terintegrasi pada kampus digital modern.",
+            }
+        ],
+        matched_source="Dokumen Repository D",
+        threshold=0.70,
+    )
+
+    assert matches == []

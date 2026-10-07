@@ -47,6 +47,15 @@ class SimilarityService:
 
         return tokens
 
+    def _normalize_exact_text(self, text: str) -> str:
+        """Normalisasi ringan untuk memverifikasi teks yang akan di-highlight.
+
+        TF-IDF dan preprocessing sengaja menghapus stopword agar perhitungan
+        similarity lebih stabil. Highlight membutuhkan aturan yang lebih ketat:
+        hanya perbedaan kapitalisasi dan tanda baca yang boleh diabaikan.
+        """
+        return re.sub(r"[\W_]+", " ", text or "", flags=re.UNICODE).strip().lower()
+
     def _find_matching_segments(
         self,
         target_sentence: str,
@@ -214,8 +223,8 @@ class SimilarityService:
                 if (
                     segments
                     and score >= threshold
-                    and target_token_count > 0
-                    and sum(segment["token_count"] for segment in segments) / target_token_count >= 0.85
+                    and self._normalize_exact_text(target_sentence)
+                    == self._normalize_exact_text(reference_sentence)
                 ):
                     emitted_segments = []
                     covered_ranges = [(0, len(target_sentence))]
@@ -239,6 +248,12 @@ class SimilarityService:
                     break
 
                 for segment in segments:
+                    if (
+                        self._normalize_exact_text(segment["text"])
+                        != self._normalize_exact_text(segment["reference_text"])
+                    ):
+                        continue
+
                     current_range = (segment["start_position"], segment["end_position"])
                     if any(self._ranges_overlap(current_range, existing) for existing in covered_ranges):
                         continue
@@ -276,6 +291,13 @@ class SimilarityService:
                 continue
 
             reference = best_sentence_match["reference"]
+            reference_sentence = reference.get("sentence", "")
+            if (
+                self._normalize_exact_text(target_sentence)
+                != self._normalize_exact_text(reference_sentence)
+            ):
+                continue
+
             matches.append({
                 "page": target_item.get("page"),
                 "chapter": target_item.get("chapter"),
@@ -286,8 +308,8 @@ class SimilarityService:
                 "source_document_id": reference.get("source_document_id"),
                 "source_chunk_index": reference.get("source_chunk_index"),
                 "source_page": reference.get("source_page"),
-                "reference_sentence": reference.get("sentence", ""),
-                "reference_full_sentence": reference.get("sentence", ""),
+                "reference_sentence": reference_sentence,
+                "reference_full_sentence": reference_sentence,
                 "match_type": "sentence",
                 "start_position": 0,
                 "end_position": len(target_sentence),
