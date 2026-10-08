@@ -7,7 +7,12 @@ from fastapi import HTTPException
 
 from app.database.session import Base
 from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User
-from app.routes.plagiarism import get_check_matches, get_check_processing_status
+from app.routes.plagiarism import (
+    get_check_history,
+    get_check_matches,
+    get_check_processing_status,
+    get_check_top_matches,
+)
 from app.routes import documents as document_routes
 from app.services.repository_check_service import (
     RepositoryCheckService,
@@ -299,6 +304,129 @@ def test_matches_endpoint_returns_final_payload_after_progress_completes():
     assert payload["highlight_summary"]["source_documents"][0]["title"] == "source.pdf"
     assert payload["chapter_validation"]["has_warning"] is False
     assert payload["results"][0]["matches"][0]["submitted_text"] == "Kalimat target yang sama."
+
+
+def test_top_matches_endpoint_returns_only_three_highest_sources_for_history():
+    db = _make_session()
+    owner = User(identifier="owner", password="secret", role="mahasiswa")
+    outsider = User(identifier="outsider", password="secret", role="mahasiswa")
+    db.add_all([owner, outsider])
+    db.commit()
+    db.refresh(owner)
+    db.refresh(outsider)
+
+    target = Document(
+        user_id=owner.id,
+        title="target.pdf",
+        document_type="skripsi",
+        file_path="target.pdf",
+    )
+    sources = [
+        Document(title=f"source-{number}.pdf", document_type="skripsi", file_path=f"source-{number}.pdf")
+        for number in range(1, 5)
+    ]
+    db.add_all([target, *sources])
+    db.commit()
+    db.refresh(target)
+    for source in sources:
+        db.refresh(source)
+
+    check = PlagiarismCheck(
+        document_id=target.id,
+        user_id=owner.id,
+        overall_similarity=0.91,
+        status="completed",
+        progress=100,
+    )
+    db.add(check)
+    db.commit()
+    db.refresh(check)
+
+    scores = [0.32, 0.91, 0.65, 0.80]
+    for source, score in zip(sources, scores):
+        result = SimilarityResult(
+            check_id=check.id,
+            source_document_id=source.id,
+            similarity_score=score,
+        )
+        db.add(result)
+        db.flush()
+        db.add(
+            SimilarityMatch(
+                result_id=result.id,
+                source_text="Kalimat sumber.",
+                submitted_text="Kalimat target.",
+                similarity_score=0.9,
+                page_number=2,
+            )
+        )
+    db.commit()
+
+    payload = get_check_top_matches(check.id, current_user=owner, db=db)
+    history = get_check_history(current_user=owner, db=db)
+
+    assert payload["total_repository_checked"] == 4
+    assert payload["top_match_count"] == 3
+    assert [item["title"] for item in payload["top_matches"]] == [
+        "source-2.pdf",
+        "source-4.pdf",
+        "source-3.pdf",
+    ]
+    assert [item["rank"] for item in payload["top_matches"]] == [1, 2, 3]
+    assert payload["top_matches"][0]["matched_sentence_count"] == 1
+    assert payload["top_matches"][0]["matched_page_numbers"] == [2]
+    assert history[0]["top_matches_url"] == f"/api/plagiarism/check/{check.id}/top-matches"
+
+    empty_check = PlagiarismCheck(
+        document_id=target.id,
+        user_id=owner.id,
+        overall_similarity=0.0,
+        status="completed",
+        progress=100,
+    )
+    processing_check = PlagiarismCheck(
+        document_id=target.id,
+        user_id=owner.id,
+        overall_similarity=0.0,
+        status="processing",
+        progress=50,
+    )
+    db.add_all([empty_check, processing_check])
+    db.commit()
+    db.refresh(empty_check)
+    db.refresh(processing_check)
+
+    empty_payload = get_check_top_matches(empty_check.id, current_user=owner, db=db)
+    history_by_id = {
+        item["id"]: item for item in get_check_history(current_user=owner, db=db)
+    }
+    assert empty_payload["top_match_count"] == 0
+    assert empty_payload["top_matches"] == []
+    assert history_by_id[empty_check.id]["top_matches_url"] == (
+        f"/api/plagiarism/check/{empty_check.id}/top-matches"
+    )
+    assert history_by_id[processing_check.id]["top_matches_url"] is None
+
+    try:
+        get_check_top_matches(processing_check.id, current_user=owner, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("Expected an unfinished check to reject top-match access")
+
+    try:
+        get_check_top_matches(check.id, current_user=outsider, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 403
+    else:
+        raise AssertionError("Expected an unrelated student to be denied")
+
+    try:
+        get_check_top_matches(99999, current_user=owner, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("Expected an unknown check to return 404")
 
 
 def test_upload_and_check_returns_pending_check_and_schedules_background_work(monkeypatch):

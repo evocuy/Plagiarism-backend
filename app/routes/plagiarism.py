@@ -235,6 +235,12 @@ def get_check_history(
             "reviewer_note": check.reviewer_note,
             "highlighted_pdf_available": has_highlighted,
             "highlighted_pdf_url": f"/api/plagiarism/check/{check.id}/download-highlighted" if has_highlighted else None,
+            "result_url": f"/api/plagiarism/check/{check.id}/matches" if check.status == "completed" else None,
+            "top_matches_url": (
+                f"/api/plagiarism/check/{check.id}/top-matches"
+                if check.status == "completed"
+                else None
+            ),
             "created_at": check.created_at.isoformat() if check.created_at else None,
             "completed_at": check.completed_at.isoformat() if check.completed_at else None,
         })
@@ -293,9 +299,9 @@ def _serialize_check_progress(check: PlagiarismCheck) -> dict:
     }
 
 
-def _get_stored_check_results(check_id: int, db: Session):
+def _get_stored_check_results(check_id: int, db: Session, limit: Optional[int] = None):
     """Load persisted source scores and sentence matches for a completed check."""
-    return (
+    query = (
         db.query(SimilarityResult)
         .options(
             joinedload(SimilarityResult.source_document),
@@ -303,8 +309,10 @@ def _get_stored_check_results(check_id: int, db: Session):
         )
         .filter(SimilarityResult.check_id == check_id)
         .order_by(SimilarityResult.similarity_score.desc(), SimilarityResult.id.asc())
-        .all()
     )
+    if limit is not None:
+        query = query.limit(limit)
+    return query.all()
 
 
 def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
@@ -424,6 +432,29 @@ def _serialize_check_final_result(
     }
 
 
+def _serialize_top_comparison(result: SimilarityResult, rank: int) -> dict:
+    """Serialize one repository document for the history's top-three view."""
+    source_title = result.source_document.title if result.source_document else None
+    page_numbers = sorted(
+        {
+            match.page_number
+            for match in result.matches
+            if match.page_number is not None and match.page_number > 0
+        }
+    )
+    return {
+        "rank": rank,
+        "repository_document_id": result.source_document_id,
+        "title": source_title or "Dokumen sumber tidak ditemukan",
+        "document_type": result.source_document.document_type if result.source_document else None,
+        "similarity_score": round(result.similarity_score, 4),
+        "similarity_percentage": f"{round(result.similarity_score * 100, 2)}%",
+        "matched_sentence_count": len(result.matches),
+        "matched_page_numbers": page_numbers,
+        "matched_page_count": len(page_numbers),
+    }
+
+
 @router.get("/check/{check_id}/status")
 def get_check_processing_status(
     check_id: int,
@@ -456,6 +487,48 @@ def get_check_matches(
         _get_stored_check_results(check_id, db),
         db,
     )
+
+
+@router.get("/check/{check_id}/top-matches")
+def get_check_top_matches(
+    check_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the three highest-scoring source documents for a historic check."""
+    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    if not check:
+        raise HTTPException(status_code=404, detail="Data pengecekan tidak ditemukan.")
+    if not _can_access_check(check, current_user, db):
+        raise HTTPException(
+            status_code=403,
+            detail="Anda tidak memiliki izin untuk melihat dokumen pembanding ini.",
+        )
+    if check.status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen pembanding tersedia setelah pengecekan selesai.",
+        )
+
+    total_repository_checked = (
+        db.query(SimilarityResult)
+        .filter(SimilarityResult.check_id == check_id)
+        .count()
+    )
+    top_results = _get_stored_check_results(check_id, db, limit=3)
+    target_document = check.document
+    return {
+        "check_id": check.id,
+        "document_id": check.document_id,
+        "status": check.status,
+        "target_document": target_document.title if target_document else "Dokumen tidak ditemukan",
+        "total_repository_checked": total_repository_checked,
+        "top_match_count": len(top_results),
+        "top_matches": [
+            _serialize_top_comparison(result, rank)
+            for rank, result in enumerate(top_results, start=1)
+        ],
+    }
 
 @router.get("/check/{check_id}/download-highlighted")
 def download_highlighted_pdf(
