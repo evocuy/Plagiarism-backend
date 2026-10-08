@@ -41,11 +41,12 @@ class PDFService:
         if len(bab_lines) > 1:
             return False
 
+        chapter_pattern = re.compile(
+            rf'^BAB\s+(?:{re.escape(chapter_roman)}|{re.escape(chapter_arabic)})(?=\s|[.:)\-]|$)',
+            re.IGNORECASE,
+        )
         for line in lines:
-            line_clean = line.strip().upper()
-            if line_clean == f'BAB {chapter_roman}' or line_clean == f'BAB {chapter_arabic}':
-                return True
-            if line_clean.startswith(f'BAB {chapter_roman} ') or line_clean.startswith(f'BAB {chapter_arabic} '):
+            if chapter_pattern.match(line.strip()):
                 return True
         return False
 
@@ -114,13 +115,10 @@ class PDFService:
         - Proposal / Sempro: standar 3 BAB. Berikan warning jika BAB kurang dari 3 atau lebih dari 3.
         """
         total = len(doc)
+        roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
         chapter_defs = [
-            (1, 'I', '1'),
-            (2, 'II', '2'),
-            (3, 'III', '3'),
-            (4, 'IV', '4'),
-            (5, 'V', '5'),
-            (6, 'VI', '6'),
+            (number, roman, str(number))
+            for number, roman in enumerate(roman_numerals, start=1)
         ]
         found_chapters = []
         for num, roman, arabic in chapter_defs:
@@ -139,31 +137,39 @@ class PDFService:
         has_warning = False
         warning_type = None
         warning_message = None
+        detected_numbers = [chapter["chapter"] for chapter in found_chapters]
 
         if is_sempro:
-            if total_detected > 3:
+            expected_chapters = [1, 2, 3]
+            missing_chapters = [chapter for chapter in expected_chapters if chapter not in detected_numbers]
+            unexpected_chapters = [
+                chapter for chapter in detected_numbers if chapter not in expected_chapters
+            ]
+            if unexpected_chapters:
                 has_warning = True
                 warning_type = "PROPOSAL_CHAPTER_OVERFLOW"
                 warning_message = (
-                    f"Perhatian: Anda mengunggah dokumen dengan tipe 'Proposal', namun sistem mendeteksi ada "
-                    f"{total_detected} BAB (ditemukan hingga BAB {found_chapters[-1]['chapter']}). "
-                    f"Apakah Anda keliru mengunggah draf Skripsi lengkap?"
+                    "Perhatian: Anda memilih tipe 'Proposal', tetapi sistem mendeteksi "
+                    f"BAB tambahan ({', '.join(f'BAB {chapter}' for chapter in unexpected_chapters)}). "
+                    "Proposal hanya boleh memuat BAB 1 sampai BAB 3."
                 )
-            elif total_detected < 3:
+            elif missing_chapters:
                 has_warning = True
                 warning_type = "PROPOSAL_CHAPTER_INCOMPLETE"
                 warning_message = (
-                    f"Perhatian: Anda memilih tipe 'Proposal' (Seminar Proposal), namun sistem hanya mendeteksi "
-                    f"{total_detected} BAB dari standar 3 BAB."
+                    "Perhatian: Anda memilih tipe 'Proposal' (Seminar Proposal), namun "
+                    f"{', '.join(f'BAB {chapter}' for chapter in missing_chapters)} belum terdeteksi."
                 )
         else:
             # Mode Skripsi
-            if total_detected < 5:
+            expected_chapters = [1, 2, 3, 4, 5]
+            missing_chapters = [chapter for chapter in expected_chapters if chapter not in detected_numbers]
+            if missing_chapters:
                 has_warning = True
                 warning_type = "SKRIPSI_CHAPTER_INCOMPLETE"
                 warning_message = (
                     f"Perhatian: Anda memilih tipe 'Skripsi', namun dokumen hanya memuat "
-                    f"{total_detected} BAB dari standar 5 BAB (ditemukan hanya hingga BAB {found_chapters[-1]['chapter'] if found_chapters else 0}). "
+                    f"{total_detected} BAB dan belum terdeteksi {', '.join(f'BAB {chapter}' for chapter in missing_chapters)}. "
                     f"Apakah Anda keliru mengunggah dokumen Proposal?"
                 )
 

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 from pydantic import BaseModel
 
 from app.database.session import get_db
@@ -293,6 +293,137 @@ def _serialize_check_progress(check: PlagiarismCheck) -> dict:
     }
 
 
+def _get_stored_check_results(check_id: int, db: Session):
+    """Load persisted source scores and sentence matches for a completed check."""
+    return (
+        db.query(SimilarityResult)
+        .options(
+            joinedload(SimilarityResult.source_document),
+            selectinload(SimilarityResult.matches),
+        )
+        .filter(SimilarityResult.check_id == check_id)
+        .order_by(SimilarityResult.similarity_score.desc(), SimilarityResult.id.asc())
+        .all()
+    )
+
+
+def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
+    """Mirror the repository scope used when this check was started."""
+    target_document = check.document
+    if not target_document:
+        return 0
+
+    query = db.query(Document).filter(Document.id != check.document_id)
+    target_owner_id = target_document.user_id or check.user_id
+    if target_owner_id is not None:
+        query = query.filter(Document.user_id != target_owner_id)
+    return query.count()
+
+
+def _serialize_check_final_result(
+    check: PlagiarismCheck,
+    stored_results: list[SimilarityResult],
+    db: Session,
+) -> dict:
+    """Rebuild the final upload-result payload from persisted check data.
+
+    BackgroundTasks discards the return value of RepositoryCheckService, so
+    the frontend fetches this representation after polling reaches completed.
+    """
+    target_document = check.document
+    detailed_results = []
+    source_matches = []
+    persisted_highlight_matches = []
+
+    for result in stored_results:
+        source_title = result.source_document.title if result.source_document else None
+        source_matches.append(
+            {
+                "repository_document_id": result.source_document_id,
+                "title": source_title or "Dokumen sumber tidak ditemukan",
+                "similarity_score": round(result.similarity_score, 4),
+                "similarity_percentage": f"{round(result.similarity_score * 100, 2)}%",
+            }
+        )
+
+        sentence_matches = []
+        for match in sorted(result.matches, key=lambda item: item.id):
+            sentence_matches.append(
+                {
+                    "id": match.id,
+                    "source_text": match.source_text,
+                    "submitted_text": match.submitted_text,
+                    "similarity_score": match.similarity_score,
+                    "similarity_percentage": f"{round(match.similarity_score * 100, 2)}%",
+                    "page_number": match.page_number,
+                    "start_position": match.start_position,
+                    "end_position": match.end_position,
+                }
+            )
+            persisted_highlight_matches.append(
+                {
+                    "sentence": match.submitted_text,
+                    "matched_source": source_title or "Dokumen sumber tidak diketahui",
+                    "source_document_id": result.source_document_id,
+                    "page": match.page_number,
+                    "start_position": match.start_position,
+                    "end_position": match.end_position,
+                }
+            )
+
+        detailed_results.append(
+            {
+                "result_id": result.id,
+                "source_document_id": result.source_document_id,
+                "source_document_title": source_title,
+                "chapter": result.chapter,
+                "similarity_score": result.similarity_score,
+                "similarity_percentage": f"{round(result.similarity_score * 100, 2)}%",
+                "matches": sentence_matches,
+            }
+        )
+
+    extraction_metadata = (
+        target_document.extraction_metadata
+        if target_document and isinstance(target_document.extraction_metadata, dict)
+        else {}
+    )
+    highlighted_pdf_available = bool(
+        check.highlighted_file_path and os.path.exists(check.highlighted_file_path)
+    )
+    is_completed = check.status == "completed"
+
+    return {
+        "check_id": check.id,
+        "document_id": check.document_id,
+        "status": check.status,
+        "progress": 100 if is_completed else int(check.progress or 0),
+        "is_finished": check.status in {"completed", "failed"},
+        "message": check.processing_message,
+        "error": check.error_message if check.status == "failed" else None,
+        "target_document": target_document.title if target_document else "Dokumen tidak ditemukan",
+        "overall_similarity": check.overall_similarity,
+        "highest_similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
+        "similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
+        "total_repository_checked": len(stored_results),
+        "total_repository_available": _repository_available_count(check, db),
+        "matches": source_matches,
+        "results": detailed_results,
+        "total_plagiarized_sentences": len(persisted_highlight_matches),
+        "highlight_summary": similarity_result_service.summarize_highlight_matches(
+            persisted_highlight_matches
+        ),
+        "highlighted_pdf_available": highlighted_pdf_available,
+        "highlighted_pdf_url": (
+            f"/api/plagiarism/check/{check.id}/download-highlighted"
+            if highlighted_pdf_available
+            else None
+        ),
+        "chapter_validation": extraction_metadata.get("chapter_validation"),
+        "completed_at": check.completed_at.isoformat() if check.completed_at else None,
+    }
+
+
 @router.get("/check/{check_id}/status")
 def get_check_processing_status(
     check_id: int,
@@ -320,43 +451,11 @@ def get_check_matches(
     if not _can_access_check(check, current_user, db):
         raise HTTPException(status_code=403, detail="Anda tidak memiliki izin untuk melihat hasil ini.")
 
-    stored_results = (
-        db.query(SimilarityResult)
-        .filter(SimilarityResult.check_id == check_id)
-        .order_by(SimilarityResult.similarity_score.desc())
-        .all()
+    return _serialize_check_final_result(
+        check,
+        _get_stored_check_results(check_id, db),
+        db,
     )
-
-    return {
-        "check_id": check.id,
-        "document_id": check.document_id,
-        "overall_similarity": check.overall_similarity,
-        "similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
-        "results": [
-            {
-                "result_id": result.id,
-                "source_document_id": result.source_document_id,
-                "source_document_title": result.source_document.title if result.source_document else None,
-                "chapter": result.chapter,
-                "similarity_score": result.similarity_score,
-                "similarity_percentage": f"{round(result.similarity_score * 100, 2)}%",
-                "matches": [
-                    {
-                        "id": match.id,
-                        "source_text": match.source_text,
-                        "submitted_text": match.submitted_text,
-                        "similarity_score": match.similarity_score,
-                        "similarity_percentage": f"{round(match.similarity_score * 100, 2)}%",
-                        "page_number": match.page_number,
-                        "start_position": match.start_position,
-                        "end_position": match.end_position,
-                    }
-                    for match in result.matches
-                ],
-            }
-            for result in stored_results
-        ],
-    }
 
 @router.get("/check/{check_id}/download-highlighted")
 def download_highlighted_pdf(

@@ -6,8 +6,8 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database.session import Base
-from app.models.schemas import Document, PlagiarismCheck, User
-from app.routes.plagiarism import get_check_processing_status
+from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User
+from app.routes.plagiarism import get_check_matches, get_check_processing_status
 from app.routes import documents as document_routes
 from app.services.repository_check_service import (
     RepositoryCheckService,
@@ -212,6 +212,95 @@ def test_status_endpoint_returns_progress_only_to_the_check_owner():
         raise AssertionError("Expected another student to be denied")
 
 
+def test_matches_endpoint_returns_final_payload_after_progress_completes():
+    db = _make_session()
+    owner = User(identifier="owner", password="secret", role="mahasiswa")
+    source_owner = User(identifier="source-owner", password="secret", role="mahasiswa")
+    db.add_all([owner, source_owner])
+    db.commit()
+    db.refresh(owner)
+    db.refresh(source_owner)
+
+    target = Document(
+        user_id=owner.id,
+        title="target.pdf",
+        document_type="proposal",
+        file_path="target.pdf",
+        extraction_metadata={
+            "chapter_validation": {
+                "has_warning": False,
+                "detected_chapters": [{"chapter": 1, "page": 1}],
+            }
+        },
+    )
+    source = Document(
+        user_id=source_owner.id,
+        title="source.pdf",
+        document_type="proposal",
+        file_path="source.pdf",
+    )
+    db.add_all([target, source])
+    db.commit()
+    db.refresh(target)
+    db.refresh(source)
+
+    check = PlagiarismCheck(
+        document_id=target.id,
+        user_id=owner.id,
+        overall_similarity=0.816,
+        status="completed",
+        progress=100,
+        processing_stage="completed",
+        processing_message="Pengecekan kemiripan selesai.",
+    )
+    db.add(check)
+    db.commit()
+    db.refresh(check)
+
+    result = SimilarityResult(
+        check_id=check.id,
+        source_document_id=source.id,
+        similarity_score=0.816,
+    )
+    db.add(result)
+    db.commit()
+    db.refresh(result)
+    db.add(
+        SimilarityMatch(
+            result_id=result.id,
+            source_text="Kalimat sumber yang sama.",
+            submitted_text="Kalimat target yang sama.",
+            similarity_score=0.915,
+            page_number=3,
+            start_position=0,
+            end_position=25,
+        )
+    )
+    db.commit()
+
+    payload = get_check_matches(check.id, current_user=owner, db=db)
+
+    assert payload["status"] == "completed"
+    assert payload["target_document"] == "target.pdf"
+    assert payload["highest_similarity_percentage"] == "81.6%"
+    assert payload["total_repository_checked"] == 1
+    assert payload["total_repository_available"] == 1
+    assert payload["matches"] == [
+        {
+            "repository_document_id": source.id,
+            "title": "source.pdf",
+            "similarity_score": 0.816,
+            "similarity_percentage": "81.6%",
+        }
+    ]
+    assert payload["total_plagiarized_sentences"] == 1
+    assert payload["highlight_summary"]["highlighted_match_count"] == 1
+    assert payload["highlight_summary"]["highlighted_page_numbers"] == [3]
+    assert payload["highlight_summary"]["source_documents"][0]["title"] == "source.pdf"
+    assert payload["chapter_validation"]["has_warning"] is False
+    assert payload["results"][0]["matches"][0]["submitted_text"] == "Kalimat target yang sama."
+
+
 def test_upload_and_check_returns_pending_check_and_schedules_background_work(monkeypatch):
     db = _make_session()
     owner = User(identifier="uploader", password="secret", role="mahasiswa")
@@ -253,6 +342,7 @@ def test_upload_and_check_returns_pending_check_and_schedules_background_work(mo
     assert payload["status"] == "pending"
     assert payload["progress"] == 0
     assert payload["status_url"] == f"/api/plagiarism/check/{check.id}/status"
+    assert payload["result_url"] == f"/api/plagiarism/check/{check.id}/matches"
     assert check.status == "pending"
     assert check.document_id == document.id
     assert len(background_tasks.tasks) == 1

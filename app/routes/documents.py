@@ -15,6 +15,7 @@ from app.routes.auth import get_current_user, get_optional_current_user
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
+from app.services.document_structure_service import DocumentStructureService
 from app.services.document_text_service import DocumentTextService
 from app.services.repository_check_service import run_repository_check_in_background
 
@@ -27,6 +28,7 @@ document_index_service = DocumentIndexService(
     document_chunk_service=document_chunk_service,
 )
 document_embedding_service = DocumentEmbeddingService(document_chunk_service=document_chunk_service)
+document_structure_service = DocumentStructureService()
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
@@ -37,6 +39,7 @@ ALLOWED_PDF_CONTENT_TYPES = {
     "applications/vnd.pdf",
     "text/pdf",
 }
+ALLOWED_FILENAME_STEM_PUNCTUATION = {" ", "_", "-", ".", "(", ")"}
 
 
 class ReindexDocumentsRequest(BaseModel):
@@ -86,6 +89,33 @@ def _effective_upload_user_id(current_user: Optional[User], user_id: Optional[in
     return user_id
 
 
+def _validate_uploaded_filename(filename: Optional[str]) -> str:
+    """Return a safe display/storage filename or reject unsupported characters."""
+    raw_filename = filename or ""
+    if "/" in raw_filename or "\\" in raw_filename:
+        raise HTTPException(status_code=400, detail="Nama file tidak valid.")
+
+    original_filename = Path(raw_filename).name
+    if not original_filename or Path(original_filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
+
+    stem = Path(original_filename).stem
+    has_letter_or_number = any(character.isalnum() for character in stem)
+    has_unsupported_character = any(
+        not (character.isalnum() or character in ALLOWED_FILENAME_STEM_PUNCTUATION)
+        for character in stem
+    )
+    if not has_letter_or_number or has_unsupported_character:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nama file hanya boleh berisi huruf, angka, spasi, tanda kurung, "
+                "titik, garis bawah, atau tanda hubung."
+            ),
+        )
+    return original_filename
+
+
 async def _store_uploaded_document(
     *,
     file: UploadFile,
@@ -94,17 +124,16 @@ async def _store_uploaded_document(
     db: Session,
 ) -> Document:
     """Validate, store, and persist one PDF without using the raw filename as a path."""
-    original_filename = Path(file.filename or "").name
-    if not original_filename or Path(original_filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
+    original_filename = _validate_uploaded_filename(file.filename)
 
     content_type = (file.content_type or "").lower()
     if content_type and content_type not in ALLOWED_PDF_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="Tipe konten file harus berupa PDF.")
 
-    clean_type = document_type.strip().lower()
-    if not clean_type:
-        raise HTTPException(status_code=400, detail="Tipe dokumen wajib diisi (skripsi/proposal).")
+    try:
+        clean_type = document_structure_service.normalize_document_type(document_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     stored_filename = f"{uuid4().hex}_{original_filename}"
     file_path = UPLOAD_DIR / stored_filename
@@ -123,6 +152,22 @@ async def _store_uploaded_document(
 
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="File PDF tidak boleh kosong.")
+
+        structure_validation = document_structure_service.validate_pdf_structure(
+            file_path,
+            clean_type,
+        )
+        if not structure_validation["is_valid"]:
+            logger.info(
+                "Menolak upload %s karena struktur %s: %s",
+                original_filename,
+                structure_validation["error_code"],
+                structure_validation["message"],
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=structure_validation["message"],
+            )
 
         db_doc = Document(
             user_id=user_id,
@@ -311,6 +356,7 @@ async def upload_and_check_document(
         "stage": check_record.processing_stage,
         "message": check_record.processing_message,
         "status_url": f"/api/plagiarism/check/{check_record.id}/status",
+        "result_url": f"/api/plagiarism/check/{check_record.id}/matches",
         "poll_after_ms": 1000,
     }
 
