@@ -84,7 +84,11 @@ def get_dashboard_summary(
         .order_by(PlagiarismCheck.created_at.desc(), PlagiarismCheck.id.desc())
         .all()
     )
-    latest_checks = _latest_checks_per_document(checks)
+    completed_checks = [check for check in checks if check.status == "completed"]
+    latest_checks = _latest_checks_per_document(completed_checks)
+    processing_check_count = sum(
+        1 for check in checks if check.status in {"pending", "processing"}
+    )
 
     approval_counts = {
         "belum disetujui": 0,
@@ -109,7 +113,9 @@ def get_dashboard_summary(
         tzinfo=None,
     )
     today_check_count = sum(
-        1 for check in checks if check.created_at and check.created_at >= start_of_today
+        1
+        for check in completed_checks
+        if check.created_at and check.created_at >= start_of_today
     )
 
     supervised_student_count = 0
@@ -123,7 +129,8 @@ def get_dashboard_summary(
     return {
         "role": current_user.role,
         "document_count": document_count,
-        "total_check_count": len(checks),
+        "total_check_count": len(completed_checks),
+        "processing_check_count": processing_check_count,
         "latest_check_count": len(latest_checks),
         "today_check_count": today_check_count,
         "average_similarity": round(average_similarity, 4),

@@ -165,6 +165,13 @@ class PlagiarismCheck(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     overall_similarity = Column(Float, nullable=False)
     status = Column(String, default="completed")
+    progress = Column(Integer, nullable=False, default=0)
+    processing_stage = Column(String(64), nullable=True)
+    processing_message = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     approval_status = Column(String, default="belum disetujui")  # 'belum disetujui', 'disetujui', 'revisi'
     reviewed_at = Column(DateTime, nullable=True)
     reviewer_note = Column(Text, nullable=True)

@@ -76,6 +76,15 @@ def _seed_dashboard_data(db):
             approval_status="belum disetujui",
             status="completed",
         ),
+        PlagiarismCheck(
+            document_id=document_bimbingan.id,
+            user_id=mahasiswa_bimbingan.id,
+            overall_similarity=0.0,
+            approval_status="belum disetujui",
+            status="processing",
+            progress=55,
+            processing_stage="comparing_documents",
+        ),
     ])
     db.commit()
     return admin, dosen_user, mahasiswa_bimbingan
@@ -94,6 +103,7 @@ def test_dashboard_summary_scopes_counts_by_role():
     assert mahasiswa_summary["latest_check_count"] == 1
     assert mahasiswa_summary["approved_count"] == 1
     assert mahasiswa_summary["average_similarity"] == 0.18
+    assert mahasiswa_summary["processing_check_count"] == 1
 
     assert dosen_summary["supervised_student_count"] == 1
     assert dosen_summary["document_count"] == 1
@@ -105,3 +115,4 @@ def test_dashboard_summary_scopes_counts_by_role():
     assert admin_summary["latest_check_count"] == 2
     assert admin_summary["approved_count"] == 1
     assert admin_summary["pending_review_count"] == 1
+    assert admin_summary["processing_check_count"] == 1

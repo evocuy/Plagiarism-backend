@@ -5,6 +5,22 @@ from app.database.session import engine
 
 def ensure_runtime_columns() -> None:
     with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_message TEXT"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS error_message TEXT"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
+        conn.execute(text("""
+            UPDATE plagiarism_checks
+            SET progress = 100,
+                processing_stage = COALESCE(processing_stage, 'completed'),
+                processing_message = COALESCE(processing_message, 'Pengecekan kemiripan selesai.'),
+                completed_at = COALESCE(completed_at, created_at),
+                updated_at = COALESCE(updated_at, created_at)
+            WHERE status = 'completed' AND progress < 100
+        """))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extracted_text TEXT"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS cleaned_text TEXT"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_metadata JSONB"))

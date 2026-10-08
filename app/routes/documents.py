@@ -1,19 +1,22 @@
-import shutil
 import logging
+import os
 from pathlib import Path
 from typing import Optional, List
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Body
+from uuid import uuid4
+
+from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form, HTTPException, Depends, Body, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
 
 from app.database.session import get_db
-from app.models.schemas import Document, User, Mahasiswa
-from app.routes.auth import get_optional_current_user, get_current_user
+from app.models.schemas import Document, PlagiarismCheck, User, Mahasiswa, utc_now
+from app.routes.auth import get_current_user, get_optional_current_user
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
 from app.services.document_text_service import DocumentTextService
+from app.services.repository_check_service import run_repository_check_in_background
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -26,6 +29,14 @@ document_index_service = DocumentIndexService(
 document_embedding_service = DocumentEmbeddingService(document_chunk_service=document_chunk_service)
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
+ALLOWED_PDF_CONTENT_TYPES = {
+    "application/pdf",
+    "application/x-pdf",
+    "application/acrobat",
+    "applications/vnd.pdf",
+    "text/pdf",
+}
 
 
 class ReindexDocumentsRequest(BaseModel):
@@ -68,6 +79,70 @@ def _visible_documents_query(current_user: Optional[User], db: Session):
         query = query.filter(Document.user_id.in_(bimbingan_user_ids))
     return query
 
+
+def _effective_upload_user_id(current_user: Optional[User], user_id: Optional[int]) -> Optional[int]:
+    if current_user:
+        return current_user.id
+    return user_id
+
+
+async def _store_uploaded_document(
+    *,
+    file: UploadFile,
+    document_type: str,
+    user_id: Optional[int],
+    db: Session,
+) -> Document:
+    """Validate, store, and persist one PDF without using the raw filename as a path."""
+    original_filename = Path(file.filename or "").name
+    if not original_filename or Path(original_filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
+
+    content_type = (file.content_type or "").lower()
+    if content_type and content_type not in ALLOWED_PDF_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Tipe konten file harus berupa PDF.")
+
+    clean_type = document_type.strip().lower()
+    if not clean_type:
+        raise HTTPException(status_code=400, detail="Tipe dokumen wajib diisi (skripsi/proposal).")
+
+    stored_filename = f"{uuid4().hex}_{original_filename}"
+    file_path = UPLOAD_DIR / stored_filename
+    total_bytes = 0
+
+    try:
+        with file_path.open("wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Ukuran file melebihi batas {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                    )
+                buffer.write(chunk)
+
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="File PDF tidak boleh kosong.")
+
+        db_doc = Document(
+            user_id=user_id,
+            title=original_filename,
+            document_type=clean_type,
+            file_path=str(file_path),
+        )
+        db.add(db_doc)
+        db.commit()
+        db.refresh(db_doc)
+        return db_doc
+    except Exception:
+        db.rollback()
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except OSError as cleanup_error:
+            logger.warning("Gagal menghapus file upload yang dibatalkan %s: %s", file_path, cleanup_error)
+        raise
+
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
@@ -77,33 +152,12 @@ async def upload_document(
     current_user: Optional[User] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Hanya file PDF yang diizinkan.")
-
-    clean_type = document_type.strip().lower()
-    if not clean_type:
-        raise HTTPException(status_code=400, detail="Tipe dokumen wajib diisi (skripsi/proposal).")
-
-    file_path = UPLOAD_DIR / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Kaitkan dokumen dengan user ID jika ada session / parameter
-    effective_user_id = None
-    if current_user:
-        effective_user_id = current_user.id
-    elif user_id:
-        effective_user_id = user_id
-
-    db_doc = Document(
-        user_id=effective_user_id,
-        title=file.filename,
-        document_type=clean_type,
-        file_path=str(file_path),
+    db_doc = await _store_uploaded_document(
+        file=file,
+        document_type=document_type,
+        user_id=_effective_upload_user_id(current_user, user_id),
+        db=db,
     )
-    db.add(db_doc)
-    db.commit()
-    db.refresh(db_doc)
 
     text_cache_status = "completed"
     text_cache_error = None
@@ -171,6 +225,93 @@ async def upload_document(
         "chunk_cache_error": chunk_cache_error,
         "embedding_auto_index": embedding_auto_index,
         "message": f"File berhasil diunggah sebagai dokumen {db_doc.document_type.upper()} dan tersimpan di database.",
+    }
+
+
+@router.post("/upload-and-check", status_code=status.HTTP_202_ACCEPTED)
+async def upload_and_check_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    document_type: str = Form(...),
+    user_id: Optional[int] = Form(None),
+    candidate_limit: int = Form(20),
+    auto_index_embeddings: bool = Form(True),
+    auto_index_repository_limit: int = Form(50),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a PDF and start its repository check without holding the request open."""
+    if not 1 <= candidate_limit <= 100:
+        raise HTTPException(status_code=400, detail="candidate_limit harus berada di antara 1 dan 100.")
+    if not 0 <= auto_index_repository_limit <= 500:
+        raise HTTPException(
+            status_code=400,
+            detail="auto_index_repository_limit harus berada di antara 0 dan 500.",
+        )
+
+    # For this asynchronous flow the authenticated uploader owns the job.
+    # ``user_id`` is kept in the form contract for client compatibility.
+    effective_user_id = current_user.id
+    db_doc = await _store_uploaded_document(
+        file=file,
+        document_type=document_type,
+        user_id=effective_user_id,
+        db=db,
+    )
+
+    check_record = PlagiarismCheck(
+        document_id=db_doc.id,
+        user_id=effective_user_id,
+        overall_similarity=0.0,
+        status="pending",
+        progress=0,
+        processing_stage="queued",
+        processing_message="File diterima dan menunggu proses pengecekan.",
+        updated_at=utc_now(),
+    )
+    try:
+        db.add(check_record)
+        db.commit()
+        db.refresh(check_record)
+    except Exception:
+        stored_file_path = Path(db_doc.file_path)
+        db.rollback()
+        try:
+            db.delete(db_doc)
+            db.commit()
+        finally:
+            try:
+                if stored_file_path.exists():
+                    stored_file_path.unlink()
+            except OSError as cleanup_error:
+                logger.warning(
+                    "Gagal menghapus file upload untuk check yang batal %s: %s",
+                    stored_file_path,
+                    cleanup_error,
+                )
+        raise
+
+    background_tasks.add_task(
+        run_repository_check_in_background,
+        document_id=db_doc.id,
+        check_id=check_record.id,
+        requester_user_id=effective_user_id,
+        candidate_limit=candidate_limit,
+        auto_index_embeddings=auto_index_embeddings,
+        auto_index_repository_limit=auto_index_repository_limit,
+    )
+
+    return {
+        "check_id": check_record.id,
+        "document_id": db_doc.id,
+        "filename": db_doc.title,
+        "document_type": db_doc.document_type,
+        "status": check_record.status,
+        "progress": check_record.progress,
+        "stage": check_record.processing_stage,
+        "message": check_record.processing_message,
+        "status_url": f"/api/plagiarism/check/{check_record.id}/status",
+        "poll_after_ms": 1000,
     }
 
 @router.get("/")
