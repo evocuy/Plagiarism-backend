@@ -82,6 +82,34 @@ def test_find_candidates_prefers_repository_documents_with_similar_chunks():
     assert result["target_chapters"] == ["bab_2"]
 
 
+def test_find_candidates_skips_ranking_when_candidate_limit_covers_repository():
+    target = FakeDocument(1, "target.pdf")
+    first_repo = FakeDocument(2, "first.pdf")
+    second_repo = FakeDocument(3, "second.pdf")
+    chunk_service = FakeChunkService({
+        1: [{"clean": "target text", "sentence": "Target text.", "chunk_index": 0, "page": 1, "chapter": "bab_1"}],
+        2: [{"clean": "first text", "sentence": "First text.", "chunk_index": 0, "page": 2, "chapter": "bab_1"}],
+        3: [{"clean": "second text", "sentence": "Second text.", "chunk_index": 0, "page": 3, "chapter": "bab_2"}],
+    })
+    service = RepositoryCandidateService(document_chunk_service=chunk_service)
+    service._rank_semantic_candidates = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("semantic ranking must not run when all documents fit the limit")
+    )
+
+    result = service.find_candidates(
+        target_document=target,
+        repository_documents=[first_repo, second_repo],
+        db=object(),
+        top_k=2,
+    )
+
+    assert result["candidate_strategy"] == "all_repository_documents"
+    assert result["candidate_strategy_reason"] == "candidate_limit_covers_repository"
+    assert result["semantic_search_used"] is False
+    assert [candidate["document"].id for candidate in result["candidates"]] == [2, 3]
+    assert {item["source_document_id"] for item in result["reference_corpus"]} == {2, 3}
+
+
 def test_find_candidates_prefers_same_chapter_references_when_available():
     target = FakeDocument(1, "target.pdf")
     wrong_chapter_repo = FakeDocument(2, "wrong-chapter.pdf")

@@ -137,6 +137,12 @@ class RepositoryCheckService:
                 "Menyiapkan indeks dokumen repositori.",
                 report_progress,
             )
+            # When every repository document will be compared, candidate
+            # retrieval cannot remove any document.  Skip embedding API work
+            # and the per-sentence pgvector queries in that common small-repo
+            # case; the final TF-IDF score and exact-match detail still run for
+            # every repository document.
+            candidate_ranking_needed = len(repo_docs) > candidate_limit
             embedding_auto_index = (
                 self._auto_index_embeddings_for_check(
                     target_doc=target_doc,
@@ -153,10 +159,17 @@ class RepositoryCheckService:
                         report_progress,
                     ),
                 )
-                if repo_docs
+                if repo_docs and auto_index_embeddings and candidate_ranking_needed
                 else self._empty_embedding_status(
                     enabled=auto_index_embeddings,
                     repository_limit=auto_index_repository_limit,
+                    reason=(
+                        "skipped_candidate_limit_covers_repository"
+                        if repo_docs and candidate_ranking_needed is False and auto_index_embeddings
+                        else "disabled_by_request"
+                        if not auto_index_embeddings
+                        else "repository_empty"
+                    ),
                 )
             )
 
@@ -596,7 +609,13 @@ class RepositoryCheckService:
             "total_failed": index_result.get("total_failed", 0),
         }
 
-    def _empty_embedding_status(self, *, enabled: bool, repository_limit: int) -> Dict[str, Any]:
+    def _empty_embedding_status(
+        self,
+        *,
+        enabled: bool,
+        repository_limit: int,
+        reason: str = "repository_empty",
+    ) -> Dict[str, Any]:
         return {
             "enabled": enabled,
             "configured": self.document_embedding_service.embedding_service.is_configured(),
@@ -606,7 +625,7 @@ class RepositoryCheckService:
             "repository": [],
             "total_repository_considered": 0,
             "total_failed": 0,
-            "reason": "repository_empty",
+            "reason": reason,
         }
 
     def _generate_highlighted_pdf(

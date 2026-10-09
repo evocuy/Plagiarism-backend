@@ -58,6 +58,40 @@ class RepositoryCandidateService:
         target_chapters = self._extract_chapters(target_chunks)
         documents_by_id = {document.id: document for document in repository_documents}
 
+        # Candidate ranking only has value when it can exclude a portion of the
+        # repository.  Running one pgvector nearest-neighbour query per target
+        # sentence is expensive (hundreds of queries for a thesis), while it
+        # cannot change the selected documents when the whole repository fits
+        # within ``top_k``.  Compare every available document directly in that
+        # case and reserve semantic/TF-IDF candidate ranking for larger repos.
+        if len(repository_documents) <= top_k:
+            reference_corpus = self._build_reference_corpus(repository_documents, db)
+            repository_chapters = self._extract_chapters(reference_corpus)
+            return {
+                "target_chunks": target_chunks,
+                "reference_corpus": reference_corpus,
+                "candidates": [
+                    {
+                        "document": document,
+                        "candidate_score": 0.0,
+                        "matched_chunk_count": 0,
+                        "chapter_matched_count": 0,
+                        "average_score": 0.0,
+                    }
+                    for document in repository_documents
+                ],
+                "total_repository_documents": len(repository_documents),
+                "total_repository_chunks": len(reference_corpus),
+                "target_chapters": target_chapters,
+                "chapter_aware": bool(set(target_chapters) & set(repository_chapters)),
+                "candidate_strategy": "all_repository_documents",
+                "candidate_strategy_reason": "candidate_limit_covers_repository",
+                "semantic_search_used": False,
+                "semantic_fallback_reason": "candidate_limit_covers_repository",
+                "total_target_embedding_chunks": 0,
+                "total_repository_embedding_chunks": 0,
+            }
+
         semantic_result = self._rank_semantic_candidates(
             target_document=target_document,
             repository_documents=repository_documents,
