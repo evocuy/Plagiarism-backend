@@ -10,8 +10,8 @@ from sqlalchemy import text
 from pydantic import BaseModel
 
 from app.database.session import get_db
-from app.models.schemas import Document, PlagiarismCheck, User, Mahasiswa, utc_now
-from app.routes.auth import get_current_user, get_optional_current_user
+from app.models.schemas import Document, PlagiarismCheck, SimilarityResult, User, Mahasiswa, utc_now
+from app.routes.auth import get_current_user, get_optional_current_user, require_admin
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
@@ -114,6 +114,47 @@ def _validate_uploaded_filename(filename: Optional[str]) -> str:
             ),
         )
     return original_filename
+
+
+def _delete_managed_upload_file(file_path: Optional[str]) -> bool:
+    """Delete an artifact only when it belongs to this backend's upload directory."""
+    if not file_path:
+        return False
+
+    try:
+        upload_root = UPLOAD_DIR.resolve()
+        candidate = Path(file_path).resolve()
+        if not candidate.is_relative_to(upload_root):
+            logger.warning("Melewati penghapusan file di luar upload directory: %s", candidate)
+            return False
+        if not candidate.is_file():
+            return False
+        candidate.unlink()
+        return True
+    except (OSError, RuntimeError, ValueError) as error:
+        logger.warning("Gagal menghapus file dokumen %s: %s", file_path, error)
+        return False
+
+
+def _is_file_referenced_elsewhere(
+    file_path: str,
+    document_id: int,
+    check_ids: List[int],
+    db: Session,
+) -> bool:
+    if (
+        db.query(Document.id)
+        .filter(Document.id != document_id, Document.file_path == file_path)
+        .first()
+    ):
+        return True
+
+    highlighted_query = db.query(PlagiarismCheck.id).filter(
+        PlagiarismCheck.highlighted_file_path == file_path
+    )
+    if check_ids:
+        highlighted_query = highlighted_query.filter(~PlagiarismCheck.id.in_(check_ids))
+    return highlighted_query.first() is not None
 
 
 async def _store_uploaded_document(
@@ -531,7 +572,10 @@ def index_single_document_embeddings(
         raise HTTPException(status_code=500, detail=f"Gagal index embedding dokumen: {str(err)}")
 
 @router.delete("/clear")
-def clear_all_documents(db: Session = Depends(get_db)):
+def clear_all_documents(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     db.execute(text("TRUNCATE TABLE documents, plagiarism_checks RESTART IDENTITY CASCADE;"))
     db.commit()
 
@@ -542,3 +586,73 @@ def clear_all_documents(db: Session = Depends(get_db)):
             pass
 
     return {"message": "Seluruh isi tabel database dan file di folder uploads berhasil dibersihkan, ID telah di-reset ke 1."}
+
+
+@router.delete("/{document_id}")
+def delete_document(
+    document_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin-only deletion of one document and its local processing artifacts."""
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
+
+    check_records = (
+        db.query(PlagiarismCheck)
+        .filter(PlagiarismCheck.document_id == document_id)
+        .all()
+    )
+    if any(check.status in {"pending", "processing"} for check in check_records):
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen tidak dapat dihapus saat pengecekan masih diproses.",
+        )
+    check_ids = [check.id for check in check_records]
+    candidate_file_paths = {
+        path
+        for path in [
+            document.file_path,
+            *(check.highlighted_file_path for check in check_records),
+        ]
+        if path
+    }
+    file_paths_to_remove = [
+        path
+        for path in candidate_file_paths
+        if not _is_file_referenced_elsewhere(path, document_id, check_ids, db)
+    ]
+
+    try:
+        # A document may be the source of another user's check.  Delete those
+        # result rows first, because source_document_id is non-nullable.
+        source_results = (
+            db.query(SimilarityResult)
+            .filter(SimilarityResult.source_document_id == document_id)
+            .all()
+        )
+        for result in source_results:
+            db.delete(result)
+        db.flush()
+
+        document_title = document.title
+        deleted_check_count = len(check_records)
+        db.delete(document)
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        logger.exception("Gagal menghapus dokumen %s: %s", document_id, error)
+        raise HTTPException(status_code=500, detail="Gagal menghapus dokumen.") from error
+
+    deleted_file_count = sum(
+        _delete_managed_upload_file(file_path)
+        for file_path in file_paths_to_remove
+    )
+    return {
+        "document_id": document_id,
+        "title": document_title,
+        "deleted_check_count": deleted_check_count,
+        "deleted_file_count": deleted_file_count,
+        "message": f"Dokumen '{document_title}' berhasil dihapus.",
+    }
