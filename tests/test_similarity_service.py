@@ -149,3 +149,47 @@ def test_sentence_matching_ignores_segment_that_only_matches_after_stopword_remo
     )
 
     assert matches == []
+
+
+def test_sentence_matching_counts_identical_sources_independently():
+    service = SimilarityService()
+    target_sentences = [
+        {
+            "page": 13,
+            "sentence": "Sistem informasi akademik digunakan untuk mengelola data mahasiswa.",
+        },
+        {
+            "page": 24,
+            "sentence": "Aplikasi ini membantu proses bimbingan skripsi mahasiswa.",
+        },
+    ]
+    reference_corpus = []
+    for source_document_id in (4, 6):
+        for target in target_sentences:
+            reference_corpus.append(
+                {
+                    "clean": service.clean_text(target["sentence"]),
+                    "sentence": target["sentence"],
+                    "matched_source": "duplicate.pdf",
+                    "source_document_id": source_document_id,
+                }
+            )
+
+    matches = service.find_sentence_matches_per_source(
+        target_sentences=target_sentences,
+        reference_corpus=reference_corpus,
+        threshold=0.70,
+    )
+    matches_by_source = {
+        source_document_id: [
+            match
+            for match in matches
+            if match["source_document_id"] == source_document_id
+        ]
+        for source_document_id in (4, 6)
+    }
+
+    assert len(matches_by_source[4]) == 2
+    assert len(matches_by_source[6]) == 2
+    assert [match["page"] for match in matches_by_source[4]] == [13, 24]
+    assert [match["page"] for match in matches_by_source[6]] == [13, 24]

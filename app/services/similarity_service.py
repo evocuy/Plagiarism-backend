@@ -161,6 +161,38 @@ class SimilarityService:
             threshold=threshold,
         )
 
+    def find_sentence_matches_per_source(
+        self,
+        target_sentences: Sequence[Dict[str, Any]],
+        reference_corpus: Sequence[Dict[str, Any]],
+        threshold: float = 0.70,
+    ) -> List[Dict[str, Any]]:
+        """Match each repository document independently.
+
+        A repository check can contain duplicate documents.  Running one
+        matcher against their combined corpus assigns tied sentences to just
+        one source based on corpus order.  Grouping the corpus first makes the
+        persisted match count and page list describe each source document.
+        """
+        references_by_source: Dict[Tuple[Optional[int], str], List[Dict[str, Any]]] = {}
+        for reference in reference_corpus:
+            source_key = (
+                reference.get("source_document_id"),
+                str(reference.get("matched_source") or ""),
+            )
+            references_by_source.setdefault(source_key, []).append(reference)
+
+        matches = []
+        for source_references in references_by_source.values():
+            matches.extend(
+                self.find_sentence_matches_against_references(
+                    target_sentences=target_sentences,
+                    reference_corpus=source_references,
+                    threshold=threshold,
+                )
+            )
+        return matches
+
     def find_sentence_matches_against_references(
         self,
         target_sentences: Sequence[Dict[str, Any]],

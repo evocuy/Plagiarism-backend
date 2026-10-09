@@ -300,7 +300,7 @@ class RepositoryCheckService:
                     "Mencari kalimat yang sama persis.",
                     report_progress,
                 )
-                lexical_matches = self.similarity_service.find_sentence_matches_against_references(
+                lexical_matches = self.similarity_service.find_sentence_matches_per_source(
                     target_sentences=target_chunks,
                     reference_corpus=repo_sentences_all,
                     threshold=0.70,
@@ -345,7 +345,9 @@ class RepositoryCheckService:
                 highlighted_file = self._generate_highlighted_pdf(
                     check_record=check_record,
                     target_doc=target_doc,
-                    plagiarized_sentences=plagiarized_sentences,
+                    plagiarized_sentences=self._deduplicate_visual_highlight_matches(
+                        plagiarized_sentences
+                    ),
                     db=db,
                 )
             except Exception as highlight_error:
@@ -667,6 +669,29 @@ class RepositoryCheckService:
                     seen.add(key)
                     merged.append(match)
         return merged
+
+    @staticmethod
+    def _deduplicate_visual_highlight_matches(
+        matches: Iterable[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Keep one PDF annotation for a target segment shared by many sources."""
+        visual_matches: List[Dict[str, Any]] = []
+        seen = set()
+        for match in matches or []:
+            sentence = " ".join((match.get("sentence") or "").split()).casefold()
+            if not sentence:
+                continue
+            key = (
+                match.get("page"),
+                sentence,
+                match.get("start_position"),
+                match.get("end_position"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            visual_matches.append(match)
+        return visual_matches
 
     def _notify_progress(
         self,

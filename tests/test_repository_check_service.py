@@ -173,6 +173,29 @@ def test_background_runner_opens_and_closes_its_own_session():
     assert calls[-1] == "closed"
 
 
+def test_visual_highlight_deduplication_keeps_one_annotation_per_target_segment():
+    matches = [
+        {
+            "page": 13,
+            "sentence": "Kalimat yang sama persis.",
+            "start_position": 0,
+            "end_position": 25,
+            "source_document_id": 4,
+        },
+        {
+            "page": 13,
+            "sentence": "Kalimat yang sama persis.",
+            "start_position": 0,
+            "end_position": 25,
+            "source_document_id": 6,
+        },
+    ]
+
+    visual_matches = RepositoryCheckService._deduplicate_visual_highlight_matches(matches)
+
+    assert visual_matches == [matches[0]]
+
+
 def test_status_endpoint_returns_progress_only_to_the_check_owner():
     db = _make_session()
     owner = User(identifier="owner", password="secret", role="mahasiswa")
