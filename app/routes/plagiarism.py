@@ -50,8 +50,16 @@ def check_similarity(
     db: Session = Depends(get_db),
 ):
     """Membandingkan 2 dokumen secara spesifik (dokumen A vs dokumen B) serta memberi highlight pada kalimat terdeteksi plagiat"""
-    doc_a = db.query(Document).filter(Document.id == request.document_id).first()
-    doc_b = db.query(Document).filter(Document.id == request.reference_document_id).first()
+    doc_a = (
+        db.query(Document)
+        .filter(Document.id == request.document_id, Document.deleted_at.is_(None))
+        .first()
+    )
+    doc_b = (
+        db.query(Document)
+        .filter(Document.id == request.reference_document_id, Document.deleted_at.is_(None))
+        .first()
+    )
 
     if not doc_a or not doc_b:
         raise HTTPException(status_code=404, detail="Salah satu atau kedua dokumen tidak ditemukan di database.")
@@ -188,10 +196,14 @@ def get_check_history(
     - Dosen: riwayat naskah mahasiswa bimbingannya.
     - Admin: seluruh riwayat.
     """
-    query = db.query(PlagiarismCheck)
+    query = (
+        db.query(PlagiarismCheck)
+        .join(Document, PlagiarismCheck.document_id == Document.id)
+        .filter(Document.deleted_at.is_(None))
+    )
 
     if current_user and current_user.role == "mahasiswa":
-        query = query.join(Document, PlagiarismCheck.document_id == Document.id).filter(
+        query = query.filter(
             (PlagiarismCheck.user_id == current_user.id) | (Document.user_id == current_user.id)
         )
     elif current_user and current_user.role == "dosen" and current_user.dosen:
@@ -203,9 +215,7 @@ def get_check_history(
             .all()
         )
         bimbingan_user_ids = [uid for (uid,) in bimbingan_user_ids]
-        query = query.join(Document, PlagiarismCheck.document_id == Document.id).filter(
-            Document.user_id.in_(bimbingan_user_ids)
-        )
+        query = query.filter(Document.user_id.in_(bimbingan_user_ids))
 
     checks = query.order_by(PlagiarismCheck.created_at.desc()).all()
 
@@ -267,6 +277,16 @@ def _can_access_check(check: PlagiarismCheck, user: Optional[User], db: Session)
     return False
 
 
+def _get_active_check(check_id: int, db: Session) -> Optional[PlagiarismCheck]:
+    """Return a check only while its target document remains active."""
+    return (
+        db.query(PlagiarismCheck)
+        .join(Document, PlagiarismCheck.document_id == Document.id)
+        .filter(PlagiarismCheck.id == check_id, Document.deleted_at.is_(None))
+        .first()
+    )
+
+
 def _serialize_check_progress(check: PlagiarismCheck) -> dict:
     is_completed = check.status == "completed"
     has_highlighted_pdf = bool(
@@ -321,7 +341,10 @@ def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
     if not target_document:
         return 0
 
-    query = db.query(Document).filter(Document.id != check.document_id)
+    query = db.query(Document).filter(
+        Document.id != check.document_id,
+        Document.deleted_at.is_(None),
+    )
     target_owner_id = target_document.user_id or check.user_id
     if target_owner_id is not None:
         query = query.filter(Document.user_id != target_owner_id)
@@ -462,7 +485,7 @@ def get_check_processing_status(
     db: Session = Depends(get_db),
 ):
     """Return persisted progress for a background repository check."""
-    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    check = _get_active_check(check_id, db)
     if not check:
         raise HTTPException(status_code=404, detail="Data pengecekan tidak ditemukan.")
     if not _can_access_check(check, current_user, db):
@@ -475,7 +498,7 @@ def get_check_matches(
     current_user: Optional[User] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    check = _get_active_check(check_id, db)
     if not check:
         raise HTTPException(status_code=404, detail="Data pengecekan tidak ditemukan.")
 
@@ -496,7 +519,7 @@ def get_check_top_matches(
     db: Session = Depends(get_db),
 ):
     """Return the three highest-scoring source documents for a historic check."""
-    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    check = _get_active_check(check_id, db)
     if not check:
         raise HTTPException(status_code=404, detail="Data pengecekan tidak ditemukan.")
     if not _can_access_check(check, current_user, db):
@@ -540,7 +563,7 @@ def download_highlighted_pdf(
     Mengunduh / membuka langsung PDF hasil pengecekan yang sudah distabilo kuning.
     Dapat diakses oleh Mahasiswa pemilik berkas dan Dosen pembimbingnya.
     """
-    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    check = _get_active_check(check_id, db)
     if not check:
         raise HTTPException(status_code=404, detail="Data pengecekan tidak ditemukan.")
 
@@ -592,7 +615,7 @@ def update_approval_status(
             detail="approval_status harus bernilai 'disetujui' atau 'revisi'.",
         )
 
-    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+    check = _get_active_check(check_id, db)
     if not check:
         raise HTTPException(status_code=404, detail="Check record tidak ditemukan.")
 

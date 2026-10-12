@@ -68,7 +68,7 @@ def _can_access_document(document: Document, user: Optional[User], db: Session) 
 
 
 def _visible_documents_query(current_user: Optional[User], db: Session):
-    query = db.query(Document)
+    query = db.query(Document).filter(Document.deleted_at.is_(None))
     if current_user and current_user.role == "mahasiswa":
         query = query.filter(Document.user_id == current_user.id)
     elif current_user and current_user.role == "dosen" and current_user.dosen:
@@ -524,7 +524,11 @@ def reindex_document(
     current_user: Optional[User] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    document = db.query(Document).filter(Document.id == document_id).first()
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.deleted_at.is_(None))
+        .first()
+    )
     if not document:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
 
@@ -553,7 +557,11 @@ def index_single_document_embeddings(
             detail="Embedding config belum lengkap. Pastikan EMBED_URL, EMBED_API_KEY, dan EMBED_MODEL tersedia.",
         )
 
-    document = db.query(Document).filter(Document.id == document_id).first()
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.deleted_at.is_(None))
+        .first()
+    )
     if not document:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
 
@@ -594,8 +602,12 @@ def delete_document(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Admin-only deletion of one document and its local processing artifacts."""
-    document = db.query(Document).filter(Document.id == document_id).first()
+    """Admin-only soft deletion that keeps the document and its artifacts recoverable."""
+    document = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.deleted_at.is_(None))
+        .first()
+    )
     if not document:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
 
@@ -609,50 +621,25 @@ def delete_document(
             status_code=409,
             detail="Dokumen tidak dapat dihapus saat pengecekan masih diproses.",
         )
-    check_ids = [check.id for check in check_records]
-    candidate_file_paths = {
-        path
-        for path in [
-            document.file_path,
-            *(check.highlighted_file_path for check in check_records),
-        ]
-        if path
-    }
-    file_paths_to_remove = [
-        path
-        for path in candidate_file_paths
-        if not _is_file_referenced_elsewhere(path, document_id, check_ids, db)
-    ]
-
     try:
-        # A document may be the source of another user's check.  Delete those
-        # result rows first, because source_document_id is non-nullable.
-        source_results = (
-            db.query(SimilarityResult)
-            .filter(SimilarityResult.source_document_id == document_id)
-            .all()
-        )
-        for result in source_results:
-            db.delete(result)
-        db.flush()
-
         document_title = document.title
-        deleted_check_count = len(check_records)
-        db.delete(document)
+        document.deleted_at = utc_now()
         db.commit()
+        db.refresh(document)
     except Exception as error:
         db.rollback()
-        logger.exception("Gagal menghapus dokumen %s: %s", document_id, error)
-        raise HTTPException(status_code=500, detail="Gagal menghapus dokumen.") from error
+        logger.exception("Gagal menonaktifkan dokumen %s: %s", document_id, error)
+        raise HTTPException(status_code=500, detail="Gagal menonaktifkan dokumen.") from error
 
-    deleted_file_count = sum(
-        _delete_managed_upload_file(file_path)
-        for file_path in file_paths_to_remove
-    )
     return {
         "document_id": document_id,
         "title": document_title,
-        "deleted_check_count": deleted_check_count,
-        "deleted_file_count": deleted_file_count,
-        "message": f"Dokumen '{document_title}' berhasil dihapus.",
+        "soft_deleted": True,
+        "soft_deleted_at": document.deleted_at.isoformat() if document.deleted_at else None,
+        "deleted_check_count": 0,
+        "deleted_file_count": 0,
+        "message": (
+            f"Dokumen '{document_title}' berhasil dinonaktifkan. "
+            "File dan data pengecekan tetap tersimpan."
+        ),
     }

@@ -130,6 +130,7 @@ class Document(Base):
     extraction_metadata = Column(JSON, nullable=True)
     text_extracted_at = Column(DateTime, nullable=True)
     text_extraction_error = Column(Text, nullable=True)
+    deleted_at = Column(DateTime, nullable=True, index=True)
     created_at = Column(DateTime, default=utc_now)
 
     user = relationship("User", back_populates="documents")

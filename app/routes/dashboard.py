@@ -12,7 +12,7 @@ router = APIRouter()
 
 
 def _visible_documents_query(current_user: User, db: Session):
-    query = db.query(Document)
+    query = db.query(Document).filter(Document.deleted_at.is_(None))
 
     if current_user.role == "mahasiswa":
         return query.filter(Document.user_id == current_user.id)
@@ -28,7 +28,11 @@ def _visible_documents_query(current_user: User, db: Session):
 
 
 def _visible_checks_query(current_user: User, db: Session):
-    query = db.query(PlagiarismCheck).join(Document, PlagiarismCheck.document_id == Document.id)
+    query = (
+        db.query(PlagiarismCheck)
+        .join(Document, PlagiarismCheck.document_id == Document.id)
+        .filter(Document.deleted_at.is_(None))
+    )
 
     if current_user.role == "mahasiswa":
         return query.filter(

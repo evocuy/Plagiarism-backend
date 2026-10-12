@@ -26,6 +26,8 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_metadata JSONB"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS text_extracted_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS text_extraction_error TEXT"))
+        conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_deleted_at ON documents(deleted_at)"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS document_chunks (
                 id SERIAL PRIMARY KEY,

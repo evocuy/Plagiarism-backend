@@ -74,7 +74,11 @@ class RepositoryCheckService:
         report_progress: Optional[ProgressReporter] = None,
     ) -> Dict[str, Any]:
         """Compare one document against the repository and save its results."""
-        target_doc = db.query(Document).filter(Document.id == document_id).first()
+        target_doc = (
+            db.query(Document)
+            .filter(Document.id == document_id, Document.deleted_at.is_(None))
+            .first()
+        )
         if not target_doc:
             raise HTTPException(status_code=404, detail="Dokumen target tidak ditemukan.")
 
@@ -123,7 +127,10 @@ class RepositoryCheckService:
             )
             target_chunks = self.document_chunk_service.get_or_build_sentence_chunks(target_doc, db)
 
-            repo_query = db.query(Document).filter(Document.id != document_id)
+            repo_query = db.query(Document).filter(
+                Document.id != document_id,
+                Document.deleted_at.is_(None),
+            )
             if target_owner_id is not None:
                 # Jangan membandingkan revisi mahasiswa terhadap dokumen miliknya sendiri.
                 repo_query = repo_query.filter(Document.user_id != target_owner_id)

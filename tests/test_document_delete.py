@@ -35,7 +35,7 @@ def _write_pdf_placeholder(path: Path) -> None:
     path.write_bytes(b"%PDF-placeholder")
 
 
-def test_delete_document_removes_its_artifacts_and_dependent_results(tmp_path, monkeypatch):
+def test_delete_document_soft_deletes_and_retains_its_artifacts_and_dependent_results(tmp_path, monkeypatch):
     db = _make_session()
     upload_dir = tmp_path / "uploads"
     monkeypatch.setattr(document_routes, "UPLOAD_DIR", upload_dir)
@@ -109,41 +109,68 @@ def test_delete_document_removes_its_artifacts_and_dependent_results(tmp_path, m
     result = document_routes.delete_document(target.id, admin=admin, db=db)
 
     assert result["document_id"] == target.id
-    assert result["deleted_check_count"] == 1
-    assert result["deleted_file_count"] == 2
-    assert db.get(Document, target.id) is None
-    assert db.get(DocumentChunk, 1) is None
-    assert db.get(PlagiarismCheck, target_check.id) is None
-    assert db.get(SimilarityResult, source_result.id) is None
-    assert db.get(SimilarityMatch, source_match.id) is None
+    assert result["soft_deleted"] is True
+    assert result["soft_deleted_at"]
+    assert result["deleted_check_count"] == 0
+    assert result["deleted_file_count"] == 0
+    soft_deleted_document = db.get(Document, target.id)
+    assert soft_deleted_document is not None
+    assert soft_deleted_document.deleted_at is not None
+    assert db.get(DocumentChunk, 1) is not None
+    assert db.get(PlagiarismCheck, target_check.id) is not None
+    assert db.get(SimilarityResult, source_result.id) is not None
+    assert db.get(SimilarityMatch, source_match.id) is not None
     assert db.get(Document, retained.id) is not None
     assert db.get(PlagiarismCheck, retained_check.id) is not None
-    assert not target_pdf.exists()
-    assert not highlighted_pdf.exists()
+    assert target_pdf.exists()
+    assert highlighted_pdf.exists()
     assert retained_pdf.exists()
 
 
-def test_delete_document_keeps_a_pdf_referenced_by_another_document(tmp_path, monkeypatch):
+def test_soft_deleted_document_is_hidden_from_document_list(tmp_path, monkeypatch):
     db = _make_session()
     upload_dir = tmp_path / "uploads"
     monkeypatch.setattr(document_routes, "UPLOAD_DIR", upload_dir)
-    shared_pdf = upload_dir / "shared.pdf"
-    _write_pdf_placeholder(shared_pdf)
+    target_pdf = upload_dir / "target.pdf"
+    retained_pdf = upload_dir / "retained.pdf"
+    _write_pdf_placeholder(target_pdf)
+    _write_pdf_placeholder(retained_pdf)
 
     admin = User(identifier="admin", password="secret", role="admin")
     db.add(admin)
     db.flush()
-    target = Document(title="first.pdf", document_type="proposal", file_path=str(shared_pdf))
-    retained = Document(title="second.pdf", document_type="proposal", file_path=str(shared_pdf))
+    target = Document(title="target.pdf", document_type="proposal", file_path=str(target_pdf))
+    retained = Document(title="retained.pdf", document_type="proposal", file_path=str(retained_pdf))
     db.add_all([target, retained])
     db.commit()
 
     result = document_routes.delete_document(target.id, admin=admin, db=db)
+    visible_documents = document_routes.get_all_documents(current_user=None, db=db)
 
+    assert result["soft_deleted"] is True
     assert result["deleted_file_count"] == 0
-    assert db.get(Document, target.id) is None
+    assert db.get(Document, target.id).deleted_at is not None
     assert db.get(Document, retained.id) is not None
-    assert shared_pdf.exists()
+    assert [document["id"] for document in visible_documents] == [retained.id]
+    assert target_pdf.exists()
+    assert retained_pdf.exists()
+
+
+def test_delete_document_returns_404_when_already_soft_deleted():
+    db = _make_session()
+    admin = User(identifier="admin", password="secret", role="admin")
+    document = Document(title="deleted.pdf", document_type="proposal", file_path="deleted.pdf")
+    db.add_all([admin, document])
+    db.commit()
+
+    document_routes.delete_document(document.id, admin=admin, db=db)
+
+    try:
+        document_routes.delete_document(document.id, admin=admin, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("Expected an already deleted document to be hidden")
 
 
 def test_delete_document_returns_404_for_unknown_id():
