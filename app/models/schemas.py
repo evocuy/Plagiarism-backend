@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 from typing import Optional, List, Union, Literal, Annotated
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean, JSON
+from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean, JSON, CheckConstraint, Index
 from sqlalchemy.orm import relationship
 from ..database.session import Base
 
@@ -213,6 +213,50 @@ class SimilarityMatch(Base):
     created_at = Column(DateTime, default=utc_now)
 
     result = relationship("SimilarityResult", back_populates="matches")
+
+
+class SupportTicket(Base):
+    """A student's help request; retained independently of document deletion."""
+    __tablename__ = "support_tickets"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('new', 'in_progress', 'waiting_student', 'resolved')",
+            name="ck_support_ticket_status",
+        ),
+        Index("ix_support_tickets_owner_created_at", "owner_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Snapshots retain the history if an administrator removes an account.
+    owner_name = Column(String(255), nullable=False)
+    owner_identifier = Column(String(100), nullable=False)
+    category = Column(String(100), nullable=False)
+    subject = Column(String(200), nullable=False)
+    status = Column(String(30), nullable=False, default="new")
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
+
+    messages = relationship("SupportMessage", back_populates="ticket", cascade="all, delete-orphan")
+
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+    __table_args__ = (
+        CheckConstraint("author_role IN ('mahasiswa', 'admin')", name="ck_support_message_role"),
+        Index("ix_support_messages_author_created_at", "author_id", "created_at"),
+        Index("ix_support_messages_ticket_created_at", "ticket_id", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    ticket_id = Column(Integer, ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False)
+    author_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    author_name = Column(String(255), nullable=False)
+    author_role = Column(String(30), nullable=False)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+
+    ticket = relationship("SupportTicket", back_populates="messages")
 
 
 # ==========================================

@@ -77,6 +77,35 @@ def ensure_runtime_columns() -> None:
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_similarity_matches_result_id ON similarity_matches(result_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_similarity_matches_page_number ON similarity_matches(page_number)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id SERIAL PRIMARY KEY,
+                owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                owner_name VARCHAR(255) NOT NULL,
+                owner_identifier VARCHAR(100) NOT NULL,
+                category VARCHAR(100) NOT NULL,
+                subject VARCHAR(200) NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'new'
+                    CONSTRAINT ck_support_ticket_status CHECK (status IN ('new', 'in_progress', 'waiting_student', 'resolved')),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_tickets_owner_created_at ON support_tickets(owner_id, created_at)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id SERIAL PRIMARY KEY,
+                ticket_id INTEGER NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+                author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                author_name VARCHAR(255) NOT NULL,
+                author_role VARCHAR(30) NOT NULL
+                    CONSTRAINT ck_support_message_role CHECK (author_role IN ('mahasiswa', 'admin')),
+                message TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_author_created_at ON support_messages(author_id, created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_ticket_created_at ON support_messages(ticket_id, created_at)"))
         conn.commit()
 
     try:
