@@ -5,6 +5,9 @@ from app.database.session import engine
 
 def ensure_runtime_columns() -> None:
     with engine.connect() as conn:
+        # Existing databases need this before JWTs with a session version are
+        # accepted. The default safely invalidates pre-versioned JWTs.
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(64)"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_message TEXT"))
@@ -12,6 +15,13 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
+        # These fields predate the runtime migration helper in some deployed
+        # databases.  Keep approval state durable before exposing review APIs.
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS approval_status VARCHAR(30) NOT NULL DEFAULT 'belum disetujui'"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reviewer_note TEXT"))
+        conn.execute(text("UPDATE plagiarism_checks SET approval_status = 'belum disetujui' WHERE approval_status IS NULL"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_approval_status ON plagiarism_checks(approval_status)"))
         conn.execute(text("""
             UPDATE plagiarism_checks
             SET progress = 100,

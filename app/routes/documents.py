@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from app.database.session import get_db
 from app.models.schemas import Document, PlagiarismCheck, SimilarityResult, User, Mahasiswa, utc_now
-from app.routes.auth import get_current_user, get_optional_current_user, require_admin
+from app.routes.auth import get_current_user, require_admin
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
@@ -52,26 +52,27 @@ class EmbedDocumentsRequest(BaseModel):
     refresh_embeddings: bool = False
 
 
-def _can_access_document(document: Document, user: Optional[User], db: Session) -> bool:
-    if not user:
-        return True
+def _can_access_document(document: Document, user: User, db: Session) -> bool:
     if user.role in ("admin", "super_admin"):
         return True
     if user.role == "mahasiswa":
         return document.user_id == user.id
     if user.role == "dosen":
-        if not document.user_id:
-            return True
+        if not user.dosen or not document.user_id:
+            return False
         mhs = db.query(Mahasiswa).filter(Mahasiswa.id == document.user_id).first()
         return bool(mhs and mhs.dosen_pembimbing_id == user.id)
     return False
 
 
-def _visible_documents_query(current_user: Optional[User], db: Session):
+def _visible_documents_query(current_user: User, db: Session):
+    """Return only active documents visible to one authenticated user."""
     query = db.query(Document).filter(Document.deleted_at.is_(None))
-    if current_user and current_user.role == "mahasiswa":
+    if current_user.role in ("admin", "super_admin"):
+        return query
+    if current_user.role == "mahasiswa":
         query = query.filter(Document.user_id == current_user.id)
-    elif current_user and current_user.role == "dosen" and current_user.dosen:
+    elif current_user.role == "dosen" and current_user.dosen:
         dosen_id = current_user.id
         bimbingan_user_ids = (
             db.query(Mahasiswa.id)
@@ -80,13 +81,10 @@ def _visible_documents_query(current_user: Optional[User], db: Session):
         )
         bimbingan_user_ids = [uid for (uid,) in bimbingan_user_ids]
         query = query.filter(Document.user_id.in_(bimbingan_user_ids))
+    else:
+        # A role/profile mismatch must never silently become a global listing.
+        query = query.filter(Document.id.is_(None))
     return query
-
-
-def _effective_upload_user_id(current_user: Optional[User], user_id: Optional[int]) -> Optional[int]:
-    if current_user:
-        return current_user.id
-    return user_id
 
 
 def _validate_uploaded_filename(filename: Optional[str]) -> str:
@@ -233,15 +231,17 @@ async def _store_uploaded_document(
 async def upload_document(
     file: UploadFile = File(...),
     document_type: str = Form(...),
+    # Kept in the multipart contract for older clients, but never trusted for
+    # ownership. Repository documents deliberately have no student owner.
     user_id: Optional[int] = Form(None),
     auto_index_embeddings: bool = Form(False),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     db_doc = await _store_uploaded_document(
         file=file,
         document_type=document_type,
-        user_id=_effective_upload_user_id(current_user, user_id),
+        user_id=None,
         db=db,
     )
 
@@ -303,7 +303,8 @@ async def upload_document(
         "user_id": db_doc.user_id,
         "filename": db_doc.title,
         "document_type": db_doc.document_type,
-        "file_path": db_doc.file_path,
+        # Clients only need a display name; never disclose the server path.
+        "file_path": db_doc.title,
         "text_cache_status": text_cache_status,
         "text_cache_error": text_cache_error,
         "chunk_cache_status": chunk_cache_status,
@@ -403,13 +404,13 @@ async def upload_and_check_document(
 
 @router.get("/")
 def get_all_documents(
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     - Mahasiswa: hanya dokumen miliknya.
     - Dosen: dokumen milik mahasiswa bimbingannya.
-    - Admin / tanpa login: seluruh dokumen.
+    - Admin: seluruh dokumen.
     """
     query = _visible_documents_query(current_user, db)
     docs = query.order_by(Document.created_at.desc()).all()
@@ -422,7 +423,9 @@ def get_all_documents(
             "owner_identifier": doc.user.identifier if doc.user else "-",
             "title": doc.title,
             "document_type": doc.document_type,
-            "file_path": doc.file_path,
+            # Keep the legacy response key for the frontend, but return only a
+            # display-safe filename rather than the internal storage path.
+            "file_path": doc.title,
             "text_cache_status": "completed" if doc.text_extracted_at else "pending",
             "text_extraction_error": doc.text_extraction_error,
             "chunk_count": len(doc.chunks),
@@ -434,11 +437,11 @@ def get_all_documents(
 @router.post("/reindex")
 def reindex_documents(
     request: Optional[ReindexDocumentsRequest] = Body(default=None),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     document_ids = request.document_ids if request else None
-    query = _visible_documents_query(current_user, db)
+    query = _visible_documents_query(admin, db)
     if document_ids:
         query = query.filter(Document.id.in_(document_ids))
 
@@ -469,7 +472,7 @@ def reindex_documents(
 @router.post("/embeddings")
 def index_document_embeddings(
     request: Optional[EmbedDocumentsRequest] = Body(default=None),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     if not document_embedding_service.embedding_service.is_configured():
@@ -482,7 +485,7 @@ def index_document_embeddings(
     refresh_chunks = request.refresh_chunks if request else False
     refresh_embeddings = request.refresh_embeddings if request else False
 
-    query = _visible_documents_query(current_user, db)
+    query = _visible_documents_query(admin, db)
     if document_ids:
         query = query.filter(Document.id.in_(document_ids))
 
@@ -521,7 +524,7 @@ def index_document_embeddings(
 @router.post("/{document_id}/reindex")
 def reindex_document(
     document_id: int,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     document = (
@@ -531,9 +534,6 @@ def reindex_document(
     )
     if not document:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
-
-    if not _can_access_document(document, current_user, db):
-        raise HTTPException(status_code=403, detail="Anda tidak memiliki izin untuk reindex dokumen ini.")
 
     try:
         result = document_index_service.reindex_document(document, db)
@@ -548,7 +548,7 @@ def reindex_document(
 def index_single_document_embeddings(
     document_id: int,
     request: Optional[EmbedDocumentsRequest] = Body(default=None),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     if not document_embedding_service.embedding_service.is_configured():
@@ -564,9 +564,6 @@ def index_single_document_embeddings(
     )
     if not document:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan.")
-
-    if not _can_access_document(document, current_user, db):
-        raise HTTPException(status_code=403, detail="Anda tidak memiliki izin untuk index embedding dokumen ini.")
 
     try:
         return document_embedding_service.index_document_embeddings(

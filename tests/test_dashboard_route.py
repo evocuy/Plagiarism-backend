@@ -1,5 +1,6 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from fastapi import HTTPException
 
 from app.database.session import Base
 from app.models.schemas import Document, Dosen, Mahasiswa, PlagiarismCheck, User
@@ -116,3 +117,18 @@ def test_dashboard_summary_scopes_counts_by_role():
     assert admin_summary["approved_count"] == 1
     assert admin_summary["pending_review_count"] == 1
     assert admin_summary["processing_check_count"] == 1
+
+
+def test_dashboard_rejects_dosen_without_profile_instead_of_using_global_scope():
+    db = _make_session()
+    incomplete_dosen = User(identifier="dosen-tanpa-profil", password="secret", role="dosen")
+    db.add(incomplete_dosen)
+    db.commit()
+
+    try:
+        get_dashboard_summary(current_user=incomplete_dosen, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 403
+        assert "Profil dosen" in exc.detail
+    else:
+        raise AssertionError("Expected a dosen account without profile to be denied")

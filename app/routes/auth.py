@@ -1,4 +1,5 @@
 import os
+from hmac import compare_digest
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, List
 
@@ -6,6 +7,7 @@ import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Response, status
 from pydantic import BaseModel, Field, model_validator
 from pwdlib import PasswordHash
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
@@ -13,12 +15,121 @@ from app.models.schemas import User, Dosen, Mahasiswa
 
 router = APIRouter()
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "b9148d88e4e7e609348b61c944f7743fa100234a9bebc04b3cfb9f5e")
+# Never use a source-controlled fallback here.  A missing or obviously
+# placeholder secret must prevent issuing/accepting sessions instead of making
+# every deployment share the same signing key.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440")) # Default 24 hours
-SESSION_COOKIE_NAME = "plagiarism_session"
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "plagiarism_session")
+AUTH_NO_STORE_VALUE = "no-store"
+
+
+def _read_positive_int_setting(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} harus berupa bilangan bulat positif.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} harus lebih besar dari nol.")
+    return value
+
+
+def _read_boolean_setting(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} harus bernilai true atau false.")
+
+
+JWT_EXPIRE_MINUTES = _read_positive_int_setting("JWT_EXPIRE_MINUTES", 1440)
+# Secure-by-default. Local HTTP development can opt out explicitly with
+# SESSION_COOKIE_SECURE=false; production must never rely on APP_ENV spelling.
+SESSION_COOKIE_SECURE = _read_boolean_setting(
+    "SESSION_COOKIE_SECURE",
+    default=True,
+)
+SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "lax").strip().lower()
+if SESSION_COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    raise RuntimeError("SESSION_COOKIE_SAMESITE harus lax, strict, atau none.")
+if SESSION_COOKIE_SAMESITE == "none" and not SESSION_COOKIE_SECURE:
+    raise RuntimeError("SESSION_COOKIE_SECURE harus true ketika SESSION_COOKIE_SAMESITE=none.")
+SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "").strip() or None
+SESSION_COOKIE_PATH = os.getenv("SESSION_COOKIE_PATH", "/").strip() or "/"
+if not SESSION_COOKIE_PATH.startswith("/"):
+    raise RuntimeError("SESSION_COOKIE_PATH harus diawali '/'.")
 
 password_hash = PasswordHash.recommended()
+
+
+def _jwt_secret_key() -> str:
+    """Return a deployment-specific signing key or fail closed."""
+    secret = (JWT_SECRET_KEY or "").strip()
+    insecure_values = {
+        "change-this-secret",
+        "your-secret-key",
+        "secret",
+        "changeme",
+        "replace-with-a-unique-random-secret-at-least-32-characters",
+    }
+    if len(secret) < 32 or secret.lower() in insecure_values:
+        raise RuntimeError(
+            "JWT_SECRET_KEY harus dikonfigurasi dengan secret acak minimal 32 karakter."
+        )
+    return secret
+
+
+def validate_auth_configuration() -> None:
+    """Fail at startup if the JWT signing configuration is unsafe."""
+    _jwt_secret_key()
+
+
+def _set_no_store(response: Response) -> None:
+    response.headers["Cache-Control"] = AUTH_NO_STORE_VALUE
+    response.headers["Pragma"] = "no-cache"
+
+
+def _auth_exception(detail: str, *, status_code: int = status.HTTP_401_UNAUTHORIZED) -> HTTPException:
+    headers = {
+        "Cache-Control": AUTH_NO_STORE_VALUE,
+        "Pragma": "no-cache",
+    }
+    if status_code == status.HTTP_401_UNAUTHORIZED:
+        headers["WWW-Authenticate"] = "Bearer"
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=SESSION_COOKIE_SECURE,
+        max_age=JWT_EXPIRE_MINUTES * 60,
+        samesite=SESSION_COOKIE_SAMESITE,
+        domain=SESSION_COOKIE_DOMAIN,
+        path=SESSION_COOKIE_PATH,
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    # Cookie scope must exactly match the login cookie; otherwise browsers can
+    # retain the old cookie alongside the expired one.
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path=SESSION_COOKIE_PATH,
+        domain=SESSION_COOKIE_DOMAIN,
+        secure=SESSION_COOKIE_SECURE,
+        httponly=True,
+        samesite=SESSION_COOKIE_SAMESITE,
+    )
 
 # Pydantic Schemas
 class LoginRequest(BaseModel):
@@ -106,67 +217,110 @@ class UpdateUserRequest(BaseModel):
 
 
 def create_access_token(user: User) -> str:
+    secret = _jwt_secret_key()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
     return jwt.encode(
         {
             "sub": str(user.id),
             "identifier": user.identifier,
             "role": user.role,
+            "sv": user.session_version,
             "exp": expires_at,
         },
-        JWT_SECRET_KEY,
+        secret,
         algorithm=JWT_ALGORITHM,
     )
 
 
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Parse Authorization strictly so a malformed Bearer header cannot fall back to a cookie."""
+    if authorization is None:
+        return None
+
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        raise _auth_exception("Format header Authorization tidak valid.")
+    return parts[1]
+
+
+def _decode_access_token(token: str) -> tuple[int, int]:
+    try:
+        payload = jwt.decode(
+            token,
+            _jwt_secret_key(),
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp", "sub", "sv"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise _auth_exception("Token autentikasi tidak valid atau telah kedaluwarsa.") from exc
+
+    subject = payload.get("sub")
+    session_version = payload.get("sv")
+    try:
+        user_id = int(subject)
+    except (TypeError, ValueError) as exc:
+        raise _auth_exception("Token autentikasi tidak valid.") from exc
+
+    if user_id <= 0 or isinstance(session_version, bool) or not isinstance(session_version, int) or session_version < 0:
+        raise _auth_exception("Token autentikasi tidak valid.")
+    return user_id, session_version
+
+
+def _rotate_session_version(db: Session, user: User) -> None:
+    """Invalidate every token minted before this point for one account."""
+    db.execute(
+        update(User)
+        .where(User.id == user.id)
+        .values(session_version=func.coalesce(User.session_version, 0) + 1)
+    )
+    db.commit()
+    db.refresh(user)
+
+
 def get_current_user(
     authorization: Optional[str] = Header(default=None),
-    plagiarism_session: Optional[str] = Cookie(default=None),
+    plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     db: Session = Depends(get_db),
 ) -> User:
-    token = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-    elif plagiarism_session:
-        token = plagiarism_session
+    bearer_token = _extract_bearer_token(authorization)
+    bearer_claims = _decode_access_token(bearer_token) if bearer_token else None
+    cookie_claims = _decode_access_token(plagiarism_session) if plagiarism_session else None
 
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Autentikasi diperlukan. Silakan login terlebih dahulu.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if not bearer_claims and not cookie_claims:
+        raise _auth_exception("Autentikasi diperlukan. Silakan login terlebih dahulu.")
 
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        user_id = int(payload.get("sub"))
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token autentikasi tidak valid atau telah kedaluwarsa.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if bearer_claims and cookie_claims:
+        if bearer_claims[0] != cookie_claims[0]:
+            raise _auth_exception("Credential Bearer dan cookie berasal dari akun yang berbeda.")
+        if bearer_claims[1] != cookie_claims[1]:
+            raise _auth_exception("Credential Bearer dan cookie berasal dari sesi yang berbeda.")
+
+    user_id, token_session_version = bearer_claims or cookie_claims
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User tidak ditemukan.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _auth_exception("User tidak ditemukan.")
+
+    if user.session_version != token_session_version:
+        raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
 
     return user
 
 
 def get_optional_current_user(
     authorization: Optional[str] = Header(default=None),
-    plagiarism_session: Optional[str] = Cookie(default=None),
+    plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     db: Session = Depends(get_db),
 ) -> Optional[User]:
-    try:
-        return get_current_user(authorization=authorization, plagiarism_session=plagiarism_session, db=db)
-    except HTTPException:
+    # Optional only means anonymous requests are accepted.  Once a client sends
+    # any credential, an invalid or conflicting credential must remain a 401.
+    if authorization is None and plagiarism_session is None:
         return None
+    return get_current_user(
+        authorization=authorization,
+        plagiarism_session=plagiarism_session,
+        db=db,
+    )
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
@@ -251,36 +405,34 @@ def seed_initial_users(db: Session) -> None:
 
 @router.post("/login", response_model=LoginResponse)
 def login(request: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    validate_auth_configuration()
+    _set_no_store(response)
     user = db.query(User).filter(User.identifier == request.identifier).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="NIM / NIDN / NIP tidak ditemukan.",
-        )
+        raise _auth_exception("NIM / NIDN / NIP tidak ditemukan.")
 
-    # Validasi kata sandi (argon2 atau fallback)
+    # Existing installations may still contain legacy plaintext credentials.
+    # If one is successfully used, upgrade it atomically with the session
+    # rotation below; new credentials are always Argon2 hashes.
     valid = False
+    upgrade_legacy_password = False
     try:
         valid = password_hash.verify(request.password, user.password)
     except Exception:
-        valid = (request.password == user.password)
+        valid = compare_digest(request.password, user.password)
+        upgrade_legacy_password = valid
 
     if not valid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Kata sandi yang Anda masukkan salah.",
-        )
+        raise _auth_exception("Kata sandi yang Anda masukkan salah.")
 
+    if upgrade_legacy_password:
+        user.password = password_hash.hash(request.password)
+
+    # Login is a session boundary: revoke all old Bearer and cookie JWTs for
+    # this account before minting the new pair.
+    _rotate_session_version(db, user)
     token = create_access_token(user)
-
-    # Set HTTP-only Cookie
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        max_age=JWT_EXPIRE_MINUTES * 60,
-        samesite="lax",
-    )
+    _set_session_cookie(response, token)
 
     return {
         "token": token,
@@ -289,13 +441,20 @@ def login(request: LoginRequest, response: Response, db: Session = Depends(get_d
 
 
 @router.get("/me", response_model=UserResponse)
-def get_me(current_user: User = Depends(get_current_user)):
+def get_me(response: Response, current_user: User = Depends(get_current_user)):
+    _set_no_store(response)
     return _build_user_response(current_user)
 
 
 @router.post("/logout")
-def logout(response: Response):
-    response.delete_cookie(key=SESSION_COOKIE_NAME)
+def logout(
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _set_no_store(response)
+    _rotate_session_version(db, current_user)
+    _clear_session_cookie(response)
     return {"message": "Berhasil keluar dari sesi."}
 
 
@@ -387,9 +546,12 @@ def update_user(
             )
         target_user.identifier = request.identifier
 
-    # Validasi & update password jika diisi
+    # Validasi & update password jika diisi. A password reset must also revoke
+    # existing sessions, otherwise a stolen pre-reset JWT would still work.
+    password_changed = False
     if request.password and len(request.password.strip()) >= 6:
         target_user.password = password_hash.hash(request.password.strip())
+        password_changed = True
 
     nama = request.nama_lengkap or request.name
 
@@ -418,6 +580,12 @@ def update_user(
             if "dosen_pembimbing_id" in request.model_fields_set:
                 target_user.mahasiswa.dosen_pembimbing_id = request.dosen_pembimbing_id
 
+    if password_changed:
+        db.execute(
+            update(User)
+            .where(User.id == target_user.id)
+            .values(session_version=func.coalesce(User.session_version, 0) + 1)
+        )
     db.commit()
     db.refresh(target_user)
     return _build_user_response(target_user)

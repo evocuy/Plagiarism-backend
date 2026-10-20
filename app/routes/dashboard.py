@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
@@ -11,8 +11,25 @@ from app.routes.auth import get_current_user
 router = APIRouter()
 
 
+def _assert_dashboard_access(current_user: User) -> None:
+    """Reject malformed or unsupported roles before building any aggregate."""
+    if current_user.role in ("admin", "super_admin", "mahasiswa"):
+        return
+    if current_user.role == "dosen" and current_user.dosen:
+        return
+    if current_user.role == "dosen":
+        raise HTTPException(
+            status_code=403,
+            detail="Profil dosen tidak ditemukan. Hubungi administrator.",
+        )
+    raise HTTPException(status_code=403, detail="Akses ditolak.")
+
+
 def _visible_documents_query(current_user: User, db: Session):
     query = db.query(Document).filter(Document.deleted_at.is_(None))
+
+    if current_user.role in ("admin", "super_admin"):
+        return query
 
     if current_user.role == "mahasiswa":
         return query.filter(Document.user_id == current_user.id)
@@ -24,7 +41,9 @@ def _visible_documents_query(current_user: User, db: Session):
         )
         return query.filter(Document.user_id.in_(supervised_student_ids))
 
-    return query
+    # `_assert_dashboard_access` is called by the public endpoint. Retain a
+    # fail-closed fallback in case this helper is reused elsewhere.
+    return query.filter(Document.id.is_(None))
 
 
 def _visible_checks_query(current_user: User, db: Session):
@@ -33,6 +52,9 @@ def _visible_checks_query(current_user: User, db: Session):
         .join(Document, PlagiarismCheck.document_id == Document.id)
         .filter(Document.deleted_at.is_(None))
     )
+
+    if current_user.role in ("admin", "super_admin"):
+        return query
 
     if current_user.role == "mahasiswa":
         return query.filter(
@@ -46,7 +68,7 @@ def _visible_checks_query(current_user: User, db: Session):
         )
         return query.filter(Document.user_id.in_(supervised_student_ids))
 
-    return query
+    return query.filter(PlagiarismCheck.id.is_(None))
 
 
 def _latest_checks_per_document(checks: List[PlagiarismCheck]) -> List[PlagiarismCheck]:
@@ -82,6 +104,7 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
 ):
     """Return role-scoped dashboard counters calculated from database records."""
+    _assert_dashboard_access(current_user)
     document_count = _visible_documents_query(current_user, db).count()
     checks = (
         _visible_checks_query(current_user, db)

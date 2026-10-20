@@ -5,7 +5,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:evopuki123@localhost:5432/plagiarism_db")
+
+def get_database_url() -> str:
+    """Require an explicit deployment database URL instead of a source fallback."""
+    database_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL wajib dikonfigurasi sebelum backend dijalankan.")
+    return database_url
+
+
+DATABASE_URL = get_database_url()
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

@@ -9,15 +9,17 @@ from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base
 from app.models.schemas import (
+    Dosen,
     Document,
     DocumentChunk,
+    Mahasiswa,
     PlagiarismCheck,
     SimilarityMatch,
     SimilarityResult,
     User,
 )
 from app.routes import documents as document_routes
-from app.routes.auth import require_admin
+from app.routes.auth import get_current_user, require_admin
 
 
 def _make_session():
@@ -145,13 +147,14 @@ def test_soft_deleted_document_is_hidden_from_document_list(tmp_path, monkeypatc
     db.commit()
 
     result = document_routes.delete_document(target.id, admin=admin, db=db)
-    visible_documents = document_routes.get_all_documents(current_user=None, db=db)
+    visible_documents = document_routes.get_all_documents(current_user=admin, db=db)
 
     assert result["soft_deleted"] is True
     assert result["deleted_file_count"] == 0
     assert db.get(Document, target.id).deleted_at is not None
     assert db.get(Document, retained.id) is not None
     assert [document["id"] for document in visible_documents] == [retained.id]
+    assert visible_documents[0]["file_path"] == "retained.pdf"
     assert target_pdf.exists()
     assert retained_pdf.exists()
 
@@ -239,3 +242,69 @@ def test_delete_document_endpoint_requires_an_admin():
         if "DELETE" in route.methods
     ]
     assert delete_paths.index("/clear") < delete_paths.index("/{document_id}")
+
+
+def test_document_read_and_maintenance_routes_require_authenticated_scoped_users():
+    routes_requiring_login = (
+        document_routes.get_all_documents,
+    )
+    for endpoint in routes_requiring_login:
+        dependency = inspect.signature(endpoint).parameters["current_user"].default
+        assert dependency.dependency is get_current_user
+
+    routes_requiring_an_admin = (
+        document_routes.upload_document,
+        document_routes.reindex_documents,
+        document_routes.index_document_embeddings,
+        document_routes.reindex_document,
+        document_routes.index_single_document_embeddings,
+    )
+    for endpoint in routes_requiring_an_admin:
+        dependency = inspect.signature(endpoint).parameters["admin"].default
+        assert dependency.dependency is require_admin
+
+
+def test_visible_documents_are_scoped_and_role_profile_mismatch_is_empty():
+    db = _make_session()
+    admin = User(identifier="admin", password="secret", role="admin")
+    dosen = User(identifier="dosen", password="secret", role="dosen")
+    dosen_without_profile = User(identifier="dosen-no-profile", password="secret", role="dosen")
+    guided_student = User(identifier="guided", password="secret", role="mahasiswa")
+    other_student = User(identifier="other", password="secret", role="mahasiswa")
+    db.add_all([admin, dosen, dosen_without_profile, guided_student, other_student])
+    db.flush()
+    db.add_all(
+        [
+            Dosen(id=dosen.id, nama_lengkap="Dosen Penguji"),
+            Mahasiswa(
+                id=guided_student.id,
+                nama_lengkap="Mahasiswa Bimbingan",
+                program_studi="Informatika",
+                fakultas="Komputer",
+                dosen_pembimbing_id=dosen.id,
+            ),
+            Mahasiswa(
+                id=other_student.id,
+                nama_lengkap="Mahasiswa Lain",
+                program_studi="Informatika",
+                fakultas="Komputer",
+            ),
+        ]
+    )
+    db.add_all(
+        [
+            Document(title="guided.pdf", document_type="skripsi", file_path="guided.pdf", user_id=guided_student.id),
+            Document(title="other.pdf", document_type="skripsi", file_path="other.pdf", user_id=other_student.id),
+            Document(title="repository.pdf", document_type="skripsi", file_path="repository.pdf"),
+        ]
+    )
+    db.commit()
+
+    by_title = lambda user: {
+        document.title for document in document_routes._visible_documents_query(user, db).all()
+    }
+
+    assert by_title(admin) == {"guided.pdf", "other.pdf", "repository.pdf"}
+    assert by_title(guided_student) == {"guided.pdf"}
+    assert by_title(dosen) == {"guided.pdf"}
+    assert by_title(dosen_without_profile) == set()

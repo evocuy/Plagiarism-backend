@@ -1,12 +1,17 @@
 import os
 from dotenv import load_dotenv
+
+# Auth configuration is read while route modules are imported, so load the
+# deployment environment before importing those modules.
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, dashboard, documents, plagiarism, support
 from app.database.session import Base, SessionLocal, engine
 from app.database.migrations import ensure_runtime_columns
 
-load_dotenv()
+auth.validate_auth_configuration()
 
 # Buat tabel di PostgreSQL secara otomatis jika belum ada
 Base.metadata.create_all(bind=engine)

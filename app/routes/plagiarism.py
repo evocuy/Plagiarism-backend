@@ -17,7 +17,7 @@ from app.services.repository_candidate_service import RepositoryCandidateService
 from app.services.repository_check_service import RepositoryCheckService
 from app.services.similarity_result_service import SimilarityResultService
 from app.services.similarity_service import SimilarityService
-from app.routes.auth import get_optional_current_user, get_current_user
+from app.routes.auth import get_current_user
 
 router = APIRouter()
 pdf_service = PDFService()
@@ -46,7 +46,7 @@ class SingleCheckRequest(BaseModel):
 @router.post("/check")
 def check_similarity(
     request: SingleCheckRequest,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Membandingkan 2 dokumen secara spesifik (dokumen A vs dokumen B) serta memberi highlight pada kalimat terdeteksi plagiat"""
@@ -64,12 +64,22 @@ def check_similarity(
     if not doc_a or not doc_b:
         raise HTTPException(status_code=404, detail="Salah satu atau kedua dokumen tidak ditemukan di database.")
 
+    # Only the document owner, their supervising lecturer, or an administrator
+    # may initiate a check that creates a result for this target document.
+    if not _can_access_document(doc_a, current_user, db):
+        raise HTTPException(
+            status_code=403,
+            detail="Anda tidak memiliki izin untuk mengecek dokumen ini.",
+        )
+
     data_a = document_text_service.get_or_extract_text(doc_a, db)
     data_b = document_text_service.get_or_extract_text(doc_b, db)
 
     score = similarity_service.calculate_clean_text_similarity(data_a["cleaned_text"], data_b["cleaned_text"])
 
-    effective_user_id = current_user.id if current_user else doc_a.user_id
+    # Keep the check tied to the document owner so its history remains visible
+    # to the student and their supervising lecturer when a lecturer starts it.
+    effective_user_id = doc_a.user_id or current_user.id
 
     check_record = PlagiarismCheck(
         document_id=doc_a.id,
@@ -172,14 +182,27 @@ def check_against_repository(
     candidate_limit: int = Query(20, ge=1, le=100),
     auto_index_embeddings: bool = Query(True),
     auto_index_repository_limit: int = Query(50, ge=0, le=500),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Check one document against the internal repository synchronously."""
+    target_document = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.deleted_at.is_(None))
+        .first()
+    )
+    if not target_document:
+        raise HTTPException(status_code=404, detail="Dokumen target tidak ditemukan.")
+    if not _can_access_document(target_document, current_user, db):
+        raise HTTPException(
+            status_code=403,
+            detail="Anda tidak memiliki izin untuk mengecek dokumen ini.",
+        )
+
     return repository_check_service.run_repository_check(
         document_id=document_id,
         db=db,
-        requester_user_id=current_user.id if current_user else None,
+        requester_user_id=current_user.id,
         candidate_limit=candidate_limit,
         auto_index_embeddings=auto_index_embeddings,
         auto_index_repository_limit=auto_index_repository_limit,
@@ -187,7 +210,7 @@ def check_against_repository(
 
 @router.get("/history")
 def get_check_history(
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -202,11 +225,18 @@ def get_check_history(
         .filter(Document.deleted_at.is_(None))
     )
 
-    if current_user and current_user.role == "mahasiswa":
+    if current_user.role == "mahasiswa":
         query = query.filter(
             (PlagiarismCheck.user_id == current_user.id) | (Document.user_id == current_user.id)
         )
-    elif current_user and current_user.role == "dosen" and current_user.dosen:
+    elif current_user.role == "dosen":
+        # A role value alone must not grant repository-wide access.  A broken
+        # lecturer account without its Dosen profile fails closed instead.
+        if not current_user.dosen:
+            raise HTTPException(
+                status_code=403,
+                detail="Profil dosen tidak ditemukan. Hubungi administrator.",
+            )
         # Hanya tampilkan riwayat mahasiswa bimbingan dosen ini
         dosen_id = current_user.id
         bimbingan_user_ids = (
@@ -216,6 +246,8 @@ def get_check_history(
         )
         bimbingan_user_ids = [uid for (uid,) in bimbingan_user_ids]
         query = query.filter(Document.user_id.in_(bimbingan_user_ids))
+    elif current_user.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="Akses ditolak.")
 
     checks = query.order_by(PlagiarismCheck.created_at.desc()).all()
 
@@ -232,7 +264,9 @@ def get_check_history(
             "owner_identifier": doc_user.identifier if doc_user else "-",
             "title": doc.title if doc else "Dokumen tidak ditemukan",
             "document_type": doc.document_type if doc else "Unknown",
-            "file_path": doc.file_path if doc else "",
+            # Kept under the legacy key for current clients, but never expose
+            # the server-side upload path outside the backend.
+            "file_path": doc.title if doc else "",
             "overall_similarity": check.overall_similarity,
             "similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
             "status": check.status,
@@ -256,25 +290,34 @@ def get_check_history(
         })
     return results
 
-def _can_access_check(check: PlagiarismCheck, user: Optional[User], db: Session) -> bool:
-    """Helper untuk validasi apakah user berhak melihat hasil check ini."""
-    if not user:
-        return True  # Mengizinkan akses jika autentikasi opsional
+def _can_access_document(document: Document, user: User, db: Session) -> bool:
+    """Return whether an authenticated user may operate on a target document."""
     if user.role in ("admin", "super_admin"):
         return True
-
-    doc = check.document
-    doc_owner_id = doc.user_id if doc else check.user_id
     if user.role == "mahasiswa":
-        return check.user_id == user.id or doc_owner_id == user.id
+        return document.user_id == user.id
 
     if user.role == "dosen":
-        if not doc_owner_id:
-            return True
-        mhs = db.query(Mahasiswa).filter(Mahasiswa.id == doc_owner_id).first()
+        if not user.dosen or not document.user_id:
+            return False
+        mhs = db.query(Mahasiswa).filter(Mahasiswa.id == document.user_id).first()
         return bool(mhs and mhs.dosen_pembimbing_id == user.id)
 
     return False
+
+
+def _can_access_check(check: PlagiarismCheck, user: User, db: Session) -> bool:
+    """Helper untuk validasi apakah user berhak melihat hasil check ini."""
+    if user.role in ("admin", "super_admin"):
+        return True
+
+    document = check.document
+    if document:
+        return _can_access_document(document, user, db)
+
+    # _get_active_check joins the document table, but keep this fallback safe
+    # if an in-memory/stale ORM object is ever passed by a caller.
+    return user.role == "mahasiswa" and check.user_id == user.id
 
 
 def _get_active_check(check_id: int, db: Session) -> Optional[PlagiarismCheck]:
@@ -495,7 +538,7 @@ def get_check_processing_status(
 @router.get("/check/{check_id}/matches")
 def get_check_matches(
     check_id: int,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     check = _get_active_check(check_id, db)
@@ -556,7 +599,7 @@ def get_check_top_matches(
 @router.get("/check/{check_id}/download-highlighted")
 def download_highlighted_pdf(
     check_id: int,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -619,18 +662,21 @@ def update_approval_status(
     if not check:
         raise HTTPException(status_code=404, detail="Check record tidak ditemukan.")
 
-    # Pastikan dosen hanya bisa update check milik mahasiswa bimbingannya
+    # Pastikan dosen hanya bisa update check milik mahasiswa bimbingannya.
     if current_user.role == "dosen":
-        doc = check.document
-        if doc and doc.user_id:
-            mhs = db.query(Mahasiswa).filter(Mahasiswa.id == doc.user_id).first()
-            if not mhs or mhs.dosen_pembimbing_id != current_user.id:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Anda hanya dapat me-review dokumen mahasiswa bimbingan Anda.",
-                )
+        if not current_user.dosen or not _can_access_check(check, current_user, db):
+            raise HTTPException(
+                status_code=403,
+                detail="Anda hanya dapat me-review dokumen mahasiswa bimbingan Anda.",
+            )
     elif current_user.role not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak.")
+
+    if check.status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Persetujuan hanya dapat diberikan setelah pengecekan selesai.",
+        )
 
     check.approval_status = request.approval_status
     check.reviewed_at = utc_now()
@@ -644,9 +690,14 @@ def update_approval_status(
     return {
         "id": check.id,
         "document_id": check.document_id,
+        "title": doc.title if doc else "Dokumen tidak ditemukan",
+        "document_type": doc.document_type if doc else None,
+        "status": check.status,
+        "overall_similarity": check.overall_similarity,
         "approval_status": check.approval_status,
         "reviewed_at": check.reviewed_at.isoformat() if check.reviewed_at else None,
         "reviewer_note": check.reviewer_note,
         "owner_name": doc_user.nama_lengkap if doc_user else "Anonim",
+        "owner_identifier": doc_user.identifier if doc_user else "-",
         "message": f"Status dokumen berhasil diubah menjadi '{check.approval_status}'.",
     }

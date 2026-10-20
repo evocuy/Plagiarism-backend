@@ -56,7 +56,12 @@ def _detail(db: Session, ticket: SupportTicket) -> dict:
         .order_by(SupportMessage.created_at.asc(), SupportMessage.id.asc())
         .all()
     )
-    return {"ticket": _ticket_data(ticket), "messages": [_message_data(message) for message in messages]}
+    # The list endpoint intentionally omits message bodies. The detail contract
+    # includes the original request message for clients that need a compact
+    # ticket summary, while retaining the full thread below.
+    ticket_data = _ticket_data(ticket)
+    ticket_data["message"] = messages[0].message if messages else None
+    return {"ticket": ticket_data, "messages": [_message_data(message) for message in messages]}
 
 
 def _require_supported_user(user: User) -> None:

@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 from typing import Optional, List, Union, Literal, Annotated
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean, JSON, CheckConstraint, Index
+from sqlalchemy import Column, String, Integer, Float, DateTime, ForeignKey, Text, Boolean, JSON, CheckConstraint, Index, text
 from sqlalchemy.orm import relationship
 from ..database.session import Base
 
@@ -29,6 +29,9 @@ class User(Base):
     identifier = Column(String(100), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, index=True)
+    # Incremented on login and logout so JWTs minted before the latest session
+    # change cannot remain valid server-side.
+    session_version = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     # Relasi One-to-One ke profil ekstensi (One-to-One Profile Extension)
     dosen = relationship("Dosen", back_populates="user", uselist=False, cascade="all, delete-orphan")

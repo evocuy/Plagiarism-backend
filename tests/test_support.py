@@ -108,6 +108,7 @@ def test_http_create_persists_ticket_and_initial_message_with_utc_times(environm
     assert result["quota"] == {"limit": 3, "remaining": 2, "next_available_at": None, "cooldown_until": "2026-10-19T01:01:00Z"}
     code, _, result = request(app, "GET", "/api/support/tickets/1", token=tokens["student"])
     assert code == 200
+    assert result["ticket"]["message"] == "PDF tidak bisa diunggah"
     assert result["messages"] == [{
         "id": 1, "author_name": "Mahasiswa Pertama", "author_role": "mahasiswa",
         "message": "PDF tidak bisa diunggah", "created_at": "2026-10-19T01:00:00Z",
