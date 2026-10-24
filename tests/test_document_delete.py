@@ -159,6 +159,44 @@ def test_soft_deleted_document_is_hidden_from_document_list(tmp_path, monkeypatc
     assert retained_pdf.exists()
 
 
+def test_repository_only_document_list_returns_only_active_published_documents():
+    db = _make_session()
+    admin = User(identifier="admin", password="secret", role="admin")
+    db.add(admin)
+    db.flush()
+    published = Document(
+        title="published.pdf",
+        document_type="skripsi",
+        file_path="published.pdf",
+        repository_status="published",
+    )
+    draft = Document(
+        title="draft.pdf",
+        document_type="skripsi",
+        file_path="draft.pdf",
+        repository_status="draft",
+    )
+    deleted_published = Document(
+        title="deleted-published.pdf",
+        document_type="skripsi",
+        file_path="deleted-published.pdf",
+        repository_status="published",
+    )
+    db.add_all([published, draft, deleted_published])
+    db.commit()
+
+    document_routes.delete_document(deleted_published.id, admin=admin, db=db)
+    repository_documents = document_routes.get_all_documents(
+        repository_only=True,
+        current_user=admin,
+        db=db,
+    )
+
+    assert [document["id"] for document in repository_documents] == [published.id]
+    assert repository_documents[0]["repository_status"] == "published"
+    assert repository_documents[0]["is_repository_published"] is True
+
+
 def test_delete_document_returns_404_when_already_soft_deleted():
     db = _make_session()
     admin = User(identifier="admin", password="secret", role="admin")

@@ -4,11 +4,21 @@ from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import FileResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload, selectinload
 from pydantic import BaseModel
 
 from app.database.session import get_db
-from app.models.schemas import Document, PlagiarismCheck, SimilarityResult, User, Mahasiswa, utc_now
+from app.models.schemas import (
+    Document,
+    PlagiarismCheck,
+    REPOSITORY_STATUS_DRAFT,
+    REPOSITORY_STATUS_PUBLISHED,
+    SimilarityResult,
+    User,
+    Mahasiswa,
+    utc_now,
+)
 from app.services.pdf_service import PDFService
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
@@ -72,6 +82,32 @@ def check_similarity(
             detail="Anda tidak memiliki izin untuk mengecek dokumen ini.",
         )
 
+    # A manual comparison must use the same corpus policy as the repository
+    # workflow: only supervisor-approved/admin-imported sources of the same
+    # document type may be used, never another revision of the same student.
+    if doc_a.id == doc_b.id:
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen tidak dapat dibandingkan dengan dirinya sendiri.",
+        )
+    if doc_b.repository_status != REPOSITORY_STATUS_PUBLISHED:
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen referensi belum diterbitkan ke repositori pembanding.",
+        )
+    if doc_b.document_type != doc_a.document_type:
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen referensi harus memiliki jenis dokumen yang sama.",
+        )
+
+    effective_user_id = doc_a.user_id or current_user.id
+    if doc_b.user_id is not None and doc_b.user_id == effective_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen tidak dapat dibandingkan dengan dokumen milik mahasiswa yang sama.",
+        )
+
     data_a = document_text_service.get_or_extract_text(doc_a, db)
     data_b = document_text_service.get_or_extract_text(doc_b, db)
 
@@ -79,8 +115,6 @@ def check_similarity(
 
     # Keep the check tied to the document owner so its history remains visible
     # to the student and their supervising lecturer when a lecturer starts it.
-    effective_user_id = doc_a.user_id or current_user.id
-
     check_record = PlagiarismCheck(
         document_id=doc_a.id,
         user_id=effective_user_id,
@@ -277,6 +311,15 @@ def get_check_history(
             "approval_status": check.approval_status or "belum disetujui",
             "reviewed_at": check.reviewed_at.isoformat() if check.reviewed_at else None,
             "reviewer_note": check.reviewer_note,
+            "repository_status": doc.repository_status if doc else None,
+            "repository_published_at": (
+                doc.repository_published_at.isoformat()
+                if doc and doc.repository_published_at
+                else None
+            ),
+            "is_repository_published": bool(
+                doc and doc.repository_status == REPOSITORY_STATUS_PUBLISHED
+            ),
             "highlighted_pdf_available": has_highlighted,
             "highlighted_pdf_url": f"/api/plagiarism/check/{check.id}/download-highlighted" if has_highlighted else None,
             "result_url": f"/api/plagiarism/check/{check.id}/matches" if check.status == "completed" else None,
@@ -379,7 +422,7 @@ def _get_stored_check_results(check_id: int, db: Session, limit: Optional[int] =
 
 
 def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
-    """Mirror the repository scope used when this check was started."""
+    """Count sources currently eligible under this check's corpus policy."""
     target_document = check.document
     if not target_document:
         return 0
@@ -387,10 +430,17 @@ def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
     query = db.query(Document).filter(
         Document.id != check.document_id,
         Document.deleted_at.is_(None),
+        Document.repository_status == REPOSITORY_STATUS_PUBLISHED,
+        Document.document_type == target_document.document_type,
     )
     target_owner_id = target_document.user_id or check.user_id
     if target_owner_id is not None:
-        query = query.filter(Document.user_id != target_owner_id)
+        query = query.filter(
+            or_(
+                Document.user_id.is_(None),
+                Document.user_id != target_owner_id,
+            )
+        )
     return query.count()
 
 
@@ -678,14 +728,29 @@ def update_approval_status(
             detail="Persetujuan hanya dapat diberikan setelah pengecekan selesai.",
         )
 
+    reviewed_at = utc_now()
     check.approval_status = request.approval_status
-    check.reviewed_at = utc_now()
+    check.reviewed_at = reviewed_at
     check.reviewer_note = request.reviewer_note
+    doc = check.document
+    if doc:
+        if request.approval_status == "disetujui":
+            doc.repository_status = REPOSITORY_STATUS_PUBLISHED
+            doc.repository_published_at = reviewed_at
+        else:
+            doc.repository_status = REPOSITORY_STATUS_DRAFT
+            doc.repository_published_at = None
     db.commit()
     db.refresh(check)
 
-    doc = check.document
+    if doc:
+        db.refresh(doc)
     doc_user = doc.user if doc and doc.user else None
+    repository_message = (
+        "Dokumen disetujui dan diterbitkan ke repositori pembanding."
+        if request.approval_status == "disetujui"
+        else "Dokumen ditandai perlu revisi dan dikeluarkan dari repositori pembanding."
+    )
 
     return {
         "id": check.id,
@@ -697,7 +762,16 @@ def update_approval_status(
         "approval_status": check.approval_status,
         "reviewed_at": check.reviewed_at.isoformat() if check.reviewed_at else None,
         "reviewer_note": check.reviewer_note,
+        "repository_status": doc.repository_status if doc else None,
+        "repository_published_at": (
+            doc.repository_published_at.isoformat()
+            if doc and doc.repository_published_at
+            else None
+        ),
+        "is_repository_published": bool(
+            doc and doc.repository_status == REPOSITORY_STATUS_PUBLISHED
+        ),
         "owner_name": doc_user.nama_lengkap if doc_user else "Anonim",
         "owner_identifier": doc_user.identifier if doc_user else "-",
-        "message": f"Status dokumen berhasil diubah menjadi '{check.approval_status}'.",
+        "message": repository_message,
     }

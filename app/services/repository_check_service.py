@@ -8,10 +8,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from fastapi import HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database.session import SessionLocal
-from app.models.schemas import Document, PlagiarismCheck, SimilarityResult, utc_now
+from app.models.schemas import (
+    Document,
+    PlagiarismCheck,
+    REPOSITORY_STATUS_PUBLISHED,
+    SimilarityResult,
+    utc_now,
+)
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_text_service import DocumentTextService
@@ -130,10 +137,19 @@ class RepositoryCheckService:
             repo_query = db.query(Document).filter(
                 Document.id != document_id,
                 Document.deleted_at.is_(None),
+                Document.repository_status == REPOSITORY_STATUS_PUBLISHED,
+                Document.document_type == target_doc.document_type,
             )
             if target_owner_id is not None:
-                # Jangan membandingkan revisi mahasiswa terhadap dokumen miliknya sendiri.
-                repo_query = repo_query.filter(Document.user_id != target_owner_id)
+                # Jangan membandingkan revisi mahasiswa terhadap dokumen
+                # miliknya sendiri. ``IS NULL`` sengaja dipertahankan agar
+                # dokumen alumni/admin tanpa pemilik tetap menjadi sumber.
+                repo_query = repo_query.filter(
+                    or_(
+                        Document.user_id.is_(None),
+                        Document.user_id != target_owner_id,
+                    )
+                )
             repo_docs = repo_query.all()
 
             self._set_progress(

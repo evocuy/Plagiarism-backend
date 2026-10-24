@@ -10,7 +10,16 @@ from sqlalchemy import text
 from pydantic import BaseModel
 
 from app.database.session import get_db
-from app.models.schemas import Document, PlagiarismCheck, SimilarityResult, User, Mahasiswa, utc_now
+from app.models.schemas import (
+    Document,
+    PlagiarismCheck,
+    SimilarityResult,
+    User,
+    Mahasiswa,
+    REPOSITORY_STATUS_DRAFT,
+    REPOSITORY_STATUS_PUBLISHED,
+    utc_now,
+)
 from app.routes.auth import get_current_user, require_admin
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
@@ -160,6 +169,7 @@ async def _store_uploaded_document(
     file: UploadFile,
     document_type: str,
     user_id: Optional[int],
+    repository_status: str = REPOSITORY_STATUS_DRAFT,
     db: Session,
 ) -> Document:
     """Validate, store, and persist one PDF without using the raw filename as a path."""
@@ -213,6 +223,12 @@ async def _store_uploaded_document(
             title=original_filename,
             document_type=clean_type,
             file_path=str(file_path),
+            repository_status=repository_status,
+            repository_published_at=(
+                utc_now()
+                if repository_status == REPOSITORY_STATUS_PUBLISHED
+                else None
+            ),
         )
         db.add(db_doc)
         db.commit()
@@ -242,6 +258,7 @@ async def upload_document(
         file=file,
         document_type=document_type,
         user_id=None,
+        repository_status=REPOSITORY_STATUS_PUBLISHED,
         db=db,
     )
 
@@ -303,6 +320,12 @@ async def upload_document(
         "user_id": db_doc.user_id,
         "filename": db_doc.title,
         "document_type": db_doc.document_type,
+        "repository_status": db_doc.repository_status,
+        "repository_published_at": (
+            db_doc.repository_published_at.isoformat()
+            if db_doc.repository_published_at
+            else None
+        ),
         # Clients only need a display name; never disclose the server path.
         "file_path": db_doc.title,
         "text_cache_status": text_cache_status,
@@ -311,7 +334,10 @@ async def upload_document(
         "chunk_count": chunk_count,
         "chunk_cache_error": chunk_cache_error,
         "embedding_auto_index": embedding_auto_index,
-        "message": f"File berhasil diunggah sebagai dokumen {db_doc.document_type.upper()} dan tersimpan di database.",
+        "message": (
+            f"File berhasil diunggah sebagai dokumen {db_doc.document_type.upper()} "
+            "dan langsung diterbitkan ke repositori pembanding."
+        ),
     }
 
 
@@ -343,6 +369,7 @@ async def upload_and_check_document(
         file=file,
         document_type=document_type,
         user_id=effective_user_id,
+        repository_status=REPOSITORY_STATUS_DRAFT,
         db=db,
     )
 
@@ -393,6 +420,8 @@ async def upload_and_check_document(
         "document_id": db_doc.id,
         "filename": db_doc.title,
         "document_type": db_doc.document_type,
+        "repository_status": db_doc.repository_status,
+        "repository_published_at": None,
         "status": check_record.status,
         "progress": check_record.progress,
         "stage": check_record.processing_stage,
@@ -404,6 +433,7 @@ async def upload_and_check_document(
 
 @router.get("/")
 def get_all_documents(
+    repository_only: bool = False,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -413,6 +443,8 @@ def get_all_documents(
     - Admin: seluruh dokumen.
     """
     query = _visible_documents_query(current_user, db)
+    if repository_only:
+        query = query.filter(Document.repository_status == REPOSITORY_STATUS_PUBLISHED)
     docs = query.order_by(Document.created_at.desc()).all()
     results = []
     for doc in docs:
@@ -423,6 +455,13 @@ def get_all_documents(
             "owner_identifier": doc.user.identifier if doc.user else "-",
             "title": doc.title,
             "document_type": doc.document_type,
+            "repository_status": doc.repository_status,
+            "repository_published_at": (
+                doc.repository_published_at.isoformat()
+                if doc.repository_published_at
+                else None
+            ),
+            "is_repository_published": doc.repository_status == REPOSITORY_STATUS_PUBLISHED,
             # Keep the legacy response key for the frontend, but return only a
             # display-safe filename rather than the internal storage path.
             "file_path": doc.title,

@@ -11,6 +11,10 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+REPOSITORY_STATUS_DRAFT = "draft"
+REPOSITORY_STATUS_PUBLISHED = "published"
+
+
 # ==========================================
 # 1. SQLAlchemy ORM Models
 # ==========================================
@@ -134,6 +138,16 @@ class Document(Base):
     text_extracted_at = Column(DateTime, nullable=True)
     text_extraction_error = Column(Text, nullable=True)
     deleted_at = Column(DateTime, nullable=True, index=True)
+    # Only published documents are eligible as comparison sources. Student
+    # uploads start as drafts and become published after supervisor approval.
+    repository_status = Column(
+        String(20),
+        nullable=False,
+        default=REPOSITORY_STATUS_DRAFT,
+        server_default=text("'draft'"),
+        index=True,
+    )
+    repository_published_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
     user = relationship("User", back_populates="documents")

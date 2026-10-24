@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database.session import Base
-from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User
+from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User, utc_now
 from app.routes.plagiarism import (
     get_check_history,
     get_check_matches,
@@ -48,6 +48,21 @@ class FakeChunkService:
                 "clean": "sistem informasi akademik",
                 "page": 1,
             }
+        ]
+
+    @staticmethod
+    def to_reference_corpus(chunks, matched_source, source_document_id=None):
+        return [
+            {
+                "clean": chunk["clean"],
+                "sentence": chunk["sentence"],
+                "matched_source": matched_source,
+                "source_document_id": source_document_id,
+                "source_chunk_index": chunk.get("chunk_index"),
+                "source_page": chunk.get("page"),
+                "chapter": chunk.get("chapter"),
+            }
+            for chunk in chunks
         ]
 
 
@@ -121,6 +136,96 @@ def test_repository_check_reuses_provisional_check_and_completes_progress():
     assert provisional_check.processing_stage == "completed"
     assert provisional_check.completed_at is not None
     assert [progress for progress, _stage in progress_events] == [5, 15, 28, 35, 96, 100]
+
+
+def test_repository_check_uses_only_published_same_type_external_sources():
+    db = _make_session()
+    owner = User(identifier="target-owner", password="secret", role="mahasiswa")
+    other_owner = User(identifier="other-owner", password="secret", role="mahasiswa")
+    db.add_all([owner, other_owner])
+    db.commit()
+    db.refresh(owner)
+    db.refresh(other_owner)
+
+    target = Document(
+        user_id=owner.id,
+        title="target.pdf",
+        document_type="skripsi",
+        file_path="target.pdf",
+        repository_status="draft",
+    )
+    eligible_student_source = Document(
+        user_id=other_owner.id,
+        title="eligible-student.pdf",
+        document_type="skripsi",
+        file_path="eligible-student.pdf",
+        repository_status="published",
+    )
+    eligible_ownerless_source = Document(
+        title="eligible-ownerless.pdf",
+        document_type="skripsi",
+        file_path="eligible-ownerless.pdf",
+        repository_status="published",
+    )
+    draft_source = Document(
+        user_id=other_owner.id,
+        title="draft.pdf",
+        document_type="skripsi",
+        file_path="draft.pdf",
+        repository_status="draft",
+    )
+    other_type_source = Document(
+        user_id=other_owner.id,
+        title="proposal.pdf",
+        document_type="proposal",
+        file_path="proposal.pdf",
+        repository_status="published",
+    )
+    same_owner_source = Document(
+        user_id=owner.id,
+        title="same-owner.pdf",
+        document_type="skripsi",
+        file_path="same-owner.pdf",
+        repository_status="published",
+    )
+    deleted_source = Document(
+        user_id=other_owner.id,
+        title="deleted.pdf",
+        document_type="skripsi",
+        file_path="deleted.pdf",
+        repository_status="published",
+        deleted_at=utc_now(),
+    )
+    db.add_all(
+        [
+            target,
+            eligible_student_source,
+            eligible_ownerless_source,
+            draft_source,
+            other_type_source,
+            same_owner_source,
+            deleted_source,
+        ]
+    )
+    db.commit()
+
+    result = _make_service(FakeTextService()).run_repository_check(
+        document_id=target.id,
+        requester_user_id=owner.id,
+        db=db,
+        auto_index_embeddings=False,
+        candidate_limit=20,
+    )
+
+    expected_source_ids = {eligible_student_source.id, eligible_ownerless_source.id}
+    persisted_source_ids = {
+        source_document_id
+        for (source_document_id,) in db.query(SimilarityResult.source_document_id).all()
+    }
+    assert result["total_repository_available"] == 2
+    assert result["total_repository_checked"] == 2
+    assert {item["repository_document_id"] for item in result["matches"]} == expected_source_ids
+    assert persisted_source_ids == expected_source_ids
 
 
 def test_repository_check_marks_provisional_check_failed_without_exposing_raw_error():
@@ -266,6 +371,7 @@ def test_matches_endpoint_returns_final_payload_after_progress_completes():
         title="source.pdf",
         document_type="proposal",
         file_path="source.pdf",
+        repository_status="published",
     )
     db.add_all([target, source])
     db.commit()

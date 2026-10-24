@@ -38,6 +38,7 @@ def _add_document_and_check(
     *,
     status="completed",
     approval_status="belum disetujui",
+    repository_status="draft",
     file_path=None,
 ):
     document = Document(
@@ -45,6 +46,7 @@ def _add_document_and_check(
         title=f"{owner.identifier}.pdf",
         document_type="skripsi",
         file_path=file_path or f"{owner.identifier}.pdf",
+        repository_status=repository_status,
     )
     db.add(document)
     db.flush()
@@ -174,7 +176,7 @@ def test_approval_rejects_an_unfinished_check_and_preserves_state():
     db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
     student = _add_student(db, "mahasiswa", dosen_pembimbing_id=dosen.id)
     db.flush()
-    _, check = _add_document_and_check(db, student, status="processing")
+    document, check = _add_document_and_check(db, student, status="processing")
     db.commit()
 
     try:
@@ -190,8 +192,10 @@ def test_approval_rejects_an_unfinished_check_and_preserves_state():
         raise AssertionError("Expected unfinished checks to reject approval")
 
     db.refresh(check)
+    db.refresh(document)
     assert check.approval_status == "belum disetujui"
     assert check.reviewed_at is None
+    assert document.repository_status == "draft"
 
 
 def test_completed_approval_returns_the_document_contract():
@@ -225,4 +229,98 @@ def test_completed_approval_returns_the_document_contract():
     assert payload["owner_name"] == "mahasiswa"
     assert payload["owner_identifier"] == "mahasiswa"
     assert payload["reviewed_at"] is not None
+    assert payload["repository_status"] == "published"
+    assert payload["repository_published_at"] is not None
+    assert payload["is_repository_published"] is True
+    db.refresh(document)
+    assert document.repository_status == "published"
+    assert document.repository_published_at is not None
+
+
+def test_revisi_withdraws_document_from_repository():
+    db = _make_session()
+    dosen = User(identifier="dosen", password="secret", role="dosen")
+    db.add(dosen)
+    db.flush()
+    db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
+    student = _add_student(db, "mahasiswa", dosen_pembimbing_id=dosen.id)
+    db.flush()
+    document, check = _add_document_and_check(
+        db,
+        student,
+        repository_status="published",
+    )
+    db.commit()
+
+    payload = plagiarism_routes.update_approval_status(
+        check.id,
+        plagiarism_routes.ApprovalUpdateRequest(approval_status="revisi"),
+        current_user=dosen,
+        db=db,
+    )
+
+    db.refresh(document)
+    assert document.repository_status == "draft"
+    assert document.repository_published_at is None
+    assert payload["repository_status"] == "draft"
+    assert payload["repository_published_at"] is None
+    assert payload["is_repository_published"] is False
+
+
+def test_manual_check_rejects_draft_wrong_type_and_same_owner_sources():
+    db = _make_session()
+    owner = _add_student(db, "pemilik")
+    other_owner = _add_student(db, "mahasiswa-lain")
+    db.flush()
+    target = Document(
+        user_id=owner.id,
+        title="target.pdf",
+        document_type="skripsi",
+        file_path="target.pdf",
+        repository_status="draft",
+    )
+    draft_source = Document(
+        user_id=other_owner.id,
+        title="draft-source.pdf",
+        document_type="skripsi",
+        file_path="draft-source.pdf",
+        repository_status="draft",
+    )
+    wrong_type_source = Document(
+        user_id=other_owner.id,
+        title="proposal-source.pdf",
+        document_type="proposal",
+        file_path="proposal-source.pdf",
+        repository_status="published",
+    )
+    same_owner_source = Document(
+        user_id=owner.id,
+        title="same-owner-source.pdf",
+        document_type="skripsi",
+        file_path="same-owner-source.pdf",
+        repository_status="published",
+    )
+    db.add_all([target, draft_source, wrong_type_source, same_owner_source])
+    db.commit()
+
+    cases = [
+        (draft_source, "belum diterbitkan"),
+        (wrong_type_source, "jenis dokumen yang sama"),
+        (same_owner_source, "mahasiswa yang sama"),
+    ]
+    for source, expected_detail in cases:
+        try:
+            plagiarism_routes.check_similarity(
+                plagiarism_routes.SingleCheckRequest(
+                    document_id=target.id,
+                    reference_document_id=source.id,
+                ),
+                current_user=owner,
+                db=db,
+            )
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            assert expected_detail in exc.detail
+        else:
+            raise AssertionError("Expected incompatible repository source to be rejected")
 

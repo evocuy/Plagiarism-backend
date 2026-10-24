@@ -38,6 +38,73 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS text_extraction_error TEXT"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_deleted_at ON documents(deleted_at)"))
+        # Comparison corpus lifecycle: uploads stay out of the repository
+        # until explicitly published. Server defaults also protect direct SQL
+        # inserts that do not go through the ORM.
+        conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS repository_status VARCHAR(20) NOT NULL DEFAULT 'draft'"))
+        conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS repository_published_at TIMESTAMP"))
+        conn.execute(text("UPDATE documents SET repository_status = 'draft' WHERE repository_status IS NULL"))
+        # Uploads have used canonical lowercase values for some time, but
+        # normalize older spellings too so the type-isolated corpus does not
+        # silently exclude legacy Skripsi/Proposal/Sempro records.
+        conn.execute(text("""
+            UPDATE documents
+            SET document_type = CASE LOWER(BTRIM(document_type))
+                WHEN 'sempro' THEN 'proposal'
+                WHEN 'proposal' THEN 'proposal'
+                WHEN 'skripsi' THEN 'skripsi'
+                ELSE document_type
+            END
+            WHERE LOWER(BTRIM(document_type)) IN ('sempro', 'proposal', 'skripsi')
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_repository_status ON documents(repository_status)"))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_documents_published_candidates
+            ON documents(document_type)
+            WHERE deleted_at IS NULL AND repository_status = 'published'
+        """))
+        # Existing ownerless uploads are the legacy admin/imported repository.
+        # Preserve them as comparison sources, while student uploads require an
+        # approval record before joining the corpus.
+        conn.execute(text("""
+            UPDATE documents
+            SET repository_status = 'published',
+                repository_published_at = COALESCE(repository_published_at, created_at, CURRENT_TIMESTAMP)
+            WHERE user_id IS NULL
+        """))
+        # For legacy student documents, use the most recently reviewed
+        # completed check. This avoids publishing a document that was approved
+        # in an older check but later marked for revision.
+        conn.execute(text("""
+            WITH latest_review AS (
+                SELECT DISTINCT ON (document_id)
+                    document_id,
+                    approval_status,
+                    reviewed_at
+                FROM plagiarism_checks
+                WHERE status = 'completed'
+                  AND approval_status IN ('disetujui', 'revisi')
+                ORDER BY document_id, reviewed_at DESC NULLS LAST, id DESC
+            )
+            UPDATE documents AS d
+            SET repository_status = CASE
+                    WHEN latest_review.approval_status = 'disetujui' THEN 'published'
+                    ELSE 'draft'
+                END,
+                repository_published_at = CASE
+                    WHEN latest_review.approval_status = 'disetujui'
+                        THEN COALESCE(
+                            d.repository_published_at,
+                            latest_review.reviewed_at,
+                            d.created_at,
+                            CURRENT_TIMESTAMP
+                        )
+                    ELSE NULL
+                END
+            FROM latest_review
+            WHERE d.id = latest_review.document_id
+              AND d.user_id IS NOT NULL
+        """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS document_chunks (
                 id SERIAL PRIMARY KEY,
