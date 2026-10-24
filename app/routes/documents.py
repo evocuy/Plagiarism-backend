@@ -431,6 +431,10 @@ async def upload_and_check_document(
         "poll_after_ms": 1000,
     }
 
+# Keep both URL forms to avoid FastAPI's automatic slash redirect.  The API is
+# served behind HTTPS, and a proxy that rewrites that redirect to HTTP can make
+# browsers drop/block an authenticated request before it reaches this handler.
+@router.get("", include_in_schema=False)
 @router.get("/")
 def get_all_documents(
     repository_only: bool = False,
