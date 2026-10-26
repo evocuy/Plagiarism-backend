@@ -427,6 +427,195 @@ class RepositoryCheckService:
             self._mark_failed(check_record.id, db, exc)
             raise
 
+    def run_direct_check(
+        self,
+        *,
+        document_id: int,
+        reference_document_id: int,
+        db: Session,
+        requester_user_id: Optional[int] = None,
+        existing_check_id: Optional[int] = None,
+        report_progress: Optional[ProgressReporter] = None,
+    ) -> Dict[str, Any]:
+        """Compare one target against one published source through the queue.
+
+        The legacy direct-comparison API used to run this expensive work in the
+        FastAPI request process. Keeping it here lets the same single worker,
+        quota, status polling, and retry behaviour protect that API too.
+        """
+        target_doc = (
+            db.query(Document)
+            .filter(Document.id == document_id, Document.deleted_at.is_(None))
+            .first()
+        )
+        if not target_doc:
+            raise HTTPException(status_code=404, detail="Dokumen target tidak ditemukan.")
+
+        target_owner_id = target_doc.user_id or requester_user_id
+        check_record = self._get_or_create_check(
+            db=db,
+            document_id=target_doc.id,
+            effective_user_id=target_owner_id,
+            existing_check_id=existing_check_id,
+        )
+
+        try:
+            reference_doc = (
+                db.query(Document)
+                .filter(
+                    Document.id == reference_document_id,
+                    Document.deleted_at.is_(None),
+                )
+                .first()
+            )
+            if not reference_doc:
+                raise HTTPException(status_code=404, detail="Dokumen referensi tidak ditemukan.")
+            if reference_doc.id == target_doc.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dokumen tidak dapat dibandingkan dengan dirinya sendiri.",
+                )
+            if reference_doc.repository_status != REPOSITORY_STATUS_PUBLISHED:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dokumen referensi belum diterbitkan ke repositori pembanding.",
+                )
+            if reference_doc.document_type != target_doc.document_type:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dokumen referensi harus memiliki jenis dokumen yang sama.",
+                )
+            if (
+                target_owner_id is not None
+                and reference_doc.user_id is not None
+                and reference_doc.user_id == target_owner_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dokumen tidak dapat dibandingkan dengan dokumen milik mahasiswa yang sama.",
+                )
+
+            self._set_progress(
+                check_record,
+                db,
+                15,
+                "extracting_text",
+                "Mengekstrak teks dari dokumen.",
+                report_progress,
+            )
+            target_data = self.document_text_service.get_or_extract_text(target_doc, db)
+            reference_data = self.document_text_service.get_or_extract_text(reference_doc, db)
+
+            self._set_progress(
+                check_record,
+                db,
+                45,
+                "comparing_documents",
+                "Membandingkan dua dokumen.",
+                report_progress,
+            )
+            score = self.similarity_service.calculate_clean_text_similarity(
+                target_data["cleaned_text"],
+                reference_data["cleaned_text"],
+            )
+            check_record.overall_similarity = score
+            check_record.reference_document_id = reference_doc.id
+            check_record.updated_at = utc_now()
+            check_record.heartbeat_at = check_record.updated_at
+            db.add(check_record)
+            db.commit()
+            db.refresh(check_record)
+
+            self._set_progress(
+                check_record,
+                db,
+                62,
+                "saving_results",
+                "Menyimpan hasil kemiripan.",
+                report_progress,
+            )
+            result_record = self.similarity_result_service.create_result(
+                db=db,
+                check_id=check_record.id,
+                source_document_id=reference_doc.id,
+                similarity_score=score,
+            )
+
+            self._set_progress(
+                check_record,
+                db,
+                78,
+                "matching_sentences",
+                "Mencari kalimat yang sama persis.",
+                report_progress,
+            )
+            target_chunks = self.document_chunk_service.get_or_build_sentence_chunks(target_doc, db)
+            reference_chunks = self.document_chunk_service.get_or_build_sentence_chunks(reference_doc, db)
+            lexical_matches = self.similarity_service.find_sentence_matches(
+                target_sentences=target_chunks,
+                reference_sentences=reference_chunks,
+                matched_source=reference_doc.title,
+                source_document_id=reference_doc.id,
+                threshold=0.70,
+            )
+            plagiarized_sentences = self._merge_highlight_matches(lexical_matches)
+            highlight_summary = self.similarity_result_service.summarize_highlight_matches(
+                plagiarized_sentences
+            )
+            self.similarity_result_service.create_matches(
+                db=db,
+                result_id=result_record.id,
+                matches=plagiarized_sentences,
+            )
+
+            self._set_progress(
+                check_record,
+                db,
+                96,
+                "generating_highlight",
+                "Membuat PDF dengan penanda kalimat.",
+                report_progress,
+            )
+            try:
+                highlighted_file = self._generate_highlighted_pdf(
+                    check_record=check_record,
+                    target_doc=target_doc,
+                    plagiarized_sentences=self._deduplicate_visual_highlight_matches(
+                        plagiarized_sentences
+                    ),
+                    db=db,
+                )
+            except Exception as highlight_error:
+                self.logger.warning(
+                    "Gagal membuat highlighted PDF untuk check langsung %s: %s",
+                    check_record.id,
+                    highlight_error,
+                )
+                highlighted_file = self._generate_fallback_highlighted_pdf(
+                    check_record=check_record,
+                    target_doc=target_doc,
+                    db=db,
+                )
+
+            self._complete_check(check_record, db, report_progress)
+            return {
+                "check_id": check_record.id,
+                "target_document": target_doc.title,
+                "reference_document": reference_doc.title,
+                "similarity_score": round(score, 4),
+                "similarity_percentage": f"{round(score * 100, 2)}%",
+                "status": check_record.status,
+                "total_plagiarized_sentences": len(plagiarized_sentences),
+                "highlight_summary": highlight_summary,
+                "highlighted_pdf_available": bool(
+                    highlighted_file and os.path.exists(highlighted_file)
+                ),
+                "chapter_validation": target_data.get("chapter_validation"),
+            }
+        except Exception as exc:
+            self._mark_failed(check_record.id, db, exc)
+            raise
+
     def _get_or_create_check(
         self,
         *,
@@ -459,6 +648,7 @@ class RepositoryCheckService:
         check_record.started_at = utc_now()
         check_record.completed_at = None
         check_record.updated_at = utc_now()
+        check_record.heartbeat_at = check_record.updated_at
         db.commit()
         db.refresh(check_record)
         return check_record
@@ -480,6 +670,7 @@ class RepositoryCheckService:
         check_record.error_message = None
         check_record.started_at = check_record.started_at or utc_now()
         check_record.updated_at = utc_now()
+        check_record.heartbeat_at = check_record.updated_at
         db.add(check_record)
         db.commit()
         db.refresh(check_record)
@@ -498,6 +689,7 @@ class RepositoryCheckService:
         check_record.error_message = None
         check_record.completed_at = utc_now()
         check_record.updated_at = utc_now()
+        check_record.heartbeat_at = check_record.updated_at
         db.add(check_record)
         db.commit()
         db.refresh(check_record)
@@ -515,6 +707,7 @@ class RepositoryCheckService:
             check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
             check_record.error_message = "Pengecekan gagal diproses. Silakan coba lagi."
             check_record.updated_at = utc_now()
+            check_record.heartbeat_at = check_record.updated_at
             db.add(check_record)
             db.commit()
         except Exception as persist_error:
@@ -667,6 +860,7 @@ class RepositoryCheckService:
         )
         check_record.highlighted_file_path = highlighted_file
         check_record.updated_at = utc_now()
+        check_record.heartbeat_at = check_record.updated_at
         db.add(check_record)
         db.commit()
         db.refresh(check_record)
@@ -788,9 +982,52 @@ def run_repository_check_in_background(
                 check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
                 check_record.error_message = "Pengecekan gagal diproses. Silakan coba lagi."
                 check_record.updated_at = utc_now()
+                check_record.heartbeat_at = check_record.updated_at
                 db.add(check_record)
                 db.commit()
         except Exception as persist_error:
             logger.error("Gagal menyimpan kegagalan background check %s: %s", check_id, persist_error)
+    finally:
+        db.close()
+
+
+def run_direct_check_in_background(
+    *,
+    document_id: int,
+    reference_document_id: int,
+    check_id: int,
+    requester_user_id: Optional[int],
+    session_factory=SessionLocal,
+    service_factory=RepositoryCheckService,
+    **_ignored: Any,
+) -> None:
+    """Execute the legacy two-document comparison outside the API process."""
+    logger = logging.getLogger(__name__)
+    db = session_factory()
+    try:
+        service = service_factory()
+        service.run_direct_check(
+            document_id=document_id,
+            reference_document_id=reference_document_id,
+            db=db,
+            requester_user_id=requester_user_id,
+            existing_check_id=check_id,
+        )
+    except Exception as exc:
+        logger.exception("Direct check %s gagal: %s", check_id, exc)
+        try:
+            db.rollback()
+            check_record = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
+            if check_record and check_record.status != "completed":
+                check_record.status = "failed"
+                check_record.processing_stage = "failed"
+                check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
+                check_record.error_message = check_record.processing_message
+                check_record.updated_at = utc_now()
+                check_record.heartbeat_at = check_record.updated_at
+                db.add(check_record)
+                db.commit()
+        except Exception as persist_error:
+            logger.error("Gagal menyimpan kegagalan direct check %s: %s", check_id, persist_error)
     finally:
         db.close()

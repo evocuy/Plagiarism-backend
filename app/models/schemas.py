@@ -187,6 +187,18 @@ class PlagiarismCheck(Base):
     processing_stage = Column(String(64), nullable=True)
     processing_message = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
+    # Queue metadata keeps long-running checks durable outside the web request
+    # process.  A separate worker claims pending rows one at a time.
+    candidate_limit = Column(Integer, nullable=False, default=20, server_default=text("20"))
+    auto_index_embeddings = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    auto_index_repository_limit = Column(Integer, nullable=False, default=50, server_default=text("50"))
+    # ``reference_document_id`` is set only for the legacy direct comparison
+    # flow.  Its presence lets the same queue/worker bound that workflow too.
+    reference_document_id = Column(Integer, nullable=True)
+    queued_at = Column(DateTime, nullable=True, index=True)
+    claimed_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)

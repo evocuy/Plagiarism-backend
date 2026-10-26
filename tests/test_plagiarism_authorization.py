@@ -324,3 +324,42 @@ def test_manual_check_rejects_draft_wrong_type_and_same_owner_sources():
         else:
             raise AssertionError("Expected incompatible repository source to be rejected")
 
+
+def test_manual_check_is_enqueued_instead_of_running_inside_api_request():
+    db = _make_session()
+    owner = _add_student(db, "pemilik")
+    other_owner = _add_student(db, "mahasiswa-lain")
+    db.flush()
+    target = Document(
+        user_id=owner.id,
+        title="target.pdf",
+        document_type="skripsi",
+        file_path="target.pdf",
+        repository_status="draft",
+    )
+    source = Document(
+        user_id=other_owner.id,
+        title="source.pdf",
+        document_type="skripsi",
+        file_path="source.pdf",
+        repository_status="published",
+    )
+    db.add_all([target, source])
+    db.commit()
+
+    payload = plagiarism_routes.check_similarity(
+        plagiarism_routes.SingleCheckRequest(
+            document_id=target.id,
+            reference_document_id=source.id,
+        ),
+        current_user=owner,
+        db=db,
+    )
+
+    check = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == payload["check_id"]).first()
+    assert payload["status"] == "pending"
+    assert payload["reference_document_id"] == source.id
+    assert payload["queue_position"] == 1
+    assert check.reference_document_id == source.id
+    assert check.status == "pending"
+

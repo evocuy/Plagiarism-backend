@@ -1,6 +1,5 @@
 import asyncio
 
-from fastapi import BackgroundTasks
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
@@ -558,7 +557,7 @@ def test_top_matches_endpoint_returns_only_three_highest_sources_for_history():
         raise AssertionError("Expected an unknown check to return 404")
 
 
-def test_upload_and_check_returns_pending_check_and_schedules_background_work(monkeypatch):
+def test_upload_and_check_returns_pending_check_for_database_worker(monkeypatch):
     db = _make_session()
     owner = User(identifier="uploader", password="secret", role="mahasiswa")
     db.add(owner)
@@ -579,11 +578,8 @@ def test_upload_and_check_returns_pending_check_and_schedules_background_work(mo
         return document
 
     monkeypatch.setattr(document_routes, "_store_uploaded_document", fake_store_uploaded_document)
-    background_tasks = BackgroundTasks()
-
     payload = asyncio.run(
         document_routes.upload_and_check_document(
-            background_tasks=background_tasks,
             file=object(),
             document_type="proposal",
             user_id=None,
@@ -600,6 +596,63 @@ def test_upload_and_check_returns_pending_check_and_schedules_background_work(mo
     assert payload["progress"] == 0
     assert payload["status_url"] == f"/api/plagiarism/check/{check.id}/status"
     assert payload["result_url"] == f"/api/plagiarism/check/{check.id}/matches"
+    assert payload["queue_position"] == 1
+    assert payload["poll_after_ms"] == 5000
     assert check.status == "pending"
     assert check.document_id == document.id
-    assert len(background_tasks.tasks) == 1
+    assert check.candidate_limit == 20
+
+
+def test_upload_and_check_rejects_active_student_before_storing_new_file(monkeypatch):
+    db = _make_session()
+    owner = User(identifier="uploader", password="secret", role="mahasiswa")
+    db.add(owner)
+    db.commit()
+    db.refresh(owner)
+
+    existing_document = Document(
+        user_id=owner.id,
+        title="existing.pdf",
+        document_type="proposal",
+        file_path="existing.pdf",
+    )
+    db.add(existing_document)
+    db.flush()
+    db.add(
+        PlagiarismCheck(
+            document_id=existing_document.id,
+            user_id=owner.id,
+            overall_similarity=0.0,
+            status="pending",
+            processing_stage="queued",
+        )
+    )
+    db.commit()
+    store_called = False
+
+    async def fake_store_uploaded_document(**_kwargs):
+        nonlocal store_called
+        store_called = True
+        raise AssertionError("File baru tidak boleh disimpan ketika ada check aktif")
+
+    monkeypatch.setattr(document_routes, "_store_uploaded_document", fake_store_uploaded_document)
+
+    try:
+        asyncio.run(
+            document_routes.upload_and_check_document(
+                file=object(),
+                document_type="proposal",
+                user_id=None,
+                candidate_limit=20,
+                auto_index_embeddings=False,
+                auto_index_repository_limit=0,
+                current_user=owner,
+                db=db,
+            )
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("Expected an active check to block another upload")
+
+    assert store_called is False

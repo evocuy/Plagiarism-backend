@@ -1,0 +1,27 @@
+# Copy this file to /etc/systemd/system/plagiarism-check-worker.service,
+# then replace every <...> placeholder for the VM deployment.
+#
+# This worker is intentionally separate from the FastAPI web service. Keep
+# exactly one enabled worker until the server capacity has been measured.
+# After installing it: systemctl daemon-reload && systemctl enable --now
+# plagiarism-check-worker. The PartOf line makes a later `systemctl restart
+# backend` restart this worker too.
+[Unit]
+Description=Plagiarism Checker queue worker
+Wants=network-online.target
+After=network-online.target backend.service
+Requires=backend.service
+PartOf=backend.service
+
+[Service]
+Type=simple
+User=<deploy-user>
+WorkingDirectory=<absolute-path-to-repository>/backend
+EnvironmentFile=<absolute-path-to-repository>/backend/.env
+ExecStart=<absolute-path-to-repository>/backend/.venv/bin/python -m app.workers.check_worker
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

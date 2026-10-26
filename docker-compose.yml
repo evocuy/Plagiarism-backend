@@ -34,5 +34,23 @@ services:
     volumes:
       - .:/app
 
+  check-worker:
+    build: .
+    container_name: plagiarism-check-worker
+    restart: always
+    command: ["python", "-m", "app.workers.check_worker"]
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-plagiarism_db}
+      UPLOAD_DIR: ${UPLOAD_DIR:-uploads}
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    volumes:
+      - .:/app
+
 volumes:
   pgvector_data:

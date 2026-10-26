@@ -12,6 +12,14 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(64)"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_message TEXT"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS error_message TEXT"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS candidate_limit INTEGER NOT NULL DEFAULT 20"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS auto_index_embeddings BOOLEAN NOT NULL DEFAULT TRUE"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS auto_index_repository_limit INTEGER NOT NULL DEFAULT 50"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reference_document_id INTEGER"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
@@ -22,6 +30,12 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reviewer_note TEXT"))
         conn.execute(text("UPDATE plagiarism_checks SET approval_status = 'belum disetujui' WHERE approval_status IS NULL"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_approval_status ON plagiarism_checks(approval_status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_queue_status ON plagiarism_checks(status, queued_at, created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_user_queue_status ON plagiarism_checks(user_id, status, created_at)"))
+        conn.execute(text("UPDATE plagiarism_checks SET candidate_limit = 20 WHERE candidate_limit IS NULL OR candidate_limit < 1"))
+        conn.execute(text("UPDATE plagiarism_checks SET auto_index_repository_limit = 50 WHERE auto_index_repository_limit IS NULL OR auto_index_repository_limit < 0"))
+        conn.execute(text("UPDATE plagiarism_checks SET attempt_count = 0 WHERE attempt_count IS NULL"))
+        conn.execute(text("UPDATE plagiarism_checks SET queued_at = created_at WHERE status = 'pending' AND queued_at IS NULL"))
         conn.execute(text("""
             UPDATE plagiarism_checks
             SET progress = 100,

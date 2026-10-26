@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, List
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form, HTTPException, Depends, Body, status
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Body, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
@@ -26,7 +26,7 @@ from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
 from app.services.document_structure_service import DocumentStructureService
 from app.services.document_text_service import DocumentTextService
-from app.services.repository_check_service import run_repository_check_in_background
+from app.services.check_queue_service import CheckQueueService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -40,7 +40,9 @@ document_embedding_service = DocumentEmbeddingService(document_chunk_service=doc
 document_structure_service = DocumentStructureService()
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
+# Keep the backend limit aligned with the student-facing upload policy.  The
+# environment can raise it deliberately if the campus adopts another limit.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10")) * 1024 * 1024
 ALLOWED_PDF_CONTENT_TYPES = {
     "application/pdf",
     "application/x-pdf",
@@ -49,6 +51,11 @@ ALLOWED_PDF_CONTENT_TYPES = {
     "text/pdf",
 }
 ALLOWED_FILENAME_STEM_PUNCTUATION = {" ", "_", "-", ".", "(", ")"}
+
+
+def _get_check_queue_service() -> CheckQueueService:
+    """Build settings from environment so deployment limits stay configurable."""
+    return CheckQueueService()
 
 
 class ReindexDocumentsRequest(BaseModel):
@@ -343,7 +350,6 @@ async def upload_document(
 
 @router.post("/upload-and-check", status_code=status.HTTP_202_ACCEPTED)
 async def upload_and_check_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     document_type: str = Form(...),
     user_id: Optional[int] = Form(None),
@@ -353,18 +359,30 @@ async def upload_and_check_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Upload a PDF and start its repository check without holding the request open."""
-    if not 1 <= candidate_limit <= 100:
-        raise HTTPException(status_code=400, detail="candidate_limit harus berada di antara 1 dan 100.")
-    if not 0 <= auto_index_repository_limit <= 500:
+    """Store a PDF and enqueue one durable repository check."""
+    queue_service = _get_check_queue_service()
+    settings = queue_service.settings
+    if not 1 <= candidate_limit <= settings.max_candidate_limit:
         raise HTTPException(
             status_code=400,
-            detail="auto_index_repository_limit harus berada di antara 0 dan 500.",
+            detail=(
+                f"candidate_limit harus berada di antara 1 dan "
+                f"{settings.max_candidate_limit}."
+            ),
+        )
+    if not 0 <= auto_index_repository_limit <= settings.max_auto_index_repository_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "auto_index_repository_limit harus berada di antara 0 dan "
+                f"{settings.max_auto_index_repository_limit}."
+            ),
         )
 
     # For this asynchronous flow the authenticated uploader owns the job.
     # ``user_id`` is kept in the form contract for client compatibility.
     effective_user_id = current_user.id
+    queue_service.assert_can_enqueue(db, effective_user_id)
     db_doc = await _store_uploaded_document(
         file=file,
         document_type=document_type,
@@ -373,20 +391,17 @@ async def upload_and_check_document(
         db=db,
     )
 
-    check_record = PlagiarismCheck(
-        document_id=db_doc.id,
-        user_id=effective_user_id,
-        overall_similarity=0.0,
-        status="pending",
-        progress=0,
-        processing_stage="queued",
-        processing_message="File diterima dan menunggu proses pengecekan.",
-        updated_at=utc_now(),
-    )
     try:
-        db.add(check_record)
-        db.commit()
-        db.refresh(check_record)
+        check_record, queue_position = queue_service.enqueue(
+            db=db,
+            document_id=db_doc.id,
+            user_id=effective_user_id,
+            candidate_limit=candidate_limit,
+            auto_index_embeddings=(
+                auto_index_embeddings and settings.auto_index_embeddings
+            ),
+            auto_index_repository_limit=auto_index_repository_limit,
+        )
     except Exception:
         stored_file_path = Path(db_doc.file_path)
         db.rollback()
@@ -405,16 +420,6 @@ async def upload_and_check_document(
                 )
         raise
 
-    background_tasks.add_task(
-        run_repository_check_in_background,
-        document_id=db_doc.id,
-        check_id=check_record.id,
-        requester_user_id=effective_user_id,
-        candidate_limit=candidate_limit,
-        auto_index_embeddings=auto_index_embeddings,
-        auto_index_repository_limit=auto_index_repository_limit,
-    )
-
     return {
         "check_id": check_record.id,
         "document_id": db_doc.id,
@@ -426,9 +431,10 @@ async def upload_and_check_document(
         "progress": check_record.progress,
         "stage": check_record.processing_stage,
         "message": check_record.processing_message,
+        "queue_position": queue_position,
         "status_url": f"/api/plagiarism/check/{check_record.id}/status",
         "result_url": f"/api/plagiarism/check/{check_record.id}/matches",
-        "poll_after_ms": 1000,
+        "poll_after_ms": settings.poll_after_ms,
     }
 
 # Keep both URL forms to avoid FastAPI's automatic slash redirect.  The API is

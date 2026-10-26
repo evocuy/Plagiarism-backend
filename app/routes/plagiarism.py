@@ -1,8 +1,7 @@
-import logging
 import os
 from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -20,46 +19,26 @@ from app.models.schemas import (
     utc_now,
 )
 from app.services.pdf_service import PDFService
-from app.services.document_chunk_service import DocumentChunkService
-from app.services.document_embedding_service import DocumentEmbeddingService
-from app.services.document_text_service import DocumentTextService
-from app.services.repository_candidate_service import RepositoryCandidateService
-from app.services.repository_check_service import RepositoryCheckService
+from app.services.check_queue_service import CheckQueueService
 from app.services.similarity_result_service import SimilarityResultService
-from app.services.similarity_service import SimilarityService
 from app.routes.auth import get_current_user
 
 router = APIRouter()
 pdf_service = PDFService()
-similarity_service = SimilarityService()
 similarity_result_service = SimilarityResultService()
-document_chunk_service = DocumentChunkService(pdf_service=pdf_service, similarity_service=similarity_service)
-document_text_service = DocumentTextService(pdf_service=pdf_service, similarity_service=similarity_service)
-repository_candidate_service = RepositoryCandidateService(document_chunk_service=document_chunk_service)
-document_embedding_service = DocumentEmbeddingService(document_chunk_service=document_chunk_service)
-repository_check_service = RepositoryCheckService(
-    pdf_service=pdf_service,
-    similarity_service=similarity_service,
-    similarity_result_service=similarity_result_service,
-    document_chunk_service=document_chunk_service,
-    document_text_service=document_text_service,
-    repository_candidate_service=repository_candidate_service,
-    document_embedding_service=document_embedding_service,
-)
-logger = logging.getLogger(__name__)
 
 class SingleCheckRequest(BaseModel):
     document_id: int
     reference_document_id: int
 
 
-@router.post("/check")
+@router.post("/check", status_code=status.HTTP_202_ACCEPTED)
 def check_similarity(
     request: SingleCheckRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Membandingkan 2 dokumen secara spesifik (dokumen A vs dokumen B) serta memberi highlight pada kalimat terdeteksi plagiat"""
+    """Enqueue one direct comparison instead of running it in the API process."""
     doc_a = (
         db.query(Document)
         .filter(Document.id == request.document_id, Document.deleted_at.is_(None))
@@ -108,118 +87,40 @@ def check_similarity(
             detail="Dokumen tidak dapat dibandingkan dengan dokumen milik mahasiswa yang sama.",
         )
 
-    data_a = document_text_service.get_or_extract_text(doc_a, db)
-    data_b = document_text_service.get_or_extract_text(doc_b, db)
-
-    score = similarity_service.calculate_clean_text_similarity(data_a["cleaned_text"], data_b["cleaned_text"])
-
-    # Keep the check tied to the document owner so its history remains visible
-    # to the student and their supervising lecturer when a lecturer starts it.
-    check_record = PlagiarismCheck(
+    queue_service = CheckQueueService()
+    check_record, queue_position = queue_service.enqueue(
+        db=db,
         document_id=doc_a.id,
         user_id=effective_user_id,
-        overall_similarity=score,
-        status="completed",
-        progress=100,
-        processing_stage="completed",
-        processing_message="Pengecekan kemiripan selesai.",
-        started_at=utc_now(),
-        completed_at=utc_now(),
-        updated_at=utc_now(),
+        candidate_limit=1,
+        auto_index_embeddings=False,
+        auto_index_repository_limit=0,
+        reference_document_id=doc_b.id,
     )
-    db.add(check_record)
-    db.commit()
-    db.refresh(check_record)
-
-    result_record = similarity_result_service.create_result(
-        db=db,
-        check_id=check_record.id,
-        source_document_id=doc_b.id,
-        similarity_score=score,
-    )
-
-    # Deteksi kalimat mirip dan beri highlight kuning stabilo di file PDF
-    highlighted_file = None
-    plagiarized_sentences = []
-    highlight_summary = similarity_result_service.summarize_highlight_matches([])
-    try:
-        repository_check_service._auto_index_embeddings_for_check(
-            target_doc=doc_a,
-            repo_docs=[doc_b],
-            db=db,
-            enabled=True,
-            repository_limit=1,
-        )
-        sentences_a = document_chunk_service.get_or_build_sentence_chunks(doc_a, db)
-        sentences_b = document_chunk_service.get_or_build_sentence_chunks(doc_b, db)
-
-        lexical_matches = similarity_service.find_sentence_matches(
-            target_sentences=sentences_a,
-            reference_sentences=sentences_b,
-            matched_source=doc_b.title,
-            source_document_id=doc_b.id,
-            threshold=0.70,
-        )
-        # Embedding dipakai untuk memilih kandidat, sedangkan stabilo hanya
-        # menunjukkan teks yang benar-benar sama agar pemilik dokumen tahu
-        # bagian konkret yang perlu direvisi.
-        plagiarized_sentences = repository_check_service._merge_highlight_matches(lexical_matches)
-        highlight_summary = similarity_result_service.summarize_highlight_matches(
-            plagiarized_sentences
-        )
-        similarity_result_service.create_matches(
-            db=db,
-            result_id=result_record.id,
-            matches=plagiarized_sentences,
-        )
-
-        output_filename = f"highlighted_check_{check_record.id}_{Path(doc_a.file_path).stem}.pdf"
-        highlighted_file = pdf_service.generate_highlighted_pdf(
-            source_pdf_path=doc_a.file_path,
-            plagiarized_sentences=plagiarized_sentences,
-            output_filename=output_filename,
-        )
-        check_record.highlighted_file_path = highlighted_file
-        db.commit()
-        db.refresh(check_record)
-    except Exception as hl_err:
-        logger.warning(f"Gagal generate highlighted PDF untuk check {check_record.id}: {hl_err}")
-        try:
-            output_filename = f"highlighted_check_{check_record.id}_{Path(doc_a.file_path).stem}.pdf"
-            highlighted_file = pdf_service.generate_highlighted_pdf(
-                source_pdf_path=doc_a.file_path,
-                plagiarized_sentences=[],
-                output_filename=output_filename,
-            )
-            check_record.highlighted_file_path = highlighted_file
-            db.commit()
-            db.refresh(check_record)
-        except Exception as fallback_err:
-            logger.warning(f"Gagal membuat fallback PDF untuk check {check_record.id}: {fallback_err}")
-
     return {
         "check_id": check_record.id,
-        "target_document": doc_a.title,
-        "reference_document": doc_b.title,
-        "similarity_score": round(score, 4),
-        "similarity_percentage": f"{round(score * 100, 2)}%",
+        "document_id": doc_a.id,
+        "reference_document_id": doc_b.id,
         "status": check_record.status,
-        "total_plagiarized_sentences": len(plagiarized_sentences),
-        "highlight_summary": highlight_summary,
-        "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
-        "chapter_validation": data_a.get("chapter_validation"),
+        "progress": check_record.progress,
+        "stage": check_record.processing_stage,
+        "message": check_record.processing_message,
+        "queue_position": queue_position,
+        "status_url": f"/api/plagiarism/check/{check_record.id}/status",
+        "result_url": f"/api/plagiarism/check/{check_record.id}/matches",
+        "poll_after_ms": queue_service.settings.poll_after_ms,
     }
 
-@router.post("/check-repository/{document_id}")
+@router.post("/check-repository/{document_id}", status_code=status.HTTP_202_ACCEPTED)
 def check_against_repository(
     document_id: int,
-    candidate_limit: int = Query(20, ge=1, le=100),
+    candidate_limit: int = Query(20, ge=1, le=20),
     auto_index_embeddings: bool = Query(True),
-    auto_index_repository_limit: int = Query(50, ge=0, le=500),
+    auto_index_repository_limit: int = Query(50, ge=0, le=50),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Check one document against the internal repository synchronously."""
+    """Enqueue an existing document for the same bounded repository workflow."""
     target_document = (
         db.query(Document)
         .filter(Document.id == document_id, Document.deleted_at.is_(None))
@@ -233,14 +134,46 @@ def check_against_repository(
             detail="Anda tidak memiliki izin untuk mengecek dokumen ini.",
         )
 
-    return repository_check_service.run_repository_check(
-        document_id=document_id,
+    queue_service = CheckQueueService()
+    settings = queue_service.settings
+    if candidate_limit > settings.max_candidate_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"candidate_limit harus berada di antara 1 dan "
+                f"{settings.max_candidate_limit}."
+            ),
+        )
+    if auto_index_repository_limit > settings.max_auto_index_repository_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "auto_index_repository_limit harus berada di antara 0 dan "
+                f"{settings.max_auto_index_repository_limit}."
+            ),
+        )
+
+    effective_user_id = target_document.user_id or current_user.id
+    check_record, queue_position = queue_service.enqueue(
         db=db,
-        requester_user_id=current_user.id,
+        document_id=target_document.id,
+        user_id=effective_user_id,
         candidate_limit=candidate_limit,
-        auto_index_embeddings=auto_index_embeddings,
+        auto_index_embeddings=(auto_index_embeddings and settings.auto_index_embeddings),
         auto_index_repository_limit=auto_index_repository_limit,
     )
+    return {
+        "check_id": check_record.id,
+        "document_id": target_document.id,
+        "status": check_record.status,
+        "progress": check_record.progress,
+        "stage": check_record.processing_stage,
+        "message": check_record.processing_message,
+        "queue_position": queue_position,
+        "status_url": f"/api/plagiarism/check/{check_record.id}/status",
+        "result_url": f"/api/plagiarism/check/{check_record.id}/matches",
+        "poll_after_ms": settings.poll_after_ms,
+    }
 
 @router.get("/history")
 def get_check_history(
@@ -451,8 +384,9 @@ def _serialize_check_final_result(
 ) -> dict:
     """Rebuild the final upload-result payload from persisted check data.
 
-    BackgroundTasks discards the return value of RepositoryCheckService, so
-    the frontend fetches this representation after polling reaches completed.
+    The queue worker persists its result independently from the initial upload
+    response, so the frontend fetches this representation after polling reaches
+    completed.
     """
     target_document = check.document
     detailed_results = []
