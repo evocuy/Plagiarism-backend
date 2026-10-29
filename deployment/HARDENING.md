@@ -44,6 +44,45 @@ Docker service name `db`. A separate host client can reach PostgreSQL on its
 loopback port. Remove the database `ports` entry entirely if no host client
 needs it. These bindings do not require touching a hypervisor or its firewall.
 
+### Frontend development over Tailscale
+
+A local frontend that proxies to `http://<tailscale-ip>:8000` needs an explicit
+API binding on that private IP. A loopback-only binding refuses that connection;
+Next.js may report its proxy connection failure as an internal server error.
+
+For the backend-only Linux VM deployment, prepare these ignored `.env` values
+after the change is reviewed and pushed:
+
+```env
+BACKEND_BIND_HOST=127.0.0.1
+BACKEND_TAILNET_IP=<the-VM-Tailscale-IPv4>
+COMPOSE_FILE=docker-compose.yml:docker-compose.tailnet.yml
+```
+
+The override adds only the exact Tailscale API address alongside loopback. Keep
+PostgreSQL on loopback. `COMPOSE_FILE` lets the existing `backend.service`
+working in the backend directory load both files on its next requested restart.
+Ensure the Tailscale interface/address exists before starting the containers.
+Check the merged mapping with `docker compose config --quiet`; this command does
+not deploy or restart services. For an explicit one-off file selection, use
+`docker compose -f docker-compose.yml -f docker-compose.tailnet.yml config --quiet`.
+Do not deploy until the user has pushed the local changes and requests the pull.
+
+The frontend developer can alternatively keep the API loopback-only and use the
+existing public API through Next's server-side proxy. The existing frontend
+`next.config.ts` supports this local `.env.local` configuration:
+
+```env
+NEXT_PUBLIC_API_URL=
+BACKEND_API_URL=https://api-evo.juliasta.my.id
+```
+
+Restart the local Next dev process after changing these values. Browser calls
+then remain on the local frontend origin and Next forwards them to the API.
+If calling the public API directly from the browser instead, its CORS allowlist
+must explicitly include the local frontend origin; avoid wildcard credentialed
+CORS. Tailscale membership alone does not change browser CORS rules.
+
 API defaults are 1 CPU and 768 MiB memory; worker defaults are 1.5 CPUs and
 1536 MiB. Set `BACKEND_*_LIMIT` and `CHECK_WORKER_*_LIMIT` in `.env` after
 measuring the VM's available capacity and representative documents. A container

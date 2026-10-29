@@ -1,0 +1,7 @@
+# Optional backend-only port publication for frontend developers on Tailscale.
+# Merge with docker-compose.yml; the base loopback mapping remains available
+# to host Cloudflared. PostgreSQL is not published to the tailnet.
+services:
+  backend:
+    ports:
+      - "${BACKEND_TAILNET_IP:?Set BACKEND_TAILNET_IP to this VM's Tailscale IPv4 address}:${BACKEND_PORT:-8000}:8000"
