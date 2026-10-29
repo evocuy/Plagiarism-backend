@@ -33,6 +33,8 @@ class User(Base):
     identifier = Column(String(100), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, index=True)
+    # Retired demo accounts retain document/profile references but cannot log in.
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     # Incremented on login and logout so JWTs minted before the latest session
     # change cannot remain valid server-side.
     session_version = Column(Integer, nullable=False, default=0, server_default=text("0"))
@@ -76,6 +78,15 @@ class User(Base):
         if self.mahasiswa and self.mahasiswa.dosen_pembimbing:
             return self.mahasiswa.dosen_pembimbing.nama_lengkap
         return None
+
+
+class LoginThrottle(Base):
+    """Expiring login counters shared by all API processes and restarts."""
+    __tablename__ = "login_throttles"
+
+    key = Column(String(80), primary_key=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime, nullable=False, index=True)
 
 
 class Dosen(Base):

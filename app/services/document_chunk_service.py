@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from sqlalchemy.orm import Session
 
 from app.models.schemas import Document, DocumentChunk
+from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
 from app.services.pdf_service import PDFService
 from app.services.similarity_service import SimilarityService
 
@@ -15,6 +16,7 @@ class DocumentChunkService:
     ):
         self.pdf_service = pdf_service or PDFService()
         self.similarity_service = similarity_service or SimilarityService()
+        self.limits = PDFProcessingLimits.from_environment()
 
     def get_or_build_sentence_chunks(
         self,
@@ -33,6 +35,8 @@ class DocumentChunkService:
             document.file_path,
             document_type=document.document_type,
         )
+        if len(sentences) > self.limits.max_chunks:
+            raise PDFLimitExceeded("Jumlah potongan teks PDF melebihi batas pemrosesan.")
 
         chunk_records = []
         for item in sentences:
@@ -83,15 +87,19 @@ class DocumentChunkService:
         ]
 
     def _get_existing_chunks(self, document: Document, db: Session) -> List[DocumentChunk]:
-        return (
+        chunks = (
             db.query(DocumentChunk)
             .filter(
                 DocumentChunk.document_id == document.id,
                 DocumentChunk.chunk_type == "sentence",
             )
             .order_by(DocumentChunk.chunk_index.asc())
+            .limit(self.limits.max_chunks + 1)
             .all()
         )
+        if len(chunks) > self.limits.max_chunks:
+            raise PDFLimitExceeded("Jumlah potongan teks tersimpan melebihi batas pemrosesan.")
+        return chunks
 
     def _delete_existing_chunks(self, document: Document, db: Session) -> None:
         (

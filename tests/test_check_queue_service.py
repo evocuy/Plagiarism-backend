@@ -342,3 +342,53 @@ def test_worker_startup_recovers_processing_check_without_waiting_for_timeout():
     assert interrupted.processing_stage == "queued"
     db.close()
     engine.dispose()
+
+
+def test_worker_deadline_marks_failed_and_allows_next_job(monkeypatch):
+    import json
+    import subprocess
+    from app.services import check_queue_worker as worker_module
+
+    factory, engine = _make_session_factory()
+    with factory() as db:
+        user = User(identifier="deadline-student", password="hash", role="mahasiswa")
+        db.add(user)
+        db.flush()
+        first_document = _add_document(db, user, "slow.pdf")
+        second_document = _add_document(db, user, "next.pdf")
+        first = _add_check(db, first_document, user, status="pending", queued_at=utc_now() - timedelta(seconds=1))
+        second = _add_check(db, second_document, user, status="pending", queued_at=utc_now())
+        db.commit()
+        first_id, second_id = first.id, second.id
+
+    invocations = []
+
+    def run_child(command, **kwargs):
+        invocations.append(kwargs)
+        if len(invocations) == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        job = json.loads(command[-1])
+        with factory() as db:
+            record = db.get(PlagiarismCheck, job["check_id"])
+            record.status = "completed"
+            db.commit()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(worker_module.subprocess, "run", run_child)
+    monkeypatch.setenv("CHECK_JOB_TIMEOUT_SECONDS", "30")
+    worker = CheckQueueWorker(session_factory=factory)
+
+    assert worker.process_next() is True
+    with factory() as db:
+        first = db.get(PlagiarismCheck, first_id)
+        assert first.status == "failed"
+        assert first.completed_at is not None
+        assert "batas waktu" in first.error_message
+        assert db.get(PlagiarismCheck, second_id).status == "pending"
+
+    assert worker.process_next() is True
+    with factory() as db:
+        assert db.get(PlagiarismCheck, second_id).status == "completed"
+    assert [invocation["timeout"] for invocation in invocations] == [30, 30]
+    assert worker.process_next() is False
+    engine.dispose()

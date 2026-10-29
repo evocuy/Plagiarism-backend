@@ -8,6 +8,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, B
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.database.session import get_db
 from app.models.schemas import (
@@ -209,7 +210,7 @@ async def _store_uploaded_document(
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="File PDF tidak boleh kosong.")
 
-        structure_validation = document_structure_service.validate_pdf_structure(
+        structure_validation = await document_structure_service.validate_pdf_structure_for_upload(
             file_path,
             clean_type,
         )
@@ -221,8 +222,9 @@ async def _store_uploaded_document(
                 structure_validation["message"],
             )
             raise HTTPException(
-                status_code=422,
+                status_code=429 if structure_validation["error_code"] == "PDF_VALIDATION_BUSY" else 422,
                 detail=structure_validation["message"],
+                headers={"Retry-After": "5"} if structure_validation["error_code"] == "PDF_VALIDATION_BUSY" else None,
             )
 
         db_doc = Document(
@@ -282,14 +284,14 @@ async def upload_document(
         "reason": "disabled_by_request",
     }
     try:
-        document_text_service.get_or_extract_text(db_doc, db)
+        await run_in_threadpool(document_text_service.get_or_extract_text, db_doc, db)
     except Exception as err:
         text_cache_status = "failed"
         text_cache_error = str(err)
         logger.warning(f"Gagal membuat cache teks untuk dokumen {db_doc.id}: {err}")
 
     try:
-        chunks = document_chunk_service.get_or_build_sentence_chunks(db_doc, db)
+        chunks = await run_in_threadpool(document_chunk_service.get_or_build_sentence_chunks, db_doc, db)
         chunk_count = len(chunks)
     except Exception as err:
         chunk_cache_status = "failed"
@@ -298,7 +300,7 @@ async def upload_document(
 
     if auto_index_embeddings:
         try:
-            result = document_embedding_service.ensure_document_embeddings(db_doc, db)
+            result = await run_in_threadpool(document_embedding_service.ensure_document_embeddings, db_doc, db)
             index_result = result.get("index_result") or {}
             embedding_auto_index = {
                 "enabled": True,
@@ -630,6 +632,13 @@ def clear_all_documents(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
+    # A reset is an explicit local-development tool, never an online production
+    # maintenance endpoint even when the caller holds an administrator JWT.
+    if (
+        os.getenv("APP_ENV", "development").strip().lower() != "development"
+        or os.getenv("ENABLE_DESTRUCTIVE_RESET", "false").strip().lower() != "true"
+    ):
+        raise HTTPException(status_code=404, detail="Endpoint tidak tersedia.")
     db.execute(text("TRUNCATE TABLE documents, plagiarism_checks RESTART IDENTITY CASCADE;"))
     db.commit()
 

@@ -4,9 +4,31 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 import pymupdf
 
+from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
+
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / 'uploads'
 
 class PDFService:
+    def __init__(self, limits: Optional[PDFProcessingLimits] = None):
+        self.limits = limits or PDFProcessingLimits.from_environment()
+
+    def _read_page_texts(self, doc: pymupdf.Document) -> List[str]:
+        # Inspect page count before parsing any page, then extract each page
+        # only once. Chapter detection reuses this bounded text cache.
+        if len(doc) > self.limits.max_pages:
+            raise PDFLimitExceeded(f"PDF melebihi batas {self.limits.max_pages} halaman.")
+        if len(doc) == 0:
+            raise ValueError("PDF tidak memuat halaman.")
+        texts = []
+        text_chars = 0
+        for index in range(len(doc)):
+            page_text = doc[index].get_text()
+            text_chars += len(page_text)
+            if text_chars > self.limits.max_text_chars:
+                raise PDFLimitExceeded("Teks PDF melebihi batas pemrosesan dokumen.")
+            texts.append(page_text)
+        return texts
+
     def _resolve_path(self, file_path: str) -> Path:
         p = Path(file_path)
         if p.exists() and p.is_file():
@@ -50,7 +72,7 @@ class PDFService:
                 return True
         return False
 
-    def detect_content_pages(self, doc: pymupdf.Document, document_type: str = "skripsi") -> tuple[int, int]:
+    def detect_content_pages(self, doc: pymupdf.Document, document_type: str = "skripsi", page_texts: Optional[List[str]] = None) -> tuple[int, int]:
         """
         Mendeteksi rentang halaman yang diperiksa:
         - Skripsi: BAB 1 sampai BAB 5 / DAFTAR PUSTAKA.
@@ -60,13 +82,15 @@ class PDFService:
         if total_pages == 0:
             return (0, 0)
 
+        page_texts = page_texts if page_texts is not None else self._read_page_texts(doc)
+
         is_sempro = any(k in (document_type or "").lower() for k in ["sempro", "proposal"])
         start_page = 0
         end_page = total_pages - 1
 
         # Cari halaman BAB 1 yang valid
         for page_idx in range(total_pages):
-            page_text = doc[page_idx].get_text()
+            page_text = page_texts[page_idx]
             if not page_text or not page_text.strip():
                 continue
 
@@ -81,7 +105,7 @@ class PDFService:
         )
 
         for page_idx in range(start_page, total_pages):
-            page_text = doc[page_idx].get_text()
+            page_text = page_texts[page_idx]
             if not page_text:
                 continue
 
@@ -108,13 +132,14 @@ class PDFService:
 
         return (start_page, end_page)
 
-    def detect_chapters_in_doc(self, doc: pymupdf.Document, document_type: str = "skripsi") -> Dict[str, Any]:
+    def detect_chapters_in_doc(self, doc: pymupdf.Document, document_type: str = "skripsi", page_texts: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Mendeteksi BAB apa saja yang ditemukan di dokumen dan memvalidasi kesesuaian jumlah BAB:
         - Skripsi: standar 5 BAB. Berikan warning jika BAB kurang dari 5.
         - Proposal / Sempro: standar 3 BAB. Berikan warning jika BAB kurang dari 3 atau lebih dari 3.
         """
         total = len(doc)
+        page_texts = page_texts if page_texts is not None else self._read_page_texts(doc)
         roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
         chapter_defs = [
             (number, roman, str(number))
@@ -123,7 +148,7 @@ class PDFService:
         found_chapters = []
         for num, roman, arabic in chapter_defs:
             for page_idx in range(total):
-                txt = doc[page_idx].get_text()
+                txt = page_texts[page_idx]
                 if self._is_chapter_heading(txt, roman, arabic):
                     found_chapters.append({
                         "chapter": num,
@@ -207,30 +232,23 @@ class PDFService:
         if not resolved_path.exists():
             raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
 
-        doc = pymupdf.open(str(resolved_path))
-        total_pages = len(doc)
-
-        start_page = 0
-        end_page = max(0, total_pages - 1)
-
-        if filter_bab and total_pages > 1:
-            start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
-
-        chapter_validation = self.detect_chapters_in_doc(doc, document_type=document_type)
-
-        full_text = []
-        pages_data = []
-
-        for page_num in range(start_page, end_page + 1):
-            page = doc[page_num]
-            text = page.get_text()
-            full_text.append(text)
-            pages_data.append({
-                'page': page_num + 1,
-                'text': text
-            })
-
-        doc.close()
+        with pymupdf.open(str(resolved_path)) as doc:
+            total_pages = len(doc)
+            page_texts = self._read_page_texts(doc)
+            start_page = 0
+            end_page = total_pages - 1
+            if filter_bab and total_pages > 1:
+                start_page, end_page = self.detect_content_pages(
+                    doc, document_type=document_type, page_texts=page_texts,
+                )
+            chapter_validation = self.detect_chapters_in_doc(
+                doc, document_type=document_type, page_texts=page_texts,
+            )
+            full_text = page_texts[start_page:end_page + 1]
+            pages_data = [
+                {'page': page_num + 1, 'text': page_texts[page_num]}
+                for page_num in range(start_page, end_page + 1)
+            ]
 
         return {
             'full_text': '\n'.join(full_text),
@@ -245,25 +263,13 @@ class PDFService:
         }
 
     def extract_sentences_with_pages(self, file_path: str, filter_bab: bool = True, document_type: str = "skripsi"):
-        resolved_path = self._resolve_path(file_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
-
-        doc = pymupdf.open(str(resolved_path))
-        total_pages = len(doc)
-        start_page = 0
-        end_page = max(0, total_pages - 1)
-
-        if filter_bab and total_pages > 1:
-            start_page, end_page = self.detect_content_pages(doc, document_type=document_type)
-
-        chapter_validation = self.detect_chapters_in_doc(doc, document_type=document_type)
+        extracted = self.extract_text_from_pdf(file_path, filter_bab=filter_bab, document_type=document_type)
+        chapter_validation = extracted["chapter_validation"]
         detected_chapters = chapter_validation.get("detected_chapters", [])
         sentences_info = []
 
-        for page_idx in range(start_page, end_page + 1):
-            page = doc[page_idx]
-            text = page.get_text()
+        for page in extracted["pages"]:
+            text = page["text"]
             if not text:
                 continue
 
@@ -274,14 +280,15 @@ class PDFService:
             for s in splits:
                 s_clean = s.strip()
                 if len(s_clean.split()) >= 4 and len(s_clean) >= 20:
-                    page_number = page_idx + 1
+                    if len(sentences_info) >= self.limits.max_chunks:
+                        raise PDFLimitExceeded("Jumlah potongan teks PDF melebihi batas pemrosesan.")
+                    page_number = page["page"]
                     sentences_info.append({
                         'page': page_number,
                         'chapter': self._chapter_for_page(page_number, detected_chapters),
                         'sentence': s_clean
                     })
 
-        doc.close()
         return sentences_info
 
     def generate_highlighted_pdf(self, source_pdf_path: str, plagiarized_sentences: list, output_filename: str) -> str:
@@ -296,6 +303,8 @@ class PDFService:
         doc = pymupdf.open(str(resolved_path))
 
         try:
+            if len(doc) > self.limits.max_pages:
+                raise PDFLimitExceeded(f"PDF melebihi batas {self.limits.max_pages} halaman.")
             for item in plagiarized_sentences:
                 sentence = item.get('sentence', '').strip()
                 page_target = item.get('page')

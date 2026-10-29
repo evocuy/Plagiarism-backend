@@ -157,7 +157,7 @@ def test_invalid_upload_is_deleted_before_a_document_row_is_created(monkeypatch)
         def normalize_document_type(document_type):
             return document_type
 
-        def validate_pdf_structure(self, file_path, _document_type):
+        async def validate_pdf_structure_for_upload(self, file_path, _document_type):
             assert Path(file_path).exists()
             self.seen_file_path = Path(file_path)
             return {

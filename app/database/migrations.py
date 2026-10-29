@@ -8,6 +8,7 @@ def ensure_runtime_columns() -> None:
         # Existing databases need this before JWTs with a session version are
         # accepted. The default safely invalidates pre-versioned JWTs.
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(64)"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_message TEXT"))

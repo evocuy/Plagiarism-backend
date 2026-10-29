@@ -6,9 +6,9 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-plagiarism_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the ignored .env file}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgvector_data:/var/lib/postgresql/data
     healthcheck:
@@ -21,36 +21,74 @@ services:
     build: .
     container_name: plagiarism-backend
     restart: always
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-768m}
+    cpus: ${BACKEND_CPU_LIMIT:-1.0}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-128}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=${BACKEND_TMPFS_SIZE:-128m},mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
-      - "8000:8000"
+      - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     env_file:
       - ./.env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-plagiarism_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the ignored .env file}@db:5432/${POSTGRES_DB:-plagiarism_db}
       UPLOAD_DIR: ${UPLOAD_DIR:-uploads}
+      APP_ENV: production
     depends_on:
       db:
         condition: service_healthy
     volumes:
-      - .:/app
+      - ./uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
 
   check-worker:
     build: .
     container_name: plagiarism-check-worker
     restart: always
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CHECK_WORKER_MEMORY_LIMIT:-1536m}
+    cpus: ${CHECK_WORKER_CPU_LIMIT:-1.5}
+    pids_limit: ${CHECK_WORKER_PIDS_LIMIT:-256}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=${CHECK_WORKER_TMPFS_SIZE:-256m},mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: ["python", "-m", "app.workers.check_worker"]
     env_file:
       - ./.env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-plagiarism_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the ignored .env file}@db:5432/${POSTGRES_DB:-plagiarism_db}
       UPLOAD_DIR: ${UPLOAD_DIR:-uploads}
+      APP_ENV: production
     depends_on:
       db:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy
     volumes:
-      - .:/app
+      - ./uploads:/app/uploads
 
 volumes:
   pgvector_data:

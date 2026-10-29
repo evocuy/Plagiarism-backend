@@ -1,17 +1,19 @@
 import os
-from hmac import compare_digest
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, List
 
 import jwt
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Response, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Request, Response, status
 from pydantic import BaseModel, Field, model_validator
 from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
 from app.models.schemas import User, Dosen, Mahasiswa
+from app.services.login_throttle_service import LoginThrottleService
 
 router = APIRouter()
 
@@ -67,6 +69,7 @@ if not SESSION_COOKIE_PATH.startswith("/"):
     raise RuntimeError("SESSION_COOKIE_PATH harus diawali '/'.")
 
 password_hash = PasswordHash.recommended()
+_DUMMY_PASSWORD_HASH = password_hash.hash(secrets.token_urlsafe(32))
 
 
 def _jwt_secret_key() -> str:
@@ -89,6 +92,7 @@ def _jwt_secret_key() -> str:
 def validate_auth_configuration() -> None:
     """Fail at startup if the JWT signing configuration is unsafe."""
     _jwt_secret_key()
+    LoginThrottleService()
 
 
 def _set_no_store(response: Response) -> None:
@@ -298,7 +302,7 @@ def get_current_user(
     user_id, token_session_version = bearer_claims or cookie_claims
 
     user = db.query(User).filter(User.id == user_id).first()
-    if not user:
+    if not user or not user.is_active:
         raise _auth_exception("User tidak ditemukan.")
 
     if user.session_version != token_session_version:
@@ -333,100 +337,48 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 
 
 def seed_initial_users(db: Session) -> None:
-    """Inisialisasi akun bawaan jika database masih kosong"""
-    initial_accounts = [
-        {
-            "identifier": "198804152011011002",
-            "name": "Bambang Wijaya, S.Kom.",
-            "email": "admin.it@univ.ac.id",
-            "password": "password123",
-            "role": "admin",
-            "program_studi": "Biro TI & Sistem Informasi",
-            "fakultas": "Pusat Komputer Kampus",
-        },
-        {
-            "identifier": "cihuy",
-            "name": "Super Admin Cihuy",
-            "email": "cihuy@localhost",
-            "password": "akuraja",
-            "role": "admin",
-            "program_studi": "Biro TI & Sistem Informasi",
-            "fakultas": "Pusat Komputer Kampus",
-        },
-        {
-            "identifier": "0412087501",
-            "name": "Dr. Ir. Hendra Gunawan, M.Kom.",
-            "email": "hendra.gunawan@lecturer.univ.ac.id",
-            "password": "password123",
-            "role": "dosen",
-            "program_studi": "Teknik Informatika",
-            "fakultas": "Fakultas Ilmu Komputer",
-            "gelar": "Dr. Ir.",
-        },
-        {
-            "identifier": "20210801142",
-            "name": "Ahmad Rizky Pratama",
-            "email": "ahmad.rizky@student.univ.ac.id",
-            "password": "password123",
-            "role": "mahasiswa",
-            "program_studi": "Teknik Informatika",
-            "fakultas": "Fakultas Ilmu Komputer",
-            "angkatan": "2021",
-        },
-    ]
+    """Bootstrap only the requested admin, without source-controlled credentials.
 
-    for acc in initial_accounts:
-        existing = db.query(User).filter(User.identifier == acc["identifier"]).first()
-        if not existing:
-            new_user = User(
-                identifier=acc["identifier"],
-                password=password_hash.hash(acc["password"]),
-                role=acc["role"],
-            )
-            db.add(new_user)
-            db.flush()  # dapatkan new_user.id tanpa commit
-
-            if acc["role"] == "dosen":
-                db.add(Dosen(
-                    id=new_user.id,
-                    nama_lengkap=acc["name"],
-                ))
-            elif acc["role"] == "mahasiswa":
-                first_dosen = db.query(Dosen).first()
-                db.add(Mahasiswa(
-                    id=new_user.id,
-                    nama_lengkap=acc["name"],
-                    program_studi=acc.get("program_studi", "Teknik Informatika"),
-                    fakultas=acc.get("fakultas", "Fakultas Ilmu Komputer"),
-                    dosen_pembimbing_id=first_dosen.id if first_dosen else None,
-                ))
+    Existing accounts are left unchanged. An empty deployment can opt in by
+    supplying BOOTSTRAP_ADMIN_PASSWORD; normal restarts never reset a password.
+    """
+    if db.query(User).filter(User.identifier == "cihuy").first():
+        return
+    bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+    if not bootstrap_password:
+        return
+    if len(bootstrap_password) < 12:
+        raise RuntimeError("BOOTSTRAP_ADMIN_PASSWORD harus minimal 12 karakter.")
+    db.add(User(identifier="cihuy", password=password_hash.hash(bootstrap_password), role="admin"))
     db.commit()
 
-
 @router.post("/login", response_model=LoginResponse)
-def login(request: LoginRequest, response: Response, db: Session = Depends(get_db)):
+def login(
+    request: LoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+    http_request: Request = None,
+):
     validate_auth_configuration()
     _set_no_store(response)
-    user = db.query(User).filter(User.identifier == request.identifier).first()
-    if not user:
-        raise _auth_exception("NIM / NIDN / NIP tidak ditemukan.")
+    user = None
 
-    # Existing installations may still contain legacy plaintext credentials.
-    # If one is successfully used, upgrade it atomically with the session
-    # rotation below; new credentials are always Argon2 hashes.
-    valid = False
-    upgrade_legacy_password = False
-    try:
-        valid = password_hash.verify(request.password, user.password)
-    except Exception:
-        valid = compare_digest(request.password, user.password)
-        upgrade_legacy_password = valid
+    def verify_credentials() -> bool:
+        nonlocal user
+        user = db.query(User).filter(User.identifier == request.identifier).first()
+        stored_hash = user.password if user else _DUMMY_PASSWORD_HASH
+        try:
+            valid = password_hash.verify(request.password, stored_hash)
+        except (UnknownHashError, ValueError):
+            # Malformed/legacy plaintext records need an explicit migration or
+            # reset; they must never become an alternate password mechanism.
+            password_hash.verify(request.password, _DUMMY_PASSWORD_HASH)
+            valid = False
+        return bool(user and user.is_active and valid)
 
-    if not valid:
-        raise _auth_exception("Kata sandi yang Anda masukkan salah.")
-
-    if upgrade_legacy_password:
-        user.password = password_hash.hash(request.password)
+    throttle = LoginThrottleService()
+    if not throttle.verify(db, request.identifier, throttle.client_ip(http_request), verify_credentials):
+        raise _auth_exception("Identifier atau kata sandi tidak valid.")
 
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
@@ -461,14 +413,20 @@ def logout(
 @router.get("/users", response_model=List[UserResponse])
 def list_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Admin Only: Ambil seluruh daftar pengguna dengan profil flat tanpa nested null"""
-    users = db.query(User).order_by(User.id.desc()).all()
+    users = db.query(User).filter(User.is_active.is_(True)).order_by(User.id.desc()).all()
     return [_build_user_response(u) for u in users]
 
 
 @router.get("/users/dosen")
 def list_dosen(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Admin Only: Daftar semua dosen (untuk dropdown assign pembimbing)"""
-    dosens = db.query(Dosen).order_by(Dosen.nama_lengkap).all()
+    dosens = (
+        db.query(Dosen)
+        .join(User, Dosen.id == User.id)
+        .filter(User.is_active.is_(True))
+        .order_by(Dosen.nama_lengkap)
+        .all()
+    )
     return [
         {
             "id": d.id,

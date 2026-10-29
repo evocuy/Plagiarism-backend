@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, dashboard, documents, plagiarism, support
 from app.database.session import Base, SessionLocal, engine
 from app.database.migrations import ensure_runtime_columns
+from app.services.request_limit_service import RequestLimitMiddleware
 
 auth.validate_auth_configuration()
 
@@ -22,6 +23,7 @@ with SessionLocal() as db:
     auth.seed_initial_users(db)
 
 app = FastAPI(title="Plagiarism Checker API", version="1.0.0")
+app.add_middleware(RequestLimitMiddleware)
 
 # Baca CORS origins langsung dari .env (pisahkan koma)
 cors_origins_env = os.getenv("CORS_ORIGINS", "") or os.getenv("ALLOWED_ORIGINS", "")

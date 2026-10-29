@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from starlette.concurrency import run_in_threadpool
+
+from app.services.pdf_limits import PDFLimitExceeded, positive_int_setting
 from app.services.pdf_service import PDFService
 
 
@@ -23,6 +31,59 @@ class DocumentStructureService:
 
     def __init__(self, pdf_service: PDFService | None = None):
         self.pdf_service = pdf_service or PDFService()
+        self.validation_timeout = positive_int_setting("PDF_VALIDATION_TIMEOUT_SECONDS", 120)
+        self._validation_slots = threading.BoundedSemaphore(
+            positive_int_setting("PDF_VALIDATION_MAX_CONCURRENT", 2)
+        )
+
+    async def validate_pdf_structure_for_upload(
+        self, file_path: str | Path, document_type: str,
+    ) -> Dict[str, Any]:
+        """Keep untrusted native PDF parsing outside the API event loop.
+
+        A thread waits for a separate Python process. subprocess.run kills and
+        reaps that process on timeout, including a parser stuck in native code.
+        """
+        canonical_type = self.normalize_document_type(document_type)
+        return await run_in_threadpool(
+            self._validate_in_subprocess, str(Path(file_path).resolve()), canonical_type,
+        )
+
+    def _validate_in_subprocess(self, file_path: str, document_type: str) -> Dict[str, Any]:
+        if not self._validation_slots.acquire(blocking=False):
+            return {
+                "is_valid": False,
+                "error_code": "PDF_VALIDATION_BUSY",
+                "message": "Pemrosesan PDF sedang penuh. Silakan coba beberapa saat lagi.",
+            }
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "app.workers.pdf_validation_worker", file_path, document_type],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                timeout=self.validation_timeout,
+                check=True,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                cwd=str(Path(__file__).resolve().parents[2]),
+            )
+            return json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            return {
+                "is_valid": False,
+                "error_code": "PDF_VALIDATION_TIMEOUT",
+                "message": "PDF melewati batas waktu pemrosesan. Coba sederhanakan dokumen.",
+            }
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return {
+                "is_valid": False,
+                "error_code": "PDF_UNREADABLE",
+                "message": "PDF tidak dapat diproses. Unggah file PDF yang valid.",
+            }
+        finally:
+            self._validation_slots.release()
 
     def normalize_document_type(self, document_type: str) -> str:
         normalized = (document_type or "").strip().lower()
@@ -45,6 +106,15 @@ class DocumentStructureService:
                 filter_bab=False,
                 document_type=canonical_type,
             )
+        except PDFLimitExceeded as exc:
+            return {
+                "is_valid": False,
+                "error_code": "PDF_PROCESSING_LIMIT",
+                "message": str(exc),
+                "document_type": canonical_type,
+                "expected_chapters": self._REQUIRED_CHAPTERS[canonical_type],
+                "detected_chapters": [],
+            }
         except Exception:
             return {
                 "is_valid": False,

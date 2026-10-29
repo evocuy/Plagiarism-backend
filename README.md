@@ -1,6 +1,8 @@
 # Plagiarism Checker - Backend Service
 
-Backend REST API untuk sistem deteksi plagiarisme dokumen berbasis FastAPI, PostgreSQL (SQLAlchemy), dan PyMuPDF/NLTK.
+Backend REST API untuk pemeriksaan kemiripan dokumen berbasis FastAPI, PostgreSQL (SQLAlchemy), PyMuPDF, Sastrawi, dan scikit-learn.
+
+Panduan deployment dan batas resource: [deployment/HARDENING.md](deployment/HARDENING.md).
 
 ---
 
@@ -33,9 +35,9 @@ backend/
 
 ## ⚙️ Persyaratan Sistem
 
-- **Python**: Versi 3.10 atau lebih baru
+- **Python**: Versi 3.12 atau lebih baru (sesuai image deployment)
 - **PostgreSQL**: Versi 13+ (bisa dijalankan via Docker)
-- **Virtual Environment** (`venv`)
+- **Virtual Environment** (`.venv`)
 
 ---
 
@@ -50,13 +52,13 @@ cd backend
 ### 2. Buat & Aktifkan Virtual Environment
 - **Windows (PowerShell)**:
   ```powershell
-  python -m venv venv
-  .\venv\Scripts\Activate.ps1
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1
   ```
 - **Linux / macOS**:
   ```bash
-  python3 -m venv venv
-  source venv/bin/activate
+  python3 -m venv .venv
+  source .venv/bin/activate
   ```
 
 ### 3. Install Dependensi
@@ -76,11 +78,13 @@ DATABASE_URL=postgresql://<db_user>:<db_password>@localhost:5432/<db_name>
 UPLOAD_DIR=uploads
 CORS_ORIGINS=http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001
 JWT_SECRET_KEY=ganti_dengan_random_secret_key_anda
-JWT_EXPIRE_MINUTES=1440
+JWT_EXPIRE_MINUTES=60
 ```
 
 > 💡 **Info Database & Migrasi:**
-> Backend **tidak memerlukan Alembic manual**. Tabel database dan akun default akan dibuat otomatis saat aplikasi pertama kali dijalankan melalui perintah `Base.metadata.create_all(bind=engine)` di `app/main.py`.
+> Backend membuat tabel dan memperbarui kolom runtime saat startup. Akun admin
+> `cihuy` hanya dibuat jika belum ada dan `BOOTSTRAP_ADMIN_PASSWORD` diisi dengan
+> password unik minimal 12 karakter. Akun yang sudah ada tidak ditimpa.
 
 ### 5. Jalankan Server API
 Jalankan backend menggunakan `uvicorn`:
@@ -96,7 +100,9 @@ Server akan aktif di:
 
 ## 👥 Akun Bawaan (Default Seed Accounts)
 
-1
+Tidak ada password bawaan dalam kode. Untuk database baru, isi
+`BOOTSTRAP_ADMIN_PASSWORD` di `.env` saat bootstrap admin `cihuy`, lalu kosongkan
+setelah akun berhasil dibuat. Akun mahasiswa dan dosen dibuat oleh admin.
 ---
 
 ## 📌 Ringkasan Endpoint Utama
