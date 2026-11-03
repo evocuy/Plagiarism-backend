@@ -92,7 +92,7 @@ def environment(monkeypatch):
     db = factory()
     db.add_all([
         User(identifier="student", password=auth.password_hash.hash("password123"), role="mahasiswa"),
-        User(identifier="lecturer", password=auth.password_hash.hash("password123"), role="dosen"),
+        User(identifier="admin", password=auth.password_hash.hash("password123"), role="admin"),
     ])
     db.commit()
 
@@ -147,14 +147,14 @@ def test_login_cookie_only_me_logout_and_no_store(environment):
 def test_bearer_and_cookie_from_different_accounts_are_rejected(environment):
     app, _ = environment
     _, student_headers, student_login = login(app, "student")
-    _, lecturer_headers, _ = login(app, "lecturer")
+    _, admin_headers, _ = login(app, "admin")
 
     code, headers, body = request(
         app,
         "GET",
         "/api/auth/me",
         authorization=f"Bearer {student_login['token']}",
-        cookie=token_from_set_cookie(lecturer_headers["set-cookie"]),
+        cookie=token_from_set_cookie(admin_headers["set-cookie"]),
     )
 
     assert code == 401

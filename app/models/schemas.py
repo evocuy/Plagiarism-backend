@@ -13,6 +13,9 @@ def utc_now() -> datetime:
 
 REPOSITORY_STATUS_DRAFT = "draft"
 REPOSITORY_STATUS_PUBLISHED = "published"
+SOURCE_ORIGIN_ALUMNI = "alumni"
+SOURCE_ORIGIN_STUDENT = "student"
+SUPPORTED_USER_ROLES = ("admin", "super_admin", "mahasiswa")
 
 
 # ==========================================
@@ -23,9 +26,9 @@ class User(Base):
     """
     Tabel users (Khusus autentikasi dan role dasar):
     - id (Primary Key)
-    - identifier (String, unique, index) -> NIM mahasiswa atau NIP dosen
+    - identifier (String, unique, index) -> NIM mahasiswa atau identifier admin
     - password (String) -> untuk simpan hashed password
-    - role (String) -> 'mahasiswa' atau 'dosen' (juga mendukung 'admin')
+    - role (String) -> 'mahasiswa' atau 'admin'
     """
     __tablename__ = "users"
 
@@ -40,7 +43,6 @@ class User(Base):
     session_version = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     # Relasi One-to-One ke profil ekstensi (One-to-One Profile Extension)
-    dosen = relationship("Dosen", back_populates="user", uselist=False, cascade="all, delete-orphan")
     mahasiswa = relationship("Mahasiswa", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
     # Relasi dokumen & pengecekan plagiarisme
@@ -50,8 +52,6 @@ class User(Base):
     # Helper properties agar ORM / Pydantic dapat mengakses data flat secara elegan
     @property
     def nama_lengkap(self) -> str:
-        if self.dosen and self.dosen.nama_lengkap:
-            return self.dosen.nama_lengkap
         if self.mahasiswa and self.mahasiswa.nama_lengkap:
             return self.mahasiswa.nama_lengkap
         return self.identifier
@@ -69,17 +69,6 @@ class User(Base):
     def fakultas(self) -> Optional[str]:
         return self.mahasiswa.fakultas if self.mahasiswa else None
 
-    @property
-    def dosen_pembimbing_id(self) -> Optional[int]:
-        return self.mahasiswa.dosen_pembimbing_id if self.mahasiswa else None
-
-    @property
-    def dosen_pembimbing_nama(self) -> Optional[str]:
-        if self.mahasiswa and self.mahasiswa.dosen_pembimbing:
-            return self.mahasiswa.dosen_pembimbing.nama_lengkap
-        return None
-
-
 class LoginThrottle(Base):
     """Expiring login counters shared by all API processes and restarts."""
     __tablename__ = "login_throttles"
@@ -89,24 +78,6 @@ class LoginThrottle(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
 
 
-class Dosen(Base):
-    """
-    Tabel dosen (Profil detail dosen):
-    - id (Primary Key, sekaligus Foreign Key me-referensi ke users.id dengan relasi One-to-One)
-    - nama_lengkap (String)
-    """
-    __tablename__ = "dosen"
-
-    id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    nama_lengkap = Column(String(255), nullable=False)
-
-    # Relasi One-to-One kembali ke User
-    user = relationship("User", back_populates="dosen")
-
-    # Relasi One-to-Many ke Mahasiswa bimbingan
-    mahasiswa_bimbingan = relationship("Mahasiswa", back_populates="dosen_pembimbing")
-
-
 class Mahasiswa(Base):
     """
     Tabel mahasiswa (Profil detail mahasiswa):
@@ -114,7 +85,6 @@ class Mahasiswa(Base):
     - nama_lengkap (String)
     - program_studi (String)
     - fakultas (String)
-    - dosen_pembimbing_id (Foreign Key me-referensi ke dosen.id)
     """
     __tablename__ = "mahasiswa"
 
@@ -122,18 +92,9 @@ class Mahasiswa(Base):
     nama_lengkap = Column(String(255), nullable=False)
     program_studi = Column(String(255), nullable=False)
     fakultas = Column(String(255), nullable=False)
-    dosen_pembimbing_id = Column(Integer, ForeignKey("dosen.id", ondelete="SET NULL"), nullable=True)
 
     # Relasi One-to-One kembali ke User
     user = relationship("User", back_populates="mahasiswa")
-
-    # Relasi Many-to-One ke Dosen Pembimbing
-    dosen_pembimbing = relationship("Dosen", back_populates="mahasiswa_bimbingan")
-
-    @property
-    def dosen_pembimbing_nama(self) -> Optional[str]:
-        return self.dosen_pembimbing.nama_lengkap if self.dosen_pembimbing else None
-
 
 class Document(Base):
     __tablename__ = "documents"
@@ -149,8 +110,12 @@ class Document(Base):
     text_extracted_at = Column(DateTime, nullable=True)
     text_extraction_error = Column(Text, nullable=True)
     deleted_at = Column(DateTime, nullable=True, index=True)
-    # Only published documents are eligible as comparison sources. Student
-    # uploads start as drafts and become published after supervisor approval.
+    # Only admin-imported alumni material can be a comparison source.
+    source_origin = Column(
+        String(20), nullable=False, default=SOURCE_ORIGIN_STUDENT,
+        server_default=text("'student'"), index=True,
+    )
+    # Student uploads always remain drafts and never enter the repository.
     repository_status = Column(
         String(20),
         nullable=False,
@@ -216,9 +181,9 @@ class PlagiarismCheck(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-    approval_status = Column(String, default="belum disetujui")  # 'belum disetujui', 'disetujui', 'revisi'
-    reviewed_at = Column(DateTime, nullable=True)
-    reviewer_note = Column(Text, nullable=True)
+    comparison_status = Column(
+        String(30), nullable=False, default="available", server_default=text("'available'"),
+    )
     highlighted_file_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
@@ -309,16 +274,6 @@ class SupportMessage(Base):
 # Tanpa struktur nested JSON, tanpa data null atau redundan
 # ==========================================
 
-class DosenResponse(BaseModel):
-    """Response khusus Dosen: bersih dari data null/redundant mahasiswa."""
-    id: int
-    identifier: str
-    role: Literal["dosen"] = "dosen"
-    nama_lengkap: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 class MahasiswaResponse(BaseModel):
     """Response khusus Mahasiswa: data spesifik mahasiswa tanpa nested profile null."""
     id: int
@@ -327,8 +282,6 @@ class MahasiswaResponse(BaseModel):
     nama_lengkap: str
     program_studi: str
     fakultas: str
-    dosen_pembimbing_id: Optional[int] = None
-    dosen_pembimbing_nama: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -345,6 +298,6 @@ class AdminResponse(BaseModel):
 
 # Discriminated Union untuk respon dinamis berdasarkan role pengguna
 UserResponseUnion = Annotated[
-    Union[MahasiswaResponse, DosenResponse, AdminResponse],
+    Union[MahasiswaResponse, AdminResponse],
     Field(discriminator="role")
 ]

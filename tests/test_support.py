@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base, get_db
-from app.models.schemas import Dosen, Mahasiswa, SupportMessage, SupportTicket, User
+from app.models.schemas import Mahasiswa, SupportMessage, SupportTicket, User
 from app.routes import support
 from app.routes.auth import create_access_token, get_current_user, require_admin
 from app.services import support_service
@@ -123,8 +123,8 @@ def test_http_create_persists_ticket_and_initial_message_with_utc_times(environm
 def test_http_auth_roles_ownership_and_validation(environment):
     app, _, _, tokens, _ = environment
     assert request(app, "GET", "/api/support/tickets")[0] == 401
-    assert request(app, "GET", "/api/support/tickets", token=tokens["lecturer"])[0] == 403
-    assert create(app, tokens["lecturer"])[0] == 403
+    assert request(app, "GET", "/api/support/tickets", token=tokens["lecturer"])[0] == 401
+    assert create(app, tokens["lecturer"])[0] == 401
     assert create(app, tokens["admin"])[0] == 403
     assert create(app, tokens["student"], subject="   ")[0] == 422
     assert create(app, tokens["student"], message="a" * 4001)[0] == 422
@@ -263,7 +263,7 @@ def test_postgresql_concurrent_requests_cannot_bypass_account_limits(monkeypatch
         schema_created = True
         engine = create_engine(url, connect_args={"options": f"-csearch_path={schema_name}"})
         Base.metadata.create_all(bind=engine, tables=[
-            User.__table__, Dosen.__table__, Mahasiswa.__table__, SupportTicket.__table__, SupportMessage.__table__,
+            User.__table__, Mahasiswa.__table__, SupportTicket.__table__, SupportMessage.__table__,
         ])
         factory = sessionmaker(bind=engine, expire_on_commit=False)
         clock = [datetime(2026, 10, 19, 1, 0, 0)]

@@ -1,8 +1,12 @@
 import asyncio
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from fastapi import HTTPException
 
 from app.routes import documents as document_routes
+from app.database.session import Base
+from app.models.schemas import User
 
 
 def test_filename_allows_normal_document_naming():
@@ -77,3 +81,62 @@ def test_empty_pdf_is_rejected_before_a_document_or_check_can_be_created(monkeyp
 
     assert db.added == []
     assert db.rollback_count == 1
+
+
+def test_only_ownerless_alumni_import_can_be_published(tmp_path, monkeypatch):
+    class Upload:
+        filename = "document.pdf"
+        content_type = "application/pdf"
+
+        def __init__(self):
+            self.content = b"temporary-pdf"
+
+        async def read(self, _size):
+            content, self.content = self.content, b""
+            return content
+
+    class Structure:
+        @staticmethod
+        def normalize_document_type(value):
+            return value
+
+        @staticmethod
+        async def validate_pdf_structure_for_upload(*_args):
+            return {"is_valid": True}
+
+    monkeypatch.setattr(document_routes, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(document_routes, "document_structure_service", Structure())
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as db:
+        student = User(identifier="student", password="unused", role="mahasiswa")
+        db.add(student)
+        db.commit()
+        alumni = asyncio.run(document_routes._store_uploaded_document(
+            file=Upload(), document_type="proposal", user_id=None,
+            source_origin="alumni", repository_status="published", db=db,
+        ))
+        assert alumni.source_origin == "alumni"
+        assert alumni.repository_status == "published"
+        assert alumni.repository_published_at is not None
+        assert alumni.user_id is None
+        owned = asyncio.run(document_routes._store_uploaded_document(
+            file=Upload(), document_type="proposal", user_id=student.id,
+            source_origin="alumni", repository_status="published", db=db,
+        ))
+        assert owned.source_origin == "student"
+        assert owned.repository_status == "draft"
+        assert owned.repository_published_at is None
+    engine.dispose()
+
+
+def test_removed_role_cannot_upload_a_check():
+    retired = User(identifier="retired", password="unused", role="dosen")
+    try:
+        asyncio.run(document_routes.upload_and_check_document(
+            file=None, document_type="proposal", current_user=retired, db=None,
+        ))
+    except HTTPException as error:
+        assert error.status_code == 403
+    else:
+        raise AssertionError("Removed role must be rejected before accepting an upload")

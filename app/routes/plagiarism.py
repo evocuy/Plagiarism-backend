@@ -11,17 +11,15 @@ from app.database.session import get_db
 from app.models.schemas import (
     Document,
     PlagiarismCheck,
-    REPOSITORY_STATUS_DRAFT,
     REPOSITORY_STATUS_PUBLISHED,
     SimilarityResult,
     User,
-    Mahasiswa,
-    utc_now,
 )
 from app.services.pdf_service import PDFService
 from app.services.check_queue_service import CheckQueueService
 from app.services.similarity_result_service import SimilarityResultService
 from app.routes.auth import get_current_user
+from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
 
 router = APIRouter()
 pdf_service = PDFService()
@@ -53,7 +51,7 @@ def check_similarity(
     if not doc_a or not doc_b:
         raise HTTPException(status_code=404, detail="Salah satu atau kedua dokumen tidak ditemukan di database.")
 
-    # Only the document owner, their supervising lecturer, or an administrator
+    # Only the document owner or an administrator
     # may initiate a check that creates a result for this target document.
     if not _can_access_document(doc_a, current_user, db):
         raise HTTPException(
@@ -62,17 +60,17 @@ def check_similarity(
         )
 
     # A manual comparison must use the same corpus policy as the repository
-    # workflow: only supervisor-approved/admin-imported sources of the same
+    # workflow: only admin-managed alumni sources of the same
     # document type may be used, never another revision of the same student.
     if doc_a.id == doc_b.id:
         raise HTTPException(
             status_code=409,
             detail="Dokumen tidak dapat dibandingkan dengan dirinya sendiri.",
         )
-    if doc_b.repository_status != REPOSITORY_STATUS_PUBLISHED:
+    if not is_comparison_source(doc_b):
         raise HTTPException(
             status_code=409,
-            detail="Dokumen referensi belum diterbitkan ke repositori pembanding.",
+            detail="Dokumen referensi harus berasal dari repositori alumni yang dikelola admin.",
         )
     if doc_b.document_type != doc_a.document_type:
         raise HTTPException(
@@ -183,7 +181,6 @@ def get_check_history(
     """
     Mengambil riwayat pengecekan.
     - Mahasiswa: hanya riwayat naskahnya sendiri.
-    - Dosen: riwayat naskah mahasiswa bimbingannya.
     - Admin: seluruh riwayat.
     """
     query = (
@@ -196,23 +193,6 @@ def get_check_history(
         query = query.filter(
             (PlagiarismCheck.user_id == current_user.id) | (Document.user_id == current_user.id)
         )
-    elif current_user.role == "dosen":
-        # A role value alone must not grant repository-wide access.  A broken
-        # lecturer account without its Dosen profile fails closed instead.
-        if not current_user.dosen:
-            raise HTTPException(
-                status_code=403,
-                detail="Profil dosen tidak ditemukan. Hubungi administrator.",
-            )
-        # Hanya tampilkan riwayat mahasiswa bimbingan dosen ini
-        dosen_id = current_user.id
-        bimbingan_user_ids = (
-            db.query(Mahasiswa.id)
-            .filter(Mahasiswa.dosen_pembimbing_id == dosen_id)
-            .all()
-        )
-        bimbingan_user_ids = [uid for (uid,) in bimbingan_user_ids]
-        query = query.filter(Document.user_id.in_(bimbingan_user_ids))
     elif current_user.role not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Akses ditolak.")
 
@@ -234,16 +214,14 @@ def get_check_history(
             # Kept under the legacy key for current clients, but never expose
             # the server-side upload path outside the backend.
             "file_path": doc.title if doc else "",
-            "overall_similarity": check.overall_similarity,
-            "similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
+            "comparison_status": check.comparison_status,
+            "overall_similarity": None if check.comparison_status == "no_comparison_sources" else check.overall_similarity,
+            "similarity_percentage": None if check.comparison_status == "no_comparison_sources" else f"{round(check.overall_similarity * 100, 2)}%",
             "status": check.status,
             "progress": 100 if check.status == "completed" else int(check.progress or 0),
             "processing_stage": check.processing_stage,
             "processing_message": check.processing_message,
             "error_message": check.error_message if check.status == "failed" else None,
-            "approval_status": check.approval_status or "belum disetujui",
-            "reviewed_at": check.reviewed_at.isoformat() if check.reviewed_at else None,
-            "reviewer_note": check.reviewer_note,
             "repository_status": doc.repository_status if doc else None,
             "repository_published_at": (
                 doc.repository_published_at.isoformat()
@@ -251,7 +229,7 @@ def get_check_history(
                 else None
             ),
             "is_repository_published": bool(
-                doc and doc.repository_status == REPOSITORY_STATUS_PUBLISHED
+                doc and is_comparison_source(doc)
             ),
             "highlighted_pdf_available": has_highlighted,
             "highlighted_pdf_url": f"/api/plagiarism/check/{check.id}/download-highlighted" if has_highlighted else None,
@@ -272,12 +250,6 @@ def _can_access_document(document: Document, user: User, db: Session) -> bool:
         return True
     if user.role == "mahasiswa":
         return document.user_id == user.id
-
-    if user.role == "dosen":
-        if not user.dosen or not document.user_id:
-            return False
-        mhs = db.query(Mahasiswa).filter(Mahasiswa.id == document.user_id).first()
-        return bool(mhs and mhs.dosen_pembimbing_id == user.id)
 
     return False
 
@@ -321,9 +293,10 @@ def _serialize_check_progress(check: PlagiarismCheck) -> dict:
         "message": check.processing_message,
         "error": check.error_message if check.status == "failed" else None,
         "is_finished": check.status in {"completed", "failed"},
-        "overall_similarity": check.overall_similarity if is_completed else None,
+        "comparison_status": check.comparison_status,
+        "overall_similarity": check.overall_similarity if is_completed and check.comparison_status != "no_comparison_sources" else None,
         "similarity_percentage": (
-            f"{round(check.overall_similarity * 100, 2)}%" if is_completed else None
+            f"{round(check.overall_similarity * 100, 2)}%" if is_completed and check.comparison_status != "no_comparison_sources" else None
         ),
         "result_url": f"/api/plagiarism/check/{check.id}/matches" if is_completed else None,
         "highlighted_pdf_available": has_highlighted_pdf,
@@ -362,8 +335,7 @@ def _repository_available_count(check: PlagiarismCheck, db: Session) -> int:
 
     query = db.query(Document).filter(
         Document.id != check.document_id,
-        Document.deleted_at.is_(None),
-        Document.repository_status == REPOSITORY_STATUS_PUBLISHED,
+        *comparison_source_filters(),
         Document.document_type == target_document.document_type,
     )
     target_owner_id = target_document.user_id or check.user_id
@@ -464,9 +436,10 @@ def _serialize_check_final_result(
         "message": check.processing_message,
         "error": check.error_message if check.status == "failed" else None,
         "target_document": target_document.title if target_document else "Dokumen tidak ditemukan",
-        "overall_similarity": check.overall_similarity,
-        "highest_similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
-        "similarity_percentage": f"{round(check.overall_similarity * 100, 2)}%",
+        "comparison_status": check.comparison_status,
+        "overall_similarity": None if check.comparison_status == "no_comparison_sources" else check.overall_similarity,
+        "highest_similarity_percentage": None if check.comparison_status == "no_comparison_sources" else f"{round(check.overall_similarity * 100, 2)}%",
+        "similarity_percentage": None if check.comparison_status == "no_comparison_sources" else f"{round(check.overall_similarity * 100, 2)}%",
         "total_repository_checked": len(stored_results),
         "total_repository_available": _repository_available_count(check, db),
         "matches": source_matches,
@@ -592,7 +565,7 @@ def download_highlighted_pdf(
 ):
     """
     Mengunduh / membuka langsung PDF hasil pengecekan yang sudah distabilo kuning.
-    Dapat diakses oleh Mahasiswa pemilik berkas dan Dosen pembimbingnya.
+    Dapat diakses oleh mahasiswa pemilik berkas dan administrator.
     """
     check = _get_active_check(check_id, db)
     if not check:
@@ -624,92 +597,3 @@ def download_highlighted_pdf(
         filename=clean_filename,
         headers={"Content-Disposition": f"inline; filename={clean_filename}"},
     )
-
-class ApprovalUpdateRequest(BaseModel):
-    approval_status: str  # 'disetujui' or 'revisi'
-    reviewer_note: Optional[str] = None
-
-@router.patch("/check/{check_id}/approval")
-def update_approval_status(
-    check_id: int,
-    request: ApprovalUpdateRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Dosen pembimbing mengubah approval_status dari check milik mahasiswa bimbingannya.
-    Nilai yang valid: 'disetujui', 'revisi'
-    """
-    if request.approval_status not in ("disetujui", "revisi"):
-        raise HTTPException(
-            status_code=400,
-            detail="approval_status harus bernilai 'disetujui' atau 'revisi'.",
-        )
-
-    check = _get_active_check(check_id, db)
-    if not check:
-        raise HTTPException(status_code=404, detail="Check record tidak ditemukan.")
-
-    # Pastikan dosen hanya bisa update check milik mahasiswa bimbingannya.
-    if current_user.role == "dosen":
-        if not current_user.dosen or not _can_access_check(check, current_user, db):
-            raise HTTPException(
-                status_code=403,
-                detail="Anda hanya dapat me-review dokumen mahasiswa bimbingan Anda.",
-            )
-    elif current_user.role not in ("admin", "super_admin"):
-        raise HTTPException(status_code=403, detail="Akses ditolak.")
-
-    if check.status != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="Persetujuan hanya dapat diberikan setelah pengecekan selesai.",
-        )
-
-    reviewed_at = utc_now()
-    check.approval_status = request.approval_status
-    check.reviewed_at = reviewed_at
-    check.reviewer_note = request.reviewer_note
-    doc = check.document
-    if doc:
-        if request.approval_status == "disetujui":
-            doc.repository_status = REPOSITORY_STATUS_PUBLISHED
-            doc.repository_published_at = reviewed_at
-        else:
-            doc.repository_status = REPOSITORY_STATUS_DRAFT
-            doc.repository_published_at = None
-    db.commit()
-    db.refresh(check)
-
-    if doc:
-        db.refresh(doc)
-    doc_user = doc.user if doc and doc.user else None
-    repository_message = (
-        "Dokumen disetujui dan diterbitkan ke repositori pembanding."
-        if request.approval_status == "disetujui"
-        else "Dokumen ditandai perlu revisi dan dikeluarkan dari repositori pembanding."
-    )
-
-    return {
-        "id": check.id,
-        "document_id": check.document_id,
-        "title": doc.title if doc else "Dokumen tidak ditemukan",
-        "document_type": doc.document_type if doc else None,
-        "status": check.status,
-        "overall_similarity": check.overall_similarity,
-        "approval_status": check.approval_status,
-        "reviewed_at": check.reviewed_at.isoformat() if check.reviewed_at else None,
-        "reviewer_note": check.reviewer_note,
-        "repository_status": doc.repository_status if doc else None,
-        "repository_published_at": (
-            doc.repository_published_at.isoformat()
-            if doc and doc.repository_published_at
-            else None
-        ),
-        "is_repository_published": bool(
-            doc and doc.repository_status == REPOSITORY_STATUS_PUBLISHED
-        ),
-        "owner_name": doc_user.nama_lengkap if doc_user else "Anonim",
-        "owner_identifier": doc_user.identifier if doc_user else "-",
-        "message": repository_message,
-    }

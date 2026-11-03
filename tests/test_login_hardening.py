@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base
-from app.models.schemas import Dosen, LoginThrottle, User
+from app.models.schemas import LoginThrottle, User
 from app.routes import auth
 from app.services.login_throttle_service import LoginThrottleService, LoginThrottleSettings
 
@@ -162,15 +162,39 @@ def test_bootstrap_never_changes_existing_cihuy_or_other_users(db, monkeypatch):
     assert db.query(User).count() == 2
 
 
-def test_retired_accounts_hidden_without_deleting_profiles(db):
+def test_retired_and_unsupported_accounts_hidden_without_deleting_users(db):
     retired = User(identifier="retired-dosen", password="unused-hash", role="dosen", is_active=False)
-    retired.dosen = Dosen(nama_lengkap="Retired Lecturer")
+    unsupported = User(identifier="legacy-lecturer", password="unused-hash", role="dosen", is_active=True)
     active = User(identifier="cihuy", password="unused-hash", role="admin")
-    db.add_all([retired, active])
+    db.add_all([retired, unsupported, active])
     db.commit()
     assert [user["identifier"] for user in auth.list_users(active, db)] == ["cihuy"]
-    assert auth.list_dosen(active, db) == []
-    assert db.query(Dosen).count() == 1
+    assert db.query(User).count() == 3
+
+
+def test_legacy_lecturer_login_and_existing_jwt_are_rejected_before_migration(db, monkeypatch):
+    monkeypatch.setattr(auth, "JWT_SECRET_KEY", "login-hardening-test-signing-key-at-least-32-characters")
+    legacy = User(identifier="legacy-lecturer", password=auth.password_hash.hash("correct-password"), role="dosen")
+    db.add(legacy)
+    db.commit()
+    token = auth.create_access_token(legacy)
+    with pytest.raises(HTTPException) as login_error:
+        auth.login(auth.LoginRequest(identifier=legacy.identifier, password="correct-password"), Response(), db, make_request())
+    assert login_error.value.status_code == 401
+    assert login_error.value.detail == "Identifier atau kata sandi tidak valid."
+    with pytest.raises(HTTPException) as token_error:
+        auth.get_current_user(authorization=f"Bearer {token}", plagiarism_session=None, db=db)
+    assert token_error.value.status_code == 401
+
+
+def test_lecturer_creation_and_supervisor_endpoint_are_removed():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        auth.CreateUserRequest(identifier="lecturer", name="Old role", password="password123", role="dosen")
+    with pytest.raises(ValidationError):
+        auth.UpdateUserRequest(role="dosen")
+    assert "/users/dosen" not in {route.path for route in auth.router.routes}
+    assert "dosen_pembimbing_id" not in auth.UserResponse.model_fields
 
 
 @pytest.mark.skipif(not os.getenv("LOGIN_TEST_DATABASE_URL"), reason="isolated PostgreSQL test URL not configured")

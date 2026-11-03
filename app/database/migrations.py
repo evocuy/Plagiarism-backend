@@ -3,6 +3,102 @@ from sqlalchemy import text
 from app.database.session import engine
 
 
+def migrate_alumni_repository_workflow(conn) -> None:
+    """Archive retired workflow metadata, then apply the alumni-only corpus.
+
+    The caller owns one PostgreSQL transaction. Any unexpected dependency or
+    failed statement rolls back the archive and schema/data changes together.
+    Account/document/check identities and score history are never deleted.
+    """
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS legacy_workflow_archive (
+            entity_type VARCHAR(40) NOT NULL,
+            entity_id INTEGER NOT NULL,
+            payload JSONB NOT NULL,
+            archived_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_type, entity_id)
+        )
+    """))
+    conn.execute(text("""
+        DO $$ BEGIN
+            IF to_regclass('dosen') IS NOT NULL THEN
+                INSERT INTO legacy_workflow_archive (entity_type, entity_id, payload)
+                SELECT 'lecturer_profile', id, to_jsonb(d) FROM dosen AS d
+                ON CONFLICT DO NOTHING;
+            END IF;
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'mahasiswa'
+                  AND column_name = 'dosen_pembimbing_id'
+            ) THEN
+                INSERT INTO legacy_workflow_archive (entity_type, entity_id, payload)
+                SELECT 'student_supervisor', id,
+                    jsonb_build_object('supervisor_id', dosen_pembimbing_id)
+                FROM mahasiswa WHERE dosen_pembimbing_id IS NOT NULL
+                ON CONFLICT DO NOTHING;
+            END IF;
+        END $$
+    """))
+    # JSON access also works on older databases with only some review columns.
+    conn.execute(text("""
+        INSERT INTO legacy_workflow_archive (entity_type, entity_id, payload)
+        SELECT 'check_review', id, jsonb_build_object(
+            'approval_status', to_jsonb(c)->'approval_status',
+            'reviewed_at', to_jsonb(c)->'reviewed_at',
+            'reviewer_note', to_jsonb(c)->'reviewer_note'
+        )
+        FROM plagiarism_checks AS c
+        WHERE to_jsonb(c) ?| ARRAY['approval_status', 'reviewed_at', 'reviewer_note']
+        ON CONFLICT DO NOTHING
+    """))
+    conn.execute(text("""
+        UPDATE users SET is_active = FALSE,
+            session_version = COALESCE(session_version, 0) + 1
+        WHERE role = 'dosen' AND is_active IS DISTINCT FROM FALSE
+    """))
+    conn.execute(text("ALTER TABLE mahasiswa DROP COLUMN IF EXISTS dosen_pembimbing_id"))
+    # No CASCADE: an unanticipated dependency must fail instead of deleting it.
+    conn.execute(text("DROP TABLE IF EXISTS dosen"))
+    conn.execute(text("ALTER TABLE plagiarism_checks DROP COLUMN IF EXISTS approval_status"))
+    conn.execute(text("ALTER TABLE plagiarism_checks DROP COLUMN IF EXISTS reviewed_at"))
+    conn.execute(text("ALTER TABLE plagiarism_checks DROP COLUMN IF EXISTS reviewer_note"))
+
+    # A nullable add distinguishes legacy rows from future rows. The default
+    # is installed only after classification; restarts never reclassify a new
+    # ownerless student upload as alumni material.
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_origin VARCHAR(20)"))
+    conn.execute(text("""
+        UPDATE documents SET source_origin = CASE
+            WHEN user_id IS NULL THEN 'alumni' ELSE 'student' END
+        WHERE source_origin IS NULL
+    """))
+    conn.execute(text("ALTER TABLE documents ALTER COLUMN source_origin SET DEFAULT 'student'"))
+    conn.execute(text("ALTER TABLE documents ALTER COLUMN source_origin SET NOT NULL"))
+    conn.execute(text("""
+        UPDATE documents SET source_origin = 'student', repository_status = 'draft',
+            repository_published_at = NULL
+        WHERE user_id IS NOT NULL
+          AND (source_origin <> 'student' OR repository_status <> 'draft'
+               OR repository_published_at IS NOT NULL)
+    """))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_source_origin ON documents(source_origin)"))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_documents_alumni_candidates ON documents(document_type)
+        WHERE deleted_at IS NULL AND repository_status = 'published'
+          AND source_origin = 'alumni' AND user_id IS NULL
+    """))
+    conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS comparison_status VARCHAR(30)"))
+    conn.execute(text("""
+        UPDATE plagiarism_checks AS c SET comparison_status = CASE
+            WHEN status = 'completed' AND COALESCE(overall_similarity, 0) = 0 AND NOT EXISTS (
+                SELECT 1 FROM similarity_results AS r WHERE r.check_id = c.id
+            ) THEN 'no_comparison_sources' ELSE 'available' END
+        WHERE comparison_status IS NULL
+    """))
+    conn.execute(text("ALTER TABLE plagiarism_checks ALTER COLUMN comparison_status SET DEFAULT 'available'"))
+    conn.execute(text("ALTER TABLE plagiarism_checks ALTER COLUMN comparison_status SET NOT NULL"))
+
+
 def ensure_runtime_columns() -> None:
     with engine.connect() as conn:
         # Existing databases need this before JWTs with a session version are
@@ -24,13 +120,6 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS started_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"))
-        # These fields predate the runtime migration helper in some deployed
-        # databases.  Keep approval state durable before exposing review APIs.
-        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS approval_status VARCHAR(30) NOT NULL DEFAULT 'belum disetujui'"))
-        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
-        conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS reviewer_note TEXT"))
-        conn.execute(text("UPDATE plagiarism_checks SET approval_status = 'belum disetujui' WHERE approval_status IS NULL"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_approval_status ON plagiarism_checks(approval_status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_queue_status ON plagiarism_checks(status, queued_at, created_at)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_plagiarism_checks_user_queue_status ON plagiarism_checks(user_id, status, created_at)"))
         conn.execute(text("UPDATE plagiarism_checks SET candidate_limit = 20 WHERE candidate_limit IS NULL OR candidate_limit < 1"))
@@ -77,48 +166,6 @@ def ensure_runtime_columns() -> None:
             CREATE INDEX IF NOT EXISTS ix_documents_published_candidates
             ON documents(document_type)
             WHERE deleted_at IS NULL AND repository_status = 'published'
-        """))
-        # Existing ownerless uploads are the legacy admin/imported repository.
-        # Preserve them as comparison sources, while student uploads require an
-        # approval record before joining the corpus.
-        conn.execute(text("""
-            UPDATE documents
-            SET repository_status = 'published',
-                repository_published_at = COALESCE(repository_published_at, created_at, CURRENT_TIMESTAMP)
-            WHERE user_id IS NULL
-        """))
-        # For legacy student documents, use the most recently reviewed
-        # completed check. This avoids publishing a document that was approved
-        # in an older check but later marked for revision.
-        conn.execute(text("""
-            WITH latest_review AS (
-                SELECT DISTINCT ON (document_id)
-                    document_id,
-                    approval_status,
-                    reviewed_at
-                FROM plagiarism_checks
-                WHERE status = 'completed'
-                  AND approval_status IN ('disetujui', 'revisi')
-                ORDER BY document_id, reviewed_at DESC NULLS LAST, id DESC
-            )
-            UPDATE documents AS d
-            SET repository_status = CASE
-                    WHEN latest_review.approval_status = 'disetujui' THEN 'published'
-                    ELSE 'draft'
-                END,
-                repository_published_at = CASE
-                    WHEN latest_review.approval_status = 'disetujui'
-                        THEN COALESCE(
-                            d.repository_published_at,
-                            latest_review.reviewed_at,
-                            d.created_at,
-                            CURRENT_TIMESTAMP
-                        )
-                    ELSE NULL
-                END
-            FROM latest_review
-            WHERE d.id = latest_review.document_id
-              AND d.user_id IS NOT NULL
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS document_chunks (
@@ -202,6 +249,7 @@ def ensure_runtime_columns() -> None:
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_author_created_at ON support_messages(author_id, created_at)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_ticket_created_at ON support_messages(ticket_id, created_at)"))
+        migrate_alumni_repository_workflow(conn)
         conn.commit()
 
     try:

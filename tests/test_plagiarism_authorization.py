@@ -1,11 +1,12 @@
 import inspect
+import pytest
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database.session import Base
-from app.models.schemas import Document, Dosen, Mahasiswa, PlagiarismCheck, User
+from app.models.schemas import Document, Mahasiswa, PlagiarismCheck, User
 from app.routes import plagiarism as plagiarism_routes
 from app.routes.auth import get_current_user
 
@@ -16,7 +17,7 @@ def _make_session():
     return sessionmaker(bind=engine)()
 
 
-def _add_student(db, identifier, *, dosen_pembimbing_id=None):
+def _add_student(db, identifier):
     student = User(identifier=identifier, password="secret", role="mahasiswa")
     db.add(student)
     db.flush()
@@ -26,7 +27,6 @@ def _add_student(db, identifier, *, dosen_pembimbing_id=None):
             nama_lengkap=identifier,
             program_studi="Informatika",
             fakultas="Teknik",
-            dosen_pembimbing_id=dosen_pembimbing_id,
         )
     )
     return student
@@ -37,7 +37,6 @@ def _add_document_and_check(
     owner,
     *,
     status="completed",
-    approval_status="belum disetujui",
     repository_status="draft",
     file_path=None,
 ):
@@ -56,7 +55,6 @@ def _add_document_and_check(
         overall_similarity=0.42,
         status=status,
         progress=100 if status == "completed" else 50,
-        approval_status=approval_status,
     )
     db.add(check)
     db.flush()
@@ -79,7 +77,7 @@ def test_sensitive_plagiarism_routes_use_required_authentication():
         assert dependency.dependency is get_current_user
 
 
-def test_history_fails_closed_for_dosen_without_profile():
+def test_history_rejects_the_retired_lecturer_role():
     db = _make_session()
     incomplete_dosen = User(identifier="dosen-tanpa-profil", password="secret", role="dosen")
     owner = _add_student(db, "mahasiswa")
@@ -93,25 +91,9 @@ def test_history_fails_closed_for_dosen_without_profile():
     except HTTPException as exc:
         assert exc.status_code == 403
     else:
-        raise AssertionError("Expected a lecturer without a profile to be denied")
+        raise AssertionError("Expected the retired lecturer role to be denied")
 
 
-def test_history_for_dosen_contains_only_supervised_students():
-    db = _make_session()
-    dosen = User(identifier="dosen", password="secret", role="dosen")
-    db.add(dosen)
-    db.flush()
-    db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
-    supervised = _add_student(db, "mahasiswa-bimbingan", dosen_pembimbing_id=dosen.id)
-    other = _add_student(db, "mahasiswa-lain")
-    db.flush()
-    supervised_document, _ = _add_document_and_check(db, supervised)
-    _add_document_and_check(db, other)
-    db.commit()
-
-    history = plagiarism_routes.get_check_history(current_user=dosen, db=db)
-
-    assert [item["document_id"] for item in history] == [supervised_document.id]
 
 
 def test_history_never_returns_the_server_side_file_path():
@@ -168,103 +150,10 @@ def test_repository_check_rejects_an_unrelated_target_owner():
         raise AssertionError("Expected an unrelated student to be denied")
 
 
-def test_approval_rejects_an_unfinished_check_and_preserves_state():
-    db = _make_session()
-    dosen = User(identifier="dosen", password="secret", role="dosen")
-    db.add(dosen)
-    db.flush()
-    db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
-    student = _add_student(db, "mahasiswa", dosen_pembimbing_id=dosen.id)
-    db.flush()
-    document, check = _add_document_and_check(db, student, status="processing")
-    db.commit()
-
-    try:
-        plagiarism_routes.update_approval_status(
-            check.id,
-            plagiarism_routes.ApprovalUpdateRequest(approval_status="disetujui"),
-            current_user=dosen,
-            db=db,
-        )
-    except HTTPException as exc:
-        assert exc.status_code == 409
-    else:
-        raise AssertionError("Expected unfinished checks to reject approval")
-
-    db.refresh(check)
-    db.refresh(document)
-    assert check.approval_status == "belum disetujui"
-    assert check.reviewed_at is None
-    assert document.repository_status == "draft"
 
 
-def test_completed_approval_returns_the_document_contract():
-    db = _make_session()
-    dosen = User(identifier="dosen", password="secret", role="dosen")
-    db.add(dosen)
-    db.flush()
-    db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
-    student = _add_student(db, "mahasiswa", dosen_pembimbing_id=dosen.id)
-    db.flush()
-    document, check = _add_document_and_check(db, student)
-    db.commit()
-
-    payload = plagiarism_routes.update_approval_status(
-        check.id,
-        plagiarism_routes.ApprovalUpdateRequest(
-            approval_status="disetujui",
-            reviewer_note="Sudah sesuai.",
-        ),
-        current_user=dosen,
-        db=db,
-    )
-
-    assert payload["id"] == check.id
-    assert payload["document_id"] == document.id
-    assert payload["title"] == document.title
-    assert payload["document_type"] == document.document_type
-    assert payload["status"] == "completed"
-    assert payload["overall_similarity"] == 0.42
-    assert payload["approval_status"] == "disetujui"
-    assert payload["owner_name"] == "mahasiswa"
-    assert payload["owner_identifier"] == "mahasiswa"
-    assert payload["reviewed_at"] is not None
-    assert payload["repository_status"] == "published"
-    assert payload["repository_published_at"] is not None
-    assert payload["is_repository_published"] is True
-    db.refresh(document)
-    assert document.repository_status == "published"
-    assert document.repository_published_at is not None
 
 
-def test_revisi_withdraws_document_from_repository():
-    db = _make_session()
-    dosen = User(identifier="dosen", password="secret", role="dosen")
-    db.add(dosen)
-    db.flush()
-    db.add(Dosen(id=dosen.id, nama_lengkap="Dosen Pembimbing"))
-    student = _add_student(db, "mahasiswa", dosen_pembimbing_id=dosen.id)
-    db.flush()
-    document, check = _add_document_and_check(
-        db,
-        student,
-        repository_status="published",
-    )
-    db.commit()
-
-    payload = plagiarism_routes.update_approval_status(
-        check.id,
-        plagiarism_routes.ApprovalUpdateRequest(approval_status="revisi"),
-        current_user=dosen,
-        db=db,
-    )
-
-    db.refresh(document)
-    assert document.repository_status == "draft"
-    assert document.repository_published_at is None
-    assert payload["repository_status"] == "draft"
-    assert payload["repository_published_at"] is None
-    assert payload["is_repository_published"] is False
 
 
 def test_manual_check_rejects_draft_wrong_type_and_same_owner_sources():
@@ -287,7 +176,7 @@ def test_manual_check_rejects_draft_wrong_type_and_same_owner_sources():
         repository_status="draft",
     )
     wrong_type_source = Document(
-        user_id=other_owner.id,
+        source_origin="alumni",
         title="proposal-source.pdf",
         document_type="proposal",
         file_path="proposal-source.pdf",
@@ -304,9 +193,9 @@ def test_manual_check_rejects_draft_wrong_type_and_same_owner_sources():
     db.commit()
 
     cases = [
-        (draft_source, "belum diterbitkan"),
+        (draft_source, "repositori alumni"),
         (wrong_type_source, "jenis dokumen yang sama"),
-        (same_owner_source, "mahasiswa yang sama"),
+        (same_owner_source, "repositori alumni"),
     ]
     for source, expected_detail in cases:
         try:
@@ -338,7 +227,7 @@ def test_manual_check_is_enqueued_instead_of_running_inside_api_request():
         repository_status="draft",
     )
     source = Document(
-        user_id=other_owner.id,
+        source_origin="alumni",
         title="source.pdf",
         document_type="skripsi",
         file_path="source.pdf",
@@ -362,4 +251,29 @@ def test_manual_check_is_enqueued_instead_of_running_inside_api_request():
     assert payload["queue_position"] == 1
     assert check.reference_document_id == source.id
     assert check.status == "pending"
+
+
+@pytest.mark.parametrize("student_owned,source_origin", [(True, "alumni"), (False, "student")])
+def test_manual_check_rejects_published_documents_without_trusted_alumni_origin(student_owned, source_origin):
+    db = _make_session()
+    owner = _add_student(db, "owner")
+    other = _add_student(db, "other")
+    db.flush()
+    target = Document(user_id=owner.id, title="target.pdf", file_path="target.pdf", document_type="proposal")
+    source = Document(user_id=other.id if student_owned else None, title="source.pdf",
+                      file_path="source.pdf", document_type="proposal",
+                      repository_status="published", source_origin=source_origin)
+    db.add_all([target, source])
+    db.commit()
+    with pytest.raises(HTTPException) as error:
+        plagiarism_routes.check_similarity(
+            plagiarism_routes.SingleCheckRequest(document_id=target.id, reference_document_id=source.id),
+            current_user=owner, db=db,
+        )
+    assert error.value.status_code == 409
+    assert db.query(PlagiarismCheck).count() == 0
+
+
+def test_removed_approval_route_is_not_registered():
+    assert not any("approval" in route.path for route in plagiarism_routes.router.routes)
 

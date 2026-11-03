@@ -1,134 +1,78 @@
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database.session import Base
-from app.models.schemas import Document, Dosen, Mahasiswa, PlagiarismCheck, User
+from app.models.schemas import Document, Mahasiswa, PlagiarismCheck, User
 from app.routes.dashboard import get_dashboard_summary
 
 
 def _make_session():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
-    session_local = sessionmaker(bind=engine)
-    return session_local()
+    return sessionmaker(bind=engine)()
 
 
 def _seed_dashboard_data(db):
     admin = User(identifier="admin", password="secret", role="admin")
-    dosen_user = User(identifier="dosen", password="secret", role="dosen")
-    mahasiswa_bimbingan = User(identifier="mhs-bimbingan", password="secret", role="mahasiswa")
-    mahasiswa_lain = User(identifier="mhs-lain", password="secret", role="mahasiswa")
-    db.add_all([admin, dosen_user, mahasiswa_bimbingan, mahasiswa_lain])
+    student = User(identifier="student", password="secret", role="mahasiswa")
+    other = User(identifier="other", password="secret", role="mahasiswa")
+    db.add_all([admin, student, other])
     db.flush()
-
-    db.add(Dosen(id=dosen_user.id, nama_lengkap="Dosen Pembimbing"))
+    db.add(Mahasiswa(id=student.id, nama_lengkap="Mahasiswa", program_studi="Informatika", fakultas="Teknik"))
+    own = Document(user_id=student.id, title="Own.pdf", document_type="proposal", file_path="own.pdf")
+    elsewhere = Document(user_id=other.id, title="Other.pdf", document_type="skripsi", file_path="other.pdf")
+    db.add_all([own, elsewhere])
+    db.flush()
     db.add_all([
-        Mahasiswa(
-            id=mahasiswa_bimbingan.id,
-            nama_lengkap="Mahasiswa Bimbingan",
-            program_studi="Informatika",
-            fakultas="Teknik",
-            dosen_pembimbing_id=dosen_user.id,
-        ),
-        Mahasiswa(
-            id=mahasiswa_lain.id,
-            nama_lengkap="Mahasiswa Lain",
-            program_studi="Informatika",
-            fakultas="Teknik",
-        ),
-    ])
-    db.flush()
-
-    document_bimbingan = Document(
-        user_id=mahasiswa_bimbingan.id,
-        title="Bimbingan.pdf",
-        document_type="proposal",
-        file_path="bimbingan.pdf",
-    )
-    document_lain = Document(
-        user_id=mahasiswa_lain.id,
-        title="Lain.pdf",
-        document_type="skripsi",
-        file_path="lain.pdf",
-    )
-    db.add_all([document_bimbingan, document_lain])
-    db.flush()
-
-    db.add_all([
-        PlagiarismCheck(
-            document_id=document_bimbingan.id,
-            user_id=mahasiswa_bimbingan.id,
-            overall_similarity=0.31,
-            approval_status="revisi",
-            status="completed",
-        ),
-        PlagiarismCheck(
-            document_id=document_bimbingan.id,
-            user_id=mahasiswa_bimbingan.id,
-            overall_similarity=0.18,
-            approval_status="disetujui",
-            status="completed",
-        ),
-        PlagiarismCheck(
-            document_id=document_lain.id,
-            user_id=mahasiswa_lain.id,
-            overall_similarity=0.42,
-            approval_status="belum disetujui",
-            status="completed",
-        ),
-        PlagiarismCheck(
-            document_id=document_bimbingan.id,
-            user_id=mahasiswa_bimbingan.id,
-            overall_similarity=0.0,
-            approval_status="belum disetujui",
-            status="processing",
-            progress=55,
-            processing_stage="comparing_documents",
-        ),
+        PlagiarismCheck(document_id=own.id, user_id=student.id, overall_similarity=.31, status="completed"),
+        PlagiarismCheck(document_id=own.id, user_id=student.id, overall_similarity=.18, status="completed"),
+        PlagiarismCheck(document_id=elsewhere.id, user_id=other.id, overall_similarity=.42, status="completed"),
+        PlagiarismCheck(document_id=own.id, user_id=student.id, overall_similarity=0, status="processing", progress=55),
     ])
     db.commit()
-    return admin, dosen_user, mahasiswa_bimbingan
+    return admin, student
 
 
-def test_dashboard_summary_scopes_counts_by_role():
+def test_dashboard_summary_scopes_counts_by_role_without_review_fields():
     db = _make_session()
-    admin, dosen_user, mahasiswa = _seed_dashboard_data(db)
-
-    mahasiswa_summary = get_dashboard_summary(current_user=mahasiswa, db=db)
-    dosen_summary = get_dashboard_summary(current_user=dosen_user, db=db)
+    admin, student = _seed_dashboard_data(db)
+    student_summary = get_dashboard_summary(current_user=student, db=db)
     admin_summary = get_dashboard_summary(current_user=admin, db=db)
-
-    assert mahasiswa_summary["document_count"] == 1
-    assert mahasiswa_summary["total_check_count"] == 2
-    assert mahasiswa_summary["latest_check_count"] == 1
-    assert mahasiswa_summary["approved_count"] == 1
-    assert mahasiswa_summary["average_similarity"] == 0.18
-    assert mahasiswa_summary["processing_check_count"] == 1
-
-    assert dosen_summary["supervised_student_count"] == 1
-    assert dosen_summary["document_count"] == 1
-    assert dosen_summary["total_check_count"] == 2
-    assert dosen_summary["approved_count"] == 1
-
+    assert student_summary["document_count"] == 1
+    assert student_summary["total_check_count"] == 2
+    assert student_summary["latest_check_count"] == 1
+    assert student_summary["average_similarity"] == .18
+    assert student_summary["processing_check_count"] == 1
     assert admin_summary["document_count"] == 2
     assert admin_summary["total_check_count"] == 3
     assert admin_summary["latest_check_count"] == 2
-    assert admin_summary["approved_count"] == 1
-    assert admin_summary["pending_review_count"] == 1
+    assert admin_summary["average_similarity"] == .3
     assert admin_summary["processing_check_count"] == 1
+    assert not {"approved_count", "pending_review_count", "revision_count", "supervised_student_count"} & admin_summary.keys()
+    assert "approval_status" not in admin_summary["latest_check"]
 
 
-def test_dashboard_rejects_dosen_without_profile_instead_of_using_global_scope():
+@pytest.mark.parametrize("role", ["dosen", "unsupported"])
+def test_dashboard_rejects_retired_and_unsupported_roles(role):
     db = _make_session()
-    incomplete_dosen = User(identifier="dosen-tanpa-profil", password="secret", role="dosen")
-    db.add(incomplete_dosen)
-    db.commit()
+    removed_user = User(identifier="old-user", password="secret", role=role)
+    with pytest.raises(HTTPException) as error:
+        get_dashboard_summary(current_user=removed_user, db=db)
+    assert error.value.status_code == 403
 
-    try:
-        get_dashboard_summary(current_user=incomplete_dosen, db=db)
-    except HTTPException as exc:
-        assert exc.status_code == 403
-        assert "Profil dosen" in exc.detail
-    else:
-        raise AssertionError("Expected a dosen account without profile to be denied")
+
+def test_empty_corpus_check_does_not_become_zero_percent_similarity():
+    db = _make_session()
+    admin, student = _seed_dashboard_data(db)
+    own = db.query(Document).filter(Document.user_id == student.id).one()
+    db.add(PlagiarismCheck(document_id=own.id, user_id=student.id, overall_similarity=0,
+                          status="completed", comparison_status="no_comparison_sources"))
+    db.commit()
+    student_summary = get_dashboard_summary(current_user=student, db=db)
+    assert student_summary["average_similarity"] is None
+    assert student_summary["latest_check"]["overall_similarity"] is None
+    assert student_summary["latest_check"]["comparison_status"] == "no_comparison_sources"
+    # Unavailable latest result does not dilute other students' mean.
+    assert get_dashboard_summary(current_user=admin, db=db)["average_similarity"] == .42

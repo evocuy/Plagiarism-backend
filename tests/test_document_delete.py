@@ -9,10 +9,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base
 from app.models.schemas import (
-    Dosen,
     Document,
     DocumentChunk,
-    Mahasiswa,
     PlagiarismCheck,
     SimilarityMatch,
     SimilarityResult,
@@ -169,6 +167,7 @@ def test_repository_only_document_list_returns_only_active_published_documents()
         document_type="skripsi",
         file_path="published.pdf",
         repository_status="published",
+        source_origin="alumni",
     )
     draft = Document(
         title="draft.pdf",
@@ -181,6 +180,7 @@ def test_repository_only_document_list_returns_only_active_published_documents()
         document_type="skripsi",
         file_path="deleted-published.pdf",
         repository_status="published",
+        source_origin="alumni",
     )
     db.add_all([published, draft, deleted_published])
     db.commit()
@@ -302,47 +302,24 @@ def test_document_read_and_maintenance_routes_require_authenticated_scoped_users
         assert dependency.dependency is require_admin
 
 
-def test_visible_documents_are_scoped_and_role_profile_mismatch_is_empty():
+def test_visible_documents_are_scoped_and_retired_roles_are_empty():
     db = _make_session()
     admin = User(identifier="admin", password="secret", role="admin")
-    dosen = User(identifier="dosen", password="secret", role="dosen")
-    dosen_without_profile = User(identifier="dosen-no-profile", password="secret", role="dosen")
-    guided_student = User(identifier="guided", password="secret", role="mahasiswa")
+    retired = User(identifier="retired", password="secret", role="dosen")
+    student = User(identifier="student", password="secret", role="mahasiswa")
     other_student = User(identifier="other", password="secret", role="mahasiswa")
-    db.add_all([admin, dosen, dosen_without_profile, guided_student, other_student])
+    db.add_all([admin, retired, student, other_student])
     db.flush()
-    db.add_all(
-        [
-            Dosen(id=dosen.id, nama_lengkap="Dosen Penguji"),
-            Mahasiswa(
-                id=guided_student.id,
-                nama_lengkap="Mahasiswa Bimbingan",
-                program_studi="Informatika",
-                fakultas="Komputer",
-                dosen_pembimbing_id=dosen.id,
-            ),
-            Mahasiswa(
-                id=other_student.id,
-                nama_lengkap="Mahasiswa Lain",
-                program_studi="Informatika",
-                fakultas="Komputer",
-            ),
-        ]
-    )
-    db.add_all(
-        [
-            Document(title="guided.pdf", document_type="skripsi", file_path="guided.pdf", user_id=guided_student.id),
-            Document(title="other.pdf", document_type="skripsi", file_path="other.pdf", user_id=other_student.id),
-            Document(title="repository.pdf", document_type="skripsi", file_path="repository.pdf"),
-        ]
-    )
+    db.add_all([
+        Document(title="own.pdf", document_type="skripsi", file_path="own.pdf", user_id=student.id),
+        Document(title="other.pdf", document_type="skripsi", file_path="other.pdf", user_id=other_student.id),
+        Document(title="repository.pdf", document_type="skripsi", file_path="repository.pdf"),
+    ])
     db.commit()
 
-    by_title = lambda user: {
-        document.title for document in document_routes._visible_documents_query(user, db).all()
-    }
+    def by_title(user):
+        return {document.title for document in document_routes._visible_documents_query(user, db).all()}
 
-    assert by_title(admin) == {"guided.pdf", "other.pdf", "repository.pdf"}
-    assert by_title(guided_student) == {"guided.pdf"}
-    assert by_title(dosen) == {"guided.pdf"}
-    assert by_title(dosen_without_profile) == set()
+    assert by_title(admin) == {"own.pdf", "other.pdf", "repository.pdf"}
+    assert by_title(student) == {"own.pdf"}
+    assert by_title(retired) == set()

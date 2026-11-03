@@ -26,6 +26,7 @@ from app.services.pdf_service import PDFService
 from app.services.repository_candidate_service import RepositoryCandidateService
 from app.services.similarity_result_service import SimilarityResultService
 from app.services.similarity_service import SimilarityService
+from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
 
 
 ProgressReporter = Callable[[int, str, str], None]
@@ -136,8 +137,7 @@ class RepositoryCheckService:
 
             repo_query = db.query(Document).filter(
                 Document.id != document_id,
-                Document.deleted_at.is_(None),
-                Document.repository_status == REPOSITORY_STATUS_PUBLISHED,
+                *comparison_source_filters(),
                 Document.document_type == target_doc.document_type,
             )
             if target_owner_id is not None:
@@ -197,6 +197,7 @@ class RepositoryCheckService:
             )
 
             if not repo_docs:
+                check_record.comparison_status = "no_comparison_sources"
                 check_record.overall_similarity = 0.0
                 self._set_progress(
                     check_record,
@@ -228,7 +229,8 @@ class RepositoryCheckService:
                 return {
                     "check_id": check_record.id,
                     "target_document": target_doc.title,
-                    "highest_similarity_percentage": "0.0%",
+                    "highest_similarity_percentage": None,
+                    "comparison_status": "no_comparison_sources",
                     "total_repository_checked": 0,
                     "total_repository_available": 0,
                     "total_repository_chunks": 0,
@@ -300,6 +302,8 @@ class RepositoryCheckService:
                         repo_err,
                     )
 
+            if not results:
+                raise RuntimeError("Tidak ada sumber yang berhasil dibandingkan.")
             results.sort(key=lambda item: item["similarity_score"], reverse=True)
             check_record.overall_similarity = max_score
             db.add(check_record)
@@ -475,10 +479,10 @@ class RepositoryCheckService:
                     status_code=409,
                     detail="Dokumen tidak dapat dibandingkan dengan dirinya sendiri.",
                 )
-            if reference_doc.repository_status != REPOSITORY_STATUS_PUBLISHED:
+            if not is_comparison_source(reference_doc):
                 raise HTTPException(
                     status_code=409,
-                    detail="Dokumen referensi belum diterbitkan ke repositori pembanding.",
+                    detail="Dokumen referensi harus berasal dari repositori alumni yang dikelola admin.",
                 )
             if reference_doc.document_type != target_doc.document_type:
                 raise HTTPException(
@@ -639,6 +643,7 @@ class RepositoryCheckService:
             db.add(check_record)
 
         check_record.status = "processing"
+        check_record.comparison_status = "available"
         check_record.progress = 0
         check_record.processing_stage = "queued"
         check_record.processing_message = "Pengecekan sedang menunggu untuk diproses."
@@ -685,7 +690,11 @@ class RepositoryCheckService:
         check_record.status = "completed"
         check_record.progress = 100
         check_record.processing_stage = "completed"
-        check_record.processing_message = "Pengecekan kemiripan selesai."
+        check_record.processing_message = (
+            "Belum ada dokumen alumni pembanding untuk jenis dokumen ini. Kemiripan belum dapat ditentukan."
+            if check_record.comparison_status == "no_comparison_sources"
+            else "Pengecekan kemiripan selesai."
+        )
         check_record.error_message = None
         check_record.completed_at = utc_now()
         check_record.updated_at = utc_now()

@@ -12,7 +12,7 @@ from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
-from app.models.schemas import User, Dosen, Mahasiswa
+from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
 
 router = APIRouter()
@@ -143,9 +143,9 @@ class LoginRequest(BaseModel):
 class UserResponse(BaseModel):
     """
     Response model flat:
-    - Tidak ada nested JSON (dosen_profile / mahasiswa_profile dihapus)
+    - Tidak ada nested JSON profil pada respons
     - Tidak ada data redundan
-    - Field prodi, fakultas, pembimbing hanya terisi bila role mahasiswa
+    - Field prodi dan fakultas hanya terisi bila role mahasiswa
     """
     id: int
     identifier: str
@@ -154,8 +154,6 @@ class UserResponse(BaseModel):
     name: Optional[str] = None
     program_studi: Optional[str] = None
     fakultas: Optional[str] = None
-    dosen_pembimbing_id: Optional[int] = None
-    dosen_pembimbing_nama: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -172,8 +170,6 @@ def _build_user_response(user: User) -> dict:
     if user.role == "mahasiswa" and user.mahasiswa:
         res["program_studi"] = user.mahasiswa.program_studi
         res["fakultas"] = user.mahasiswa.fakultas
-        res["dosen_pembimbing_id"] = user.mahasiswa.dosen_pembimbing_id
-        res["dosen_pembimbing_nama"] = user.mahasiswa.dosen_pembimbing_nama
     return res
 
 class LoginResponse(BaseModel):
@@ -185,10 +181,9 @@ class CreateUserRequest(BaseModel):
     nama_lengkap: Optional[str] = None
     name: Optional[str] = None
     password: str = Field(min_length=6, max_length=256)
-    role: Literal["mahasiswa", "dosen", "admin"]
+    role: Literal["mahasiswa", "admin"]
     program_studi: Optional[str] = None
     fakultas: Optional[str] = None
-    dosen_pembimbing_id: Optional[int] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -204,10 +199,9 @@ class UpdateUserRequest(BaseModel):
     nama_lengkap: Optional[str] = None
     name: Optional[str] = None
     password: Optional[str] = None
-    role: Optional[Literal["mahasiswa", "dosen", "admin"]] = None
+    role: Optional[Literal["mahasiswa", "admin"]] = None
     program_studi: Optional[str] = None
     fakultas: Optional[str] = None
-    dosen_pembimbing_id: Optional[int] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -302,7 +296,7 @@ def get_current_user(
     user_id, token_session_version = bearer_claims or cookie_claims
 
     user = db.query(User).filter(User.id == user_id).first()
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.role not in SUPPORTED_USER_ROLES:
         raise _auth_exception("User tidak ditemukan.")
 
     if user.session_version != token_session_version:
@@ -374,7 +368,7 @@ def login(
             # reset; they must never become an alternate password mechanism.
             password_hash.verify(request.password, _DUMMY_PASSWORD_HASH)
             valid = False
-        return bool(user and user.is_active and valid)
+        return bool(user and user.is_active and user.role in SUPPORTED_USER_ROLES and valid)
 
     throttle = LoginThrottleService()
     if not throttle.verify(db, request.identifier, throttle.client_ip(http_request), verify_credentials):
@@ -413,29 +407,10 @@ def logout(
 @router.get("/users", response_model=List[UserResponse])
 def list_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Admin Only: Ambil seluruh daftar pengguna dengan profil flat tanpa nested null"""
-    users = db.query(User).filter(User.is_active.is_(True)).order_by(User.id.desc()).all()
+    users = db.query(User).filter(
+        User.is_active.is_(True), User.role.in_(SUPPORTED_USER_ROLES)
+    ).order_by(User.id.desc()).all()
     return [_build_user_response(u) for u in users]
-
-
-@router.get("/users/dosen")
-def list_dosen(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    """Admin Only: Daftar semua dosen (untuk dropdown assign pembimbing)"""
-    dosens = (
-        db.query(Dosen)
-        .join(User, Dosen.id == User.id)
-        .filter(User.is_active.is_(True))
-        .order_by(Dosen.nama_lengkap)
-        .all()
-    )
-    return [
-        {
-            "id": d.id,
-            "user_id": d.id,
-            "nidn": d.user.identifier if d.user else "",
-            "nama_lengkap": d.nama_lengkap,
-        }
-        for d in dosens
-    ]
 
 
 @router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -444,7 +419,7 @@ def create_user(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Admin Only: Buat akun pengguna baru (Mahasiswa, Dosen, atau Admin)"""
+    """Admin Only: Buat akun mahasiswa atau admin."""
     if db.query(User).filter(User.identifier == request.identifier).first():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -460,18 +435,12 @@ def create_user(
     db.flush()  # dapatkan new_user.id
 
     # Buat profil ekstensi One-to-One spesifik sesuai role
-    if request.role == "dosen":
-        db.add(Dosen(
-            id=new_user.id,
-            nama_lengkap=request.name,
-        ))
-    elif request.role == "mahasiswa":
+    if request.role == "mahasiswa":
         db.add(Mahasiswa(
             id=new_user.id,
             nama_lengkap=request.name,
             program_studi=request.program_studi or "Teknik Informatika",
             fakultas=request.fakultas or "Fakultas Ilmu Komputer",
-            dosen_pembimbing_id=request.dosen_pembimbing_id,
         ))
 
     db.commit()
@@ -486,9 +455,9 @@ def update_user(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Admin Only: Perbarui akun pengguna & profil mahasiswa / dosen"""
+    """Admin Only: Perbarui akun pengguna dan profil mahasiswa."""
     target_user = db.query(User).filter(User.id == user_id).first()
-    if not target_user:
+    if not target_user or target_user.role not in SUPPORTED_USER_ROLES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pengguna tidak ditemukan.",
@@ -514,19 +483,13 @@ def update_user(
     nama = request.nama_lengkap or request.name
 
     # Update profil sesuai role
-    if target_user.role == "dosen":
-        if not target_user.dosen:
-            target_user.dosen = Dosen(id=target_user.id, nama_lengkap=nama or target_user.identifier)
-        elif nama:
-            target_user.dosen.nama_lengkap = nama
-    elif target_user.role == "mahasiswa":
+    if target_user.role == "mahasiswa":
         if not target_user.mahasiswa:
             target_user.mahasiswa = Mahasiswa(
                 id=target_user.id,
                 nama_lengkap=nama or target_user.identifier,
                 program_studi=request.program_studi or "Teknik Informatika",
                 fakultas=request.fakultas or "Fakultas Ilmu Komputer",
-                dosen_pembimbing_id=request.dosen_pembimbing_id,
             )
         else:
             if nama:
@@ -535,8 +498,6 @@ def update_user(
                 target_user.mahasiswa.program_studi = request.program_studi
             if request.fakultas:
                 target_user.mahasiswa.fakultas = request.fakultas
-            if "dosen_pembimbing_id" in request.model_fields_set:
-                target_user.mahasiswa.dosen_pembimbing_id = request.dosen_pembimbing_id
 
     if password_changed:
         db.execute(

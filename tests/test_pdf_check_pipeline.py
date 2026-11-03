@@ -32,7 +32,7 @@ def test_real_check_filters_headings_and_preserves_body_match_locations(tmp_path
         db.add(owner)
         db.flush()
         target = Document(title="target.pdf", document_type="proposal", file_path=str(target_path), user_id=owner.id)
-        source = Document(title="source.pdf", document_type="proposal", file_path=str(source_path), repository_status="published")
+        source = Document(title="source.pdf", document_type="proposal", file_path=str(source_path), repository_status="published", source_origin="alumni")
         # Simulate a deployed pre-fix repository cache.
         source.extracted_text = heading + body
         source.cleaned_text = "bab pendahuluan latar belakang"

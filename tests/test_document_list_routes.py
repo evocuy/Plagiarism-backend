@@ -66,6 +66,9 @@ def environment(monkeypatch):
     factory = sessionmaker(bind=engine)
     db = factory()
     admin = User(identifier="admin", password="hash", role="admin")
+    student = User(identifier="student", password="hash", role="mahasiswa")
+    db.add(student)
+    db.flush()
     db.add_all([
         admin,
         Document(
@@ -73,12 +76,23 @@ def environment(monkeypatch):
             document_type="skripsi",
             file_path="published.pdf",
             repository_status="published",
+            source_origin="alumni",
         ),
         Document(
             title="draft.pdf",
             document_type="skripsi",
             file_path="draft.pdf",
             repository_status="draft",
+        ),
+        Document(
+            title="old-student-published.pdf", document_type="skripsi",
+            file_path="old-student-published.pdf", repository_status="published",
+            source_origin="student",
+        ),
+        Document(
+            title="owned-alumni-flag.pdf", document_type="skripsi",
+            file_path="owned-alumni-flag.pdf", repository_status="published",
+            source_origin="alumni", user_id=student.id,
         ),
     ])
     db.commit()
@@ -109,6 +123,7 @@ def test_document_list_supports_both_url_forms_without_redirect(environment):
         assert status == 200
         assert "location" not in headers
         assert [document["title"] for document in body] == ["published.pdf"]
+        assert body[0]["source_origin"] == "alumni"
         results.append(body)
 
     assert results[0] == results[1]

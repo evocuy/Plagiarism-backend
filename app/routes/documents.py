@@ -16,7 +16,6 @@ from app.models.schemas import (
     PlagiarismCheck,
     SimilarityResult,
     User,
-    Mahasiswa,
     REPOSITORY_STATUS_DRAFT,
     REPOSITORY_STATUS_PUBLISHED,
     utc_now,
@@ -28,6 +27,7 @@ from app.services.document_index_service import DocumentIndexService
 from app.services.document_structure_service import DocumentStructureService
 from app.services.document_text_service import DocumentTextService
 from app.services.check_queue_service import CheckQueueService
+from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -74,11 +74,6 @@ def _can_access_document(document: Document, user: User, db: Session) -> bool:
         return True
     if user.role == "mahasiswa":
         return document.user_id == user.id
-    if user.role == "dosen":
-        if not user.dosen or not document.user_id:
-            return False
-        mhs = db.query(Mahasiswa).filter(Mahasiswa.id == document.user_id).first()
-        return bool(mhs and mhs.dosen_pembimbing_id == user.id)
     return False
 
 
@@ -89,15 +84,6 @@ def _visible_documents_query(current_user: User, db: Session):
         return query
     if current_user.role == "mahasiswa":
         query = query.filter(Document.user_id == current_user.id)
-    elif current_user.role == "dosen" and current_user.dosen:
-        dosen_id = current_user.id
-        bimbingan_user_ids = (
-            db.query(Mahasiswa.id)
-            .filter(Mahasiswa.dosen_pembimbing_id == dosen_id)
-            .all()
-        )
-        bimbingan_user_ids = [uid for (uid,) in bimbingan_user_ids]
-        query = query.filter(Document.user_id.in_(bimbingan_user_ids))
     else:
         # A role/profile mismatch must never silently become a global listing.
         query = query.filter(Document.id.is_(None))
@@ -178,6 +164,7 @@ async def _store_uploaded_document(
     document_type: str,
     user_id: Optional[int],
     repository_status: str = REPOSITORY_STATUS_DRAFT,
+    source_origin: str = "student",
     db: Session,
 ) -> Document:
     """Validate, store, and persist one PDF without using the raw filename as a path."""
@@ -227,11 +214,17 @@ async def _store_uploaded_document(
                 headers={"Retry-After": "5"} if structure_validation["error_code"] == "PDF_VALIDATION_BUSY" else None,
             )
 
+        # A student-owned upload can never become a comparison source, even
+        # if a caller supplies an old published status.
+        is_alumni_import = source_origin == "alumni" and user_id is None
+        if not is_alumni_import:
+            repository_status = REPOSITORY_STATUS_DRAFT
         db_doc = Document(
             user_id=user_id,
             title=original_filename,
             document_type=clean_type,
             file_path=str(file_path),
+            source_origin="alumni" if is_alumni_import else "student",
             repository_status=repository_status,
             repository_published_at=(
                 utc_now()
@@ -268,6 +261,7 @@ async def upload_document(
         document_type=document_type,
         user_id=None,
         repository_status=REPOSITORY_STATUS_PUBLISHED,
+        source_origin="alumni",
         db=db,
     )
 
@@ -329,6 +323,7 @@ async def upload_document(
         "user_id": db_doc.user_id,
         "filename": db_doc.title,
         "document_type": db_doc.document_type,
+        "source_origin": db_doc.source_origin,
         "repository_status": db_doc.repository_status,
         "repository_published_at": (
             db_doc.repository_published_at.isoformat()
@@ -345,7 +340,7 @@ async def upload_document(
         "embedding_auto_index": embedding_auto_index,
         "message": (
             f"File berhasil diunggah sebagai dokumen {db_doc.document_type.upper()} "
-            "dan langsung diterbitkan ke repositori pembanding."
+            "alumni dan diterbitkan ke repositori pembanding."
         ),
     }
 
@@ -362,6 +357,8 @@ async def upload_and_check_document(
     db: Session = Depends(get_db),
 ):
     """Store a PDF and enqueue one durable repository check."""
+    if current_user.role not in ("admin", "super_admin", "mahasiswa"):
+        raise HTTPException(status_code=403, detail="Akses ditolak.")
     queue_service = _get_check_queue_service()
     settings = queue_service.settings
     if not 1 <= candidate_limit <= settings.max_candidate_limit:
@@ -390,6 +387,7 @@ async def upload_and_check_document(
         document_type=document_type,
         user_id=effective_user_id,
         repository_status=REPOSITORY_STATUS_DRAFT,
+        source_origin="student",
         db=db,
     )
 
@@ -427,6 +425,7 @@ async def upload_and_check_document(
         "document_id": db_doc.id,
         "filename": db_doc.title,
         "document_type": db_doc.document_type,
+        "source_origin": db_doc.source_origin,
         "repository_status": db_doc.repository_status,
         "repository_published_at": None,
         "status": check_record.status,
@@ -451,12 +450,11 @@ def get_all_documents(
 ):
     """
     - Mahasiswa: hanya dokumen miliknya.
-    - Dosen: dokumen milik mahasiswa bimbingannya.
     - Admin: seluruh dokumen.
     """
     query = _visible_documents_query(current_user, db)
     if repository_only:
-        query = query.filter(Document.repository_status == REPOSITORY_STATUS_PUBLISHED)
+        query = query.filter(*comparison_source_filters())
     docs = query.order_by(Document.created_at.desc()).all()
     results = []
     for doc in docs:
@@ -467,13 +465,14 @@ def get_all_documents(
             "owner_identifier": doc.user.identifier if doc.user else "-",
             "title": doc.title,
             "document_type": doc.document_type,
+            "source_origin": doc.source_origin,
             "repository_status": doc.repository_status,
             "repository_published_at": (
                 doc.repository_published_at.isoformat()
                 if doc.repository_published_at
                 else None
             ),
-            "is_repository_published": doc.repository_status == REPOSITORY_STATUS_PUBLISHED,
+            "is_repository_published": is_comparison_source(doc),
             # Keep the legacy response key for the frontend, but return only a
             # display-safe filename rather than the internal storage path.
             "file_path": doc.title,

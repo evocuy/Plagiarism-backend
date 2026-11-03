@@ -134,6 +134,13 @@ def test_repository_check_reuses_provisional_check_and_completes_progress():
     assert provisional_check.progress == 100
     assert provisional_check.processing_stage == "completed"
     assert provisional_check.completed_at is not None
+    assert provisional_check.comparison_status == "no_comparison_sources"
+    status = get_check_processing_status(provisional_check.id, current_user=User(role="admin"), db=db)
+    assert status["overall_similarity"] is None
+    assert status["similarity_percentage"] is None
+    assert "Belum ada dokumen alumni pembanding" in status["message"]
+    result_payload = get_check_matches(provisional_check.id, current_user=User(role="admin"), db=db)
+    assert result_payload["highest_similarity_percentage"] is None
     assert [progress for progress, _stage in progress_events] == [5, 15, 28, 35, 96, 100]
 
 
@@ -161,6 +168,7 @@ def test_repository_check_uses_only_published_same_type_external_sources():
         repository_status="published",
     )
     eligible_ownerless_source = Document(
+        source_origin="alumni",
         title="eligible-ownerless.pdf",
         document_type="skripsi",
         file_path="eligible-ownerless.pdf",
@@ -216,15 +224,30 @@ def test_repository_check_uses_only_published_same_type_external_sources():
         candidate_limit=20,
     )
 
-    expected_source_ids = {eligible_student_source.id, eligible_ownerless_source.id}
+    expected_source_ids = {eligible_ownerless_source.id}
     persisted_source_ids = {
         source_document_id
         for (source_document_id,) in db.query(SimilarityResult.source_document_id).all()
     }
-    assert result["total_repository_available"] == 2
-    assert result["total_repository_checked"] == 2
+    assert result["total_repository_available"] == 1
+    assert result["total_repository_checked"] == 1
     assert {item["repository_document_id"] for item in result["matches"]} == expected_source_ids
     assert persisted_source_ids == expected_source_ids
+
+
+def test_proposal_stays_without_comparison_sources_when_only_alumni_theses_exist():
+    db = _make_session()
+    target, _ = _create_pending_check(db)
+    db.add(Document(title="alumni.pdf", file_path="alumni.pdf", document_type="skripsi",
+                    source_origin="alumni", repository_status="published"))
+    db.commit()
+    result = _make_service(FakeTextService()).run_repository_check(
+        document_id=target.id, db=db, auto_index_embeddings=False,
+    )
+    assert result["comparison_status"] == "no_comparison_sources"
+    assert result["total_repository_available"] == 0
+    assert result["highest_similarity_percentage"] is None
+    assert db.query(SimilarityResult).count() == 0
 
 
 def test_repository_check_marks_provisional_check_failed_without_exposing_raw_error():
@@ -366,7 +389,7 @@ def test_matches_endpoint_returns_final_payload_after_progress_completes():
         },
     )
     source = Document(
-        user_id=source_owner.id,
+        source_origin="alumni",
         title="source.pdf",
         document_type="proposal",
         file_path="source.pdf",

@@ -121,7 +121,37 @@ setelah akun berhasil dibuat. Akun mahasiswa dan dosen dibuat oleh admin.
 - **Plagiarism**:
   - `POST /api/plagiarism/check` (Jalankan pemindaian plagiarisme dokumen)
   - `GET /api/plagiarism/reports/{document_id}` (Detail hasil analisis per dokumen)
-  - `POST /api/plagiarism/approve/{document_id}` (Approval dosen)
+  - `GET /api/plagiarism/check/{id}/status` (Status pemrosesan)
+
+## Repositori alumni dan penghapusan alur pembimbing
+
+Role aktif adalah `admin` dan `mahasiswa` (`super_admin` lama tetap diperlakukan
+sebagai admin). Tidak ada lagi penugasan pembimbing atau approval dokumen.
+`POST /api/auth/users` hanya menerima role mahasiswa/admin; endpoint
+`GET /api/auth/users/dosen` dan `PATCH /api/plagiarism/check/{id}/approval` dihapus.
+Field pembimbing, approval, catatan reviewer, serta counter review dashboard
+dihapus dari kontrak API. Frontend harus diperbarui bersama versi backend ini.
+
+Admin mengimpor dokumen alumni melalui `POST /api/documents/upload`. Admin
+bertanggung jawab memastikan asal dokumen dari alumni yang sudah lulus;
+aplikasi belum terhubung ke layanan verifikasi kelulusan kampus. Sumber harus
+memiliki `source_origin=alumni`, tanpa pemilik mahasiswa, berstatus published,
+dan belum dihapus. Dokumen mahasiswa selalu `source_origin=student` dan draft,
+termasuk dokumen lama yang pernah disetujui. Pemeriksaan tetap membandingkan
+proposal dengan proposal dan skripsi dengan skripsi.
+
+Jika sumber sejenis belum tersedia, proses selesai dengan
+`comparison_status=no_comparison_sources`, skor/teks persentase pada API bernilai
+null, dan pesan bahwa kemiripan belum dapat ditentukan. `available` berarti
+pembanding tersedia. Frontend menampilkan kondisi ini secara eksplisit.
+
+Saat startup, migrasi PostgreSQL menyimpan metadata pembimbing/review lama ke
+`legacy_workflow_archive`, menonaktifkan akun dosen serta mencabut sesinya,
+kemudian menghapus tabel/kolom workflow lama. Dokumen, hasil pemeriksaan, dan
+skor lama dipertahankan. Impor lama tanpa pemilik diklasifikasikan alumni satu
+kali; daftar impor tersebut tetap perlu ditinjau admin sesuai asal dokumennya.
+Migrasi dapat diulang dan tidak menerbitkan kembali dokumen mahasiswa.
+Perubahan ini dikembangkan lokal; VM belum diperbarui.
 
 ## Penyaringan judul dan posisi highlight
 
