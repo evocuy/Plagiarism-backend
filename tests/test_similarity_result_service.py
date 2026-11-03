@@ -48,6 +48,10 @@ def test_create_result_and_matches_persists_similarity_detail():
                 "reference_sentence": "Kalimat sumber mirip.",
                 "similarity": 91.5,
                 "page": 7,
+                "start_position": 0,
+                "end_position": 21,
+                "page_start_position": 100,
+                "page_end_position": 121,
             }
         ],
     )
@@ -62,6 +66,8 @@ def test_create_result_and_matches_persists_similarity_detail():
     assert stored_match.submitted_text == "Kalimat target mirip."
     assert stored_match.similarity_score == 0.915
     assert stored_match.page_number == 7
+    assert stored_match.page_start_position == 100
+    assert stored_match.page_end_position == 121
 
 
 def test_summarize_highlight_matches_reports_words_pages_and_sources():
@@ -122,3 +128,17 @@ def test_summarize_highlight_matches_reports_words_pages_and_sources():
             "page_count": 1,
         },
     ]
+
+
+def test_summary_distinguishes_repeated_phrase_positions_but_deduplicates_sources():
+    matches = [
+        {"sentence": "Sistem informasi akademik", "page": 1,
+         "start_position": 0, "end_position": 25,
+         "page_start_position": start, "page_end_position": start + 25,
+         "source_document_id": source, "matched_source": str(source)}
+        for start, source in [(0, 1), (100, 1), (100, 2)]
+    ]
+    summary = SimilarityResultService().summarize_highlight_matches(matches)
+    assert summary["detected_match_count"] == 3
+    assert summary["highlighted_match_count"] == 2
+    assert summary["highlighted_word_count"] == 6

@@ -900,6 +900,8 @@ class RepositoryCheckService:
                     match.get("source_document_id"),
                     (match.get("reference_sentence") or "").strip().lower(),
                     match.get("match_type"),
+                    match.get("page_start_position"),
+                    match.get("page_end_position"),
                 )
                 if key not in seen:
                     seen.add(key)
@@ -922,6 +924,8 @@ class RepositoryCheckService:
                 sentence,
                 match.get("start_position"),
                 match.get("end_position"),
+                match.get("page_start_position"),
+                match.get("page_end_position"),
             )
             if key in seen:
                 continue

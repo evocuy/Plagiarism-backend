@@ -416,6 +416,8 @@ def _serialize_check_final_result(
                     "page_number": match.page_number,
                     "start_position": match.start_position,
                     "end_position": match.end_position,
+                    "page_start_position": match.page_start_position,
+                    "page_end_position": match.page_end_position,
                 }
             )
             persisted_highlight_matches.append(
@@ -426,6 +428,8 @@ def _serialize_check_final_result(
                     "page": match.page_number,
                     "start_position": match.start_position,
                     "end_position": match.end_position,
+                    "page_start_position": match.page_start_position,
+                    "page_end_position": match.page_end_position,
                 }
             )
 

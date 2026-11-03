@@ -48,6 +48,8 @@ class SimilarityResultService:
                 self._normalize_visual_text(submitted_text),
                 match.get("start_position"),
                 match.get("end_position"),
+                match.get("page_start_position"),
+                match.get("page_end_position"),
             )
             visual_matches.setdefault(
                 visual_key,
@@ -148,6 +150,8 @@ class SimilarityResultService:
                     page_number=match.get("page"),
                     start_position=match.get("start_position"),
                     end_position=match.get("end_position"),
+                    page_start_position=match.get("page_start_position"),
+                    page_end_position=match.get("page_end_position"),
                 )
             )
 

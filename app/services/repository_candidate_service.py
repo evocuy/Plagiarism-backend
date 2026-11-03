@@ -7,6 +7,7 @@ from app.models.schemas import Document
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.embedding_service import EmbeddingService
 from app.services.tfidf_service import TfidfService
+from app.services.pdf_service import PDF_EXTRACTION_VERSION
 
 
 class RepositoryCandidateService:
@@ -217,6 +218,15 @@ class RepositoryCandidateService:
                 **empty_result,
                 "reason": "embedding_model_not_configured",
             }
+
+        # Old embeddings still contain headings. Until every eligible source
+        # has current chunks, use lexical retrieval, which refreshes the caches.
+        if any(
+            (getattr(document, "extraction_metadata", None) or {}).get("chunk_extraction_version")
+            != PDF_EXTRACTION_VERSION
+            for document in [target_document, *repository_documents]
+        ):
+            return {**empty_result, "reason": "chunk_extraction_version_outdated"}
 
         repository_document_ids = [
             document.id for document in repository_documents

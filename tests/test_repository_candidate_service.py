@@ -1,10 +1,12 @@
 from app.services.repository_candidate_service import RepositoryCandidateService
+from app.services.pdf_service import PDF_EXTRACTION_VERSION
 
 
 class FakeDocument:
     def __init__(self, document_id, title):
         self.id = document_id
         self.title = title
+        self.extraction_metadata = {"chunk_extraction_version": PDF_EXTRACTION_VERSION}
 
 
 class FakeChunkService:
@@ -29,6 +31,24 @@ class FakeChunkService:
             }
             for chunk in chunks
         ]
+
+
+def test_old_heading_embeddings_cannot_drive_candidate_selection():
+    target = FakeDocument(1, "target.pdf")
+    source = FakeDocument(2, "source.pdf")
+    source.extraction_metadata = {}
+    service = RepositoryCandidateService()
+    service.embedding_service.model = "test-model"
+    service._fetch_embedded_target_chunks = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("stale embeddings must not be queried")
+    )
+    result = service._rank_semantic_candidates(
+        target_document=target, repository_documents=[source],
+        documents_by_id={source.id: source}, db=object(), top_k=1,
+        min_score=0.0, target_chunk_count=1,
+    )
+    assert result["candidates"] == []
+    assert result["reason"] == "chunk_extraction_version_outdated"
 
 
 def test_find_candidates_prefers_repository_documents_with_similar_chunks():

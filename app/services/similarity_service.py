@@ -121,6 +121,23 @@ class SimilarityService:
     def _ranges_overlap(self, left: Tuple[int, int], right: Tuple[int, int]) -> bool:
         return left[0] < right[1] and right[0] < left[1]
 
+    @staticmethod
+    def _page_positions(item: Dict[str, Any], start: int, end: int) -> Dict[str, int]:
+        """Keep sentence-relative offsets and carry the exact page occurrence."""
+        page_start = item.get("page_start_position")
+        page_end = item.get("page_end_position")
+        sentence = item.get("sentence") or ""
+        if (
+            type(page_start) is int and type(page_end) is int
+            and page_start >= 0 and page_end - page_start == len(sentence)
+            and 0 <= start < end <= len(sentence)
+        ):
+            return {
+                "page_start_position": page_start + start,
+                "page_end_position": page_start + end,
+            }
+        return {}
+
     def build_sentence_reference_corpus(
         self,
         sentences: Sequence[Dict[str, Any]],
@@ -226,6 +243,10 @@ class SimilarityService:
         for (target_item, _), top_matches in zip(valid_targets, top_matches_by_target):
             target_sentence = (target_item.get("sentence") or "").strip()
             target_token_count = len(self._tokenize_with_positions(target_sentence))
+            # The minimum also applies to the exact-sentence fallback below.
+            # Otherwise one/two-word fragments can bypass the segment minimum.
+            if target_token_count < min_segment_tokens:
+                continue
             covered_ranges: List[Tuple[int, int]] = []
             emitted_segments = []
             emitted_sentence_match = False
@@ -275,6 +296,7 @@ class SimilarityService:
                         "match_type": "sentence",
                         "start_position": 0,
                         "end_position": len(target_sentence),
+                        **self._page_positions(target_item, 0, len(target_sentence)),
                     })
                     emitted_sentence_match = True
                     break
@@ -310,6 +332,9 @@ class SimilarityService:
                         "match_type": "segment",
                         "start_position": segment["start_position"],
                         "end_position": segment["end_position"],
+                        **self._page_positions(
+                            target_item, segment["start_position"], segment["end_position"]
+                        ),
                     })
 
             if emitted_sentence_match:
@@ -345,6 +370,7 @@ class SimilarityService:
                 "match_type": "sentence",
                 "start_position": 0,
                 "end_position": len(target_sentence),
+                **self._page_positions(target_item, 0, len(target_sentence)),
             })
 
         return matches

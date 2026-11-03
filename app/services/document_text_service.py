@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import Session
 
 from app.models.schemas import Document
-from app.services.pdf_service import PDFService
+from app.services.pdf_service import PDFService, PDF_EXTRACTION_VERSION
 from app.services.similarity_service import SimilarityService
 
 
@@ -35,7 +35,10 @@ class DocumentTextService:
 
             document.extracted_text = extracted["full_text"]
             document.cleaned_text = cleaned_text
-            document.extraction_metadata = self._build_metadata(extracted)
+            document.extraction_metadata = {
+                **(document.extraction_metadata or {}),
+                **self._build_metadata(extracted),
+            }
             document.text_extracted_at = datetime.now(timezone.utc).replace(tzinfo=None)
             document.text_extraction_error = None
             db.add(document)
@@ -55,7 +58,8 @@ class DocumentTextService:
 
     def _has_cached_text(self, document: Document) -> bool:
         return (
-            document.text_extracted_at is not None
+            (document.extraction_metadata or {}).get("text_extraction_version") == PDF_EXTRACTION_VERSION
+            and document.text_extracted_at is not None
             and document.extracted_text is not None
             and document.cleaned_text is not None
         )
@@ -70,6 +74,7 @@ class DocumentTextService:
 
     def _build_metadata(self, extracted: Dict[str, Any]) -> Dict[str, Any]:
         return {
+            "text_extraction_version": PDF_EXTRACTION_VERSION,
             "total_pages": extracted.get("total_pages"),
             "checked_pages_range": extracted.get("checked_pages_range"),
             "chapter_validation": extracted.get("chapter_validation"),

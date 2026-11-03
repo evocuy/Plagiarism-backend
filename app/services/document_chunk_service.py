@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.models.schemas import Document, DocumentChunk
 from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
-from app.services.pdf_service import PDFService
+from app.services.pdf_service import PDFService, PDF_EXTRACTION_VERSION
 from app.services.similarity_service import SimilarityService
 
 
@@ -24,13 +24,13 @@ class DocumentChunkService:
         db: Session,
         refresh_cache: bool = False,
     ) -> List[Dict[str, Any]]:
-        if refresh_cache:
-            self._delete_existing_chunks(document, db)
+        metadata = document.extraction_metadata or {}
+        if not refresh_cache and metadata.get("chunk_extraction_version") == PDF_EXTRACTION_VERSION:
+            # A current extraction may intentionally contain no body sentences.
+            return self._format_chunks(self._get_existing_chunks(document, db))
 
-        existing_chunks = self._get_existing_chunks(document, db)
-        if existing_chunks:
-            return self._format_chunks(existing_chunks)
-
+        # Extract/validate first: a failed refresh must not erase a usable cache.
+        # Old versions still raise instead of returning heading-bearing chunks.
         sentences = self.pdf_service.extract_sentences_with_pages(
             document.file_path,
             document_type=document.document_type,
@@ -54,15 +54,26 @@ class DocumentChunkService:
                     chunk_type="sentence",
                     chapter=item.get("chapter"),
                     page_number=item.get("page"),
+                    page_start_position=item.get("page_start_position"),
+                    page_end_position=item.get("page_end_position"),
                     chunk_index=len(chunk_records),
                     raw_text=raw_text,
                     cleaned_text=cleaned_text,
                 )
             )
 
-        if chunk_records:
+        try:
+            self._delete_existing_chunks(document, db)
             db.add_all(chunk_records)
+            document.extraction_metadata = {
+                **(document.extraction_metadata or {}),
+                "chunk_extraction_version": PDF_EXTRACTION_VERSION,
+            }
+            db.add(document)
             db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
         return self._format_chunks(chunk_records)
 
@@ -81,6 +92,11 @@ class DocumentChunkService:
                 "source_chunk_index": chunk.get("chunk_index"),
                 "source_page": chunk.get("page"),
                 "chapter": chunk.get("chapter"),
+                **{
+                    f"source_{key}": chunk[key]
+                    for key in ("page_start_position", "page_end_position")
+                    if chunk.get(key) is not None
+                },
             }
             for chunk in chunks
             if (chunk.get("clean") or "").strip()
@@ -105,9 +121,8 @@ class DocumentChunkService:
         (
             db.query(DocumentChunk)
             .filter(DocumentChunk.document_id == document.id)
-            .delete(synchronize_session=False)
+            .delete(synchronize_session="fetch")
         )
-        db.commit()
 
     def _format_chunks(self, chunks: Sequence[Any]) -> List[Dict[str, Any]]:
         return [
@@ -117,6 +132,8 @@ class DocumentChunkService:
                 "sentence": chunk.raw_text,
                 "clean": chunk.cleaned_text,
                 "chunk_index": chunk.chunk_index,
+                "page_start_position": chunk.page_start_position,
+                "page_end_position": chunk.page_end_position,
             }
             for chunk in chunks
         ]

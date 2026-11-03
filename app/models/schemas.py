@@ -175,6 +175,9 @@ class DocumentChunk(Base):
     chunk_type = Column(String(50), default="sentence", nullable=False, index=True)
     chapter = Column(String(50), nullable=True, index=True)
     page_number = Column(Integer, nullable=True, index=True)
+    # Offsets in the heading-filtered page text used to place exact highlights.
+    page_start_position = Column(Integer, nullable=True)
+    page_end_position = Column(Integer, nullable=True)
     chunk_index = Column(Integer, nullable=False)
     raw_text = Column(Text, nullable=False)
     cleaned_text = Column(Text, nullable=False)
@@ -250,6 +253,8 @@ class SimilarityMatch(Base):
     page_number = Column(Integer, nullable=True, index=True)
     start_position = Column(Integer, nullable=True)
     end_position = Column(Integer, nullable=True)
+    page_start_position = Column(Integer, nullable=True)
+    page_end_position = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
     result = relationship("SimilarityResult", back_populates="matches")

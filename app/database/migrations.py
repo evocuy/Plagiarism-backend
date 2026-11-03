@@ -137,6 +137,8 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_chunks_chunk_type ON document_chunks(chunk_type)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_chunks_chapter ON document_chunks(chapter)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_chunks_page_number ON document_chunks(page_number)"))
+        conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS page_start_position INTEGER"))
+        conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS page_end_position INTEGER"))
         conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)"))
         conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_generated_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_error TEXT"))
@@ -169,6 +171,8 @@ def ensure_runtime_columns() -> None:
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_similarity_matches_result_id ON similarity_matches(result_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_similarity_matches_page_number ON similarity_matches(page_number)"))
+        conn.execute(text("ALTER TABLE similarity_matches ADD COLUMN IF NOT EXISTS page_start_position INTEGER"))
+        conn.execute(text("ALTER TABLE similarity_matches ADD COLUMN IF NOT EXISTS page_end_position INTEGER"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS support_tickets (
                 id SERIAL PRIMARY KEY,

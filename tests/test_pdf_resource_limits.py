@@ -19,8 +19,16 @@ class FakePage:
     def __init__(self, text):
         self.text = text
         self.calls = 0
+        self.layout_calls = 0
 
-    def get_text(self):
+    def get_text(self, kind="text", **_kwargs):
+        if kind == "words":
+            self.layout_calls += 1
+            return [
+                (0, line_index, 1, line_index + 1, word, 0, line_index, word_index)
+                for line_index, line in enumerate(self.text.splitlines())
+                for word_index, word in enumerate(line.split())
+            ]
         self.calls += 1
         return self.text
 
@@ -77,6 +85,7 @@ def test_chapter_detection_and_content_filter_reuse_one_extraction(tmp_path, mon
     assert extracted["total_pages"] == 3
     assert extracted["chapter_validation"]["total_chapters_detected"] == 3
     assert [page.calls for page in document.pages] == [1, 1, 1]
+    assert [page.layout_calls for page in document.pages] == [1, 1, 1]
 
 
 def test_sentence_count_limit_rejects_excess_chunks(monkeypatch):
@@ -88,6 +97,30 @@ def test_sentence_count_limit_rejects_excess_chunks(monkeypatch):
 
     with pytest.raises(PDFLimitExceeded, match="potongan teks"):
         service.extract_sentences_with_pages("unused.pdf")
+
+
+def test_body_offsets_use_word_layout_when_plain_extraction_has_extra_spaces(tmp_path, monkeypatch):
+    document = FakeDocument(["Sistem informasi akademik membantu mahasiswa."])
+    page = document.pages[0]
+    original_get_text = page.get_text
+
+    def get_text(kind="text", **kwargs):
+        if kind == "words":
+            return original_get_text(kind, **kwargs)
+        # PDF font spans/justification can split a word in the plain-text view.
+        return "Sistem infor\nmasi akademik membantu mahasiswa."
+
+    page.get_text = get_text
+    path = tmp_path / "font-spans.pdf"
+    path.touch()
+    monkeypatch.setattr(pymupdf, "open", lambda _path: document)
+    service = PDFService()
+    extracted = service.extract_text_from_pdf(str(path))
+    sentence = service.extract_sentences_with_pages(str(path))[0]
+    assert extracted["full_text"] == "Sistem informasi akademik membantu mahasiswa."
+    assert sentence["sentence"] == extracted["full_text"]
+    start, end = sentence["page_start_position"], sentence["page_end_position"]
+    assert service._page_body_layout(page)[0][start:end] == sentence["sentence"]
 
 
 def test_isolated_validation_accepts_a_text_based_proposal(tmp_path):

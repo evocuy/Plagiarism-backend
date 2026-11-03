@@ -1,5 +1,6 @@
 from app.services.similarity_service import SimilarityService
 from app.services.tfidf_service import TfidfService
+import pytest
 
 
 def test_pair_similarity_identical_text_is_high():
@@ -193,3 +194,39 @@ def test_sentence_matching_counts_identical_sources_independently():
     assert len(matches_by_source[6]) == 2
     assert [match["page"] for match in matches_by_source[4]] == [13, 24]
     assert [match["page"] for match in matches_by_source[6]] == [13, 24]
+
+
+@pytest.mark.parametrize("text", ["BAB I", "Latar Belakang", "kampus"])
+def test_exact_sentence_cannot_bypass_minimum_match_length(text):
+    service = SimilarityService()
+    assert service.find_sentence_matches(
+        [{"sentence": text, "page": 1}], [{"sentence": text}], "source"
+    ) == []
+
+
+def test_partial_match_preserves_exact_page_occurrence():
+    service = SimilarityService()
+    target = "Penelitian mengevaluasi sistem informasi akademik menggunakan survei."
+    matches = service.find_sentence_matches(
+        [{"sentence": target, "page": 2, "page_start_position": 100,
+          "page_end_position": 100 + len(target)}],
+        [{"sentence": "Pengembangan sistem informasi akademik berbasis web."}],
+        "source",
+    )
+    assert len(matches) == 1
+    match = matches[0]
+    assert match["sentence"] == "sistem informasi akademik"
+    assert target[match["start_position"]:match["end_position"]] == match["sentence"]
+    assert match["page_start_position"] == 100 + match["start_position"]
+    assert match["page_end_position"] == 100 + match["end_position"]
+
+
+def test_exact_sentence_preserves_each_occurrence_on_same_page():
+    service = SimilarityService()
+    sentence = "Sistem informasi akademik membantu mahasiswa."
+    matches = service.find_sentence_matches(
+        [{"sentence": sentence, "page": 1, "page_start_position": start,
+          "page_end_position": start + len(sentence)} for start in (0, 100)],
+        [{"sentence": sentence}], "source",
+    )
+    assert [match["page_start_position"] for match in matches] == [0, 100]

@@ -1,4 +1,3 @@
-import os
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -7,10 +6,93 @@ import pymupdf
 from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / 'uploads'
+PDF_EXTRACTION_VERSION = 2
 
 class PDFService:
+    # Only whole structural lines are ignored. These words inside ordinary
+    # prose remain comparison material, including the body of BAB I.
+    _COMMON_HEADINGS = frozenset({
+        "pendahuluan", "latar belakang", "latar belakang masalah",
+        "rumusan masalah", "perumusan masalah", "batasan masalah",
+        "tujuan penelitian", "manfaat penelitian", "sistematika penulisan",
+        "tinjauan pustaka", "landasan teori", "kajian teori", "kajian pustaka",
+        "penelitian terdahulu", "metodologi penelitian", "metode penelitian",
+        "metode pengumpulan data", "teknik pengumpulan data",
+        "analisis kebutuhan", "hasil dan pembahasan", "hasil penelitian",
+        "pembahasan", "penutup", "kesimpulan", "simpulan", "saran",
+        "kesimpulan dan saran", "simpulan dan saran",
+    })
+
     def __init__(self, limits: Optional[PDFProcessingLimits] = None):
         self.limits = limits or PDFProcessingLimits.from_environment()
+
+    @classmethod
+    def _is_structural_heading(cls, line: str) -> bool:
+        normalized = " ".join(line.split()).casefold()
+        if normalized.rstrip(":") in cls._COMMON_HEADINGS:
+            return True
+        chapter = re.fullmatch(r"bab\s+(?:[ivx]+|\d+)[:.]?(?:\s*[-:]?\s+(.+))?", normalized)
+        if chapter:
+            title = chapter.group(1)
+            return not title or title.rstrip(":") in cls._COMMON_HEADINGS
+        # A short numbered title without sentence-ending punctuation is the
+        # conventional subsection format. Do not strip numbered body sentences.
+        subsection = re.fullmatch(r"\d+(?:\.\d+)+\.?\s+(.+)", normalized)
+        if subsection:
+            title = subsection.group(1)
+            return len(title.split()) <= 12 and len(title) <= 120 and not re.search(r"[.!?;]$", title)
+        return False
+
+    @classmethod
+    def _body_layout(cls, lines: list[dict]) -> tuple[str, list[dict]]:
+        """Normalize body text once, optionally retaining word rectangles.
+
+        Extraction and rendering share this representation so a stored page
+        offset always identifies the same occurrence. Removed headings create
+        a boundary instead of joining unrelated prose across sections.
+        """
+        parts = []
+        positioned_words = []
+        position = 0
+        boundary = False
+        for line_id, line in enumerate(lines):
+            words = line["words"]
+            line_text = " ".join(word["text"] for word in words)
+            if not line_text or cls._is_structural_heading(line_text):
+                boundary = True
+                continue
+            if parts:
+                separator = "\n\n" if boundary else " "
+                parts.append(separator)
+                position += len(separator)
+            boundary = False
+            for index, word in enumerate(words):
+                if index:
+                    parts.append(" ")
+                    position += 1
+                start = position
+                parts.append(word["text"])
+                position += len(word["text"])
+                positioned_words.append({**word, "start": start, "end": position, "line": line_id})
+        return "".join(parts), positioned_words
+
+    @classmethod
+    def _body_text(cls, raw_text: str) -> str:
+        lines = [
+            {"words": [{"text": word} for word in line.split()]}
+            for line in raw_text.splitlines()
+        ]
+        return cls._body_layout(lines)[0]
+
+    @classmethod
+    def _page_body_layout(cls, page) -> tuple[str, list[dict]]:
+        lines = {}
+        for word in page.get_text("words", sort=False):
+            key = (word[5], word[6])
+            lines.setdefault(key, {"words": []})["words"].append({
+                "text": word[4], "rect": pymupdf.Rect(word[:4]),
+            })
+        return cls._body_layout(list(lines.values()))
 
     def _read_page_texts(self, doc: pymupdf.Document) -> List[str]:
         # Inspect page count before parsing any page, then extract each page
@@ -244,14 +326,27 @@ class PDFService:
             chapter_validation = self.detect_chapters_in_doc(
                 doc, document_type=document_type, page_texts=page_texts,
             )
-            full_text = page_texts[start_page:end_page + 1]
-            pages_data = [
-                {'page': page_num + 1, 'text': page_texts[page_num]}
-                for page_num in range(start_page, end_page + 1)
-            ]
+            pages_data = []
+            body_chars = 0
+            for page_num in range(start_page, end_page + 1):
+                raw_text = page_texts[page_num]
+                # Use the exact same word/line representation as the renderer.
+                # Plain-text extraction can insert spaces that word extraction
+                # does not (font spans, justification, ligatures), making its
+                # offsets unsuitable for locating annotations.
+                body_text = self._page_body_layout(doc[page_num])[0] if filter_bab else None
+                body_chars += len(body_text or "")
+                if body_chars > self.limits.max_text_chars:
+                    raise PDFLimitExceeded("Teks PDF melebihi batas pemrosesan dokumen.")
+                pages_data.append({
+                    'page': page_num + 1,
+                    'text': body_text if filter_bab else raw_text,
+                    **({'body_text': body_text} if body_text is not None else {}),
+                })
 
         return {
-            'full_text': '\n'.join(full_text),
+            'full_text': '\n'.join(page['text'] for page in pages_data),
+            'extraction_version': PDF_EXTRACTION_VERSION,
             'total_pages': total_pages,
             'checked_pages_range': {
                 'start_page': start_page + 1,
@@ -269,16 +364,22 @@ class PDFService:
         sentences_info = []
 
         for page in extracted["pages"]:
-            text = page["text"]
-            if not text:
+            page_content = page.get("body_text", self._body_text(page["text"]))
+            if not page_content:
                 continue
 
-            raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
-            page_content = ' '.join(raw_lines)
-
-            splits = re.split(r'(?<=[.!?])\s+', page_content)
-            for s in splits:
-                s_clean = s.strip()
+            # Preserve offsets in the normalized body, and never produce a
+            # sentence that spans a removed heading.
+            start = 0
+            separators = list(re.finditer(r'(?<=[.!?])\s+|\n\n', page_content))
+            ranges = []
+            for separator in separators:
+                ranges.append((start, separator.start()))
+                start = separator.end()
+            ranges.append((start, len(page_content)))
+            for start, end in ranges:
+                fragment = page_content[start:end]
+                s_clean = fragment.strip()
                 if len(s_clean.split()) >= 4 and len(s_clean) >= 20:
                     if len(sentences_info) >= self.limits.max_chunks:
                         raise PDFLimitExceeded("Jumlah potongan teks PDF melebihi batas pemrosesan.")
@@ -286,7 +387,9 @@ class PDFService:
                     sentences_info.append({
                         'page': page_number,
                         'chapter': self._chapter_for_page(page_number, detected_chapters),
-                        'sentence': s_clean
+                        'sentence': s_clean,
+                        'page_start_position': start + len(fragment) - len(fragment.lstrip()),
+                        'page_end_position': end - len(fragment) + len(fragment.rstrip()),
                     })
 
         return sentences_info
@@ -300,41 +403,62 @@ class PDFService:
         highlight_dir.mkdir(parents=True, exist_ok=True)
         output_path = highlight_dir / output_filename
 
-        doc = pymupdf.open(str(resolved_path))
-
-        try:
-            if len(doc) > self.limits.max_pages:
-                raise PDFLimitExceeded(f"PDF melebihi batas {self.limits.max_pages} halaman.")
+        with pymupdf.open(str(resolved_path)) as doc:
+            self._read_page_texts(doc)
+            layouts = {}
+            body_chars = 0
+            highlighted_ranges = set()
             for item in plagiarized_sentences:
                 sentence = item.get('sentence', '').strip()
                 page_target = item.get('page')
-                if not sentence:
+                if (not sentence or isinstance(page_target, bool)
+                        or not isinstance(page_target, int) or not 1 <= page_target <= len(doc)):
                     continue
-
-                pages_to_search = []
-                if page_target and 1 <= page_target <= len(doc):
-                    pages_to_search.append(doc[page_target - 1])
-                else:
-                    pages_to_search = list(doc)
-
-                for page in pages_to_search:
-                    rects = page.search_for(sentence)
-                    if not rects:
-                        words = sentence.split()
-                        chunk_size = 5
-                        for i in range(0, len(words), chunk_size):
-                            chunk = ' '.join(words[i:i + chunk_size])
-                            if len(chunk) >= 15:
-                                sub_rects = page.search_for(chunk)
-                                for r in sub_rects:
-                                    self._add_highlight(page, r)
-                    else:
-                        for r in rects:
-                            self._add_highlight(page, r)
-
+                page = doc[page_target - 1]
+                if page_target not in layouts:
+                    layouts[page_target] = self._page_body_layout(page)
+                    body_chars += len(layouts[page_target][0])
+                    if body_chars > self.limits.max_text_chars:
+                        raise PDFLimitExceeded("Teks PDF melebihi batas pemrosesan dokumen.")
+                body_text, words = layouts[page_target]
+                start = item.get('page_start_position')
+                end = item.get('page_end_position')
+                if start is None and end is None:
+                    # Compatibility for old callers: only one exact occurrence
+                    # in body text is safe. Never search headings or other pages.
+                    occurrences = list(re.finditer(re.escape(sentence), body_text))
+                    if len(occurrences) != 1:
+                        continue
+                    start, end = occurrences[0].span()
+                if (isinstance(start, bool) or isinstance(end, bool)
+                        or not isinstance(start, int) or not isinstance(end, int)
+                        or not 0 <= start < end <= len(body_text)
+                        or body_text[start:end] != sentence
+                        or '\n\n' in body_text[start:end]):
+                    continue
+                key = (page_target, start, end)
+                if key in highlighted_ranges:
+                    continue
+                highlighted_ranges.add(key)
+                rectangles_by_line = {}
+                for word in words:
+                    if word['start'] < end and start < word['end']:
+                        # Word rectangles include punctuation (e.g. akademik.),
+                        # while lexical match ranges end at the final letter.
+                        # Include that rectangle only when all omitted chars
+                        # are punctuation; never highlight unmatched letters.
+                        prefix = word['text'][:max(0, start - word['start'])]
+                        suffix = word['text'][max(0, end - word['start']):]
+                        if re.search(r'\w', prefix + suffix):
+                            continue
+                        line = word['line']
+                        if line in rectangles_by_line:
+                            rectangles_by_line[line] |= word['rect']
+                        else:
+                            rectangles_by_line[line] = pymupdf.Rect(word['rect'])
+                for rect in rectangles_by_line.values():
+                    self._add_highlight(page, rect)
             doc.save(str(output_path))
-        finally:
-            doc.close()
 
         return str(output_path)
 

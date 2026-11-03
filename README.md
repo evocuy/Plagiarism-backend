@@ -122,3 +122,32 @@ setelah akun berhasil dibuat. Akun mahasiswa dan dosen dibuat oleh admin.
   - `POST /api/plagiarism/check` (Jalankan pemindaian plagiarisme dokumen)
   - `GET /api/plagiarism/reports/{document_id}` (Detail hasil analisis per dokumen)
   - `POST /api/plagiarism/approve/{document_id}` (Approval dosen)
+
+## Penyaringan judul dan posisi highlight
+
+Pemeriksaan baru mengabaikan judul struktur yang dikenali, seperti `BAB I`,
+`PENDAHULUAN`, `Latar Belakang`, dan subbab bernomor pendek. Penyaringan berlaku
+pada baris judul tersendiri; isi paragraf Bab I dan latar belakang tetap dihitung.
+Deteksi memakai pola judul umum, sehingga format judul khusus perlu dievaluasi
+dengan contoh PDF kampus. TF-IDF dan cosine similarity tetap menjadi algoritma
+skor dokumen. Skor tersebut menunjukkan kemiripan, bukan putusan plagiarisme.
+
+Highlight memakai posisi frasa pada teks halaman yang telah disaring dan
+koordinat kata PDF. Frasa sama di lokasi lain tidak otomatis ikut ditandai.
+Batas minimum kecocokan tetap 3 token hasil preprocessing dan kini berlaku juga
+pada jalur kalimat identik. Kalimat utuh memerlukan skor minimal 0.70 serta
+teks identik setelah normalisasi ringan; segmen frasa identik dapat ditandai
+di bawah skor kalimat itu. Angka tersebut adalah aturan teknis saat ini,
+bukan ambang resmi kampus. Menambah kata minimum perlu pengujian akurasi.
+
+Kolom posisi halaman ditambahkan oleh migrasi runtime saat startup API.
+Cache teks/kalimat lama diperbarui otomatis ketika dipakai untuk pemeriksaan
+baru; embedding lama tidak dipakai untuk memilih kandidat sampai cache korpus
+sesuai versi ekstraksi. Pemeriksaan pertama pada repositori lama dapat lebih
+lama karena pembaruan cache. Hasil dan PDF pemeriksaan terdahulu tetap menjadi
+riwayat; jalankan pemeriksaan baru untuk mendapatkan hasil dengan aturan ini.
+
+Frontend tetap dapat memakai endpoint hasil dan PDF yang sama. Respons detail
+kecocokan menambahkan `page_start_position` dan `page_end_position`, yaitu offset
+karakter pada teks halaman yang sudah disaring. Field `start_position` dan
+`end_position` tetap relatif terhadap kalimat asal.
