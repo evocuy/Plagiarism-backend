@@ -18,12 +18,14 @@ from app.models.schemas import (
 from app.services.pdf_service import PDFService
 from app.services.check_queue_service import CheckQueueService
 from app.services.similarity_result_service import SimilarityResultService
+from app.services.watermark_service import WatermarkService
 from app.routes.auth import get_current_user
 from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
 
 router = APIRouter()
 pdf_service = PDFService()
 similarity_result_service = SimilarityResultService()
+watermark_service = WatermarkService()
 
 class SingleCheckRequest(BaseModel):
     document_id: int
@@ -462,6 +464,10 @@ def _serialize_check_final_result(
 def _serialize_top_comparison(result: SimilarityResult, rank: int) -> dict:
     """Serialize one repository document for the history's top-three view."""
     source_title = result.source_document.title if result.source_document else None
+    pdf_available = bool(
+        result.source_document and is_comparison_source(result.source_document)
+        and watermark_service.resolve_source(result.source_document.file_path)
+    )
     page_numbers = sorted(
         {
             match.page_number
@@ -479,6 +485,12 @@ def _serialize_top_comparison(result: SimilarityResult, rank: int) -> dict:
         "matched_sentence_count": len(result.matches),
         "matched_page_numbers": page_numbers,
         "matched_page_count": len(page_numbers),
+        "pdf_available": pdf_available,
+        "pdf_watermarked": True,
+        "pdf_url": (
+            f"/api/plagiarism/check/{result.check_id}/sources/{result.source_document_id}/pdf"
+            if pdf_available else None
+        ),
     }
 
 
@@ -556,6 +568,35 @@ def get_check_top_matches(
             for rank, result in enumerate(top_results, start=1)
         ],
     }
+
+@router.get("/check/{check_id}/sources/{source_document_id}/pdf")
+def get_comparison_source_pdf(
+    check_id: int,
+    source_document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    check = _get_active_check(check_id, db)
+    if not check:
+        raise HTTPException(404, "Data pengecekan tidak ditemukan.")
+    if not _can_access_check(check, current_user, db):
+        raise HTTPException(403, "Anda tidak memiliki izin untuk melihat dokumen pembanding ini.")
+    if check.status != "completed":
+        raise HTTPException(409, "Dokumen pembanding tersedia setelah pengecekan selesai.")
+    top_results = _get_stored_check_results(check_id, db, limit=3)
+    result = next((item for item in top_results if item.source_document_id == source_document_id), None)
+    if not result or not result.source_document or not is_comparison_source(result.source_document):
+        raise HTTPException(404, "PDF pembanding tidak tersedia untuk hasil ini.")
+    source_path = watermark_service.resolve_source(result.source_document.file_path)
+    if source_path is None:
+        raise HTTPException(404, "PDF pembanding tidak tersedia untuk hasil ini.")
+    watermarked_path = watermark_service.get_pdf(source_path)
+    return FileResponse(
+        watermarked_path, media_type="application/pdf",
+        filename=f"pembanding-{source_document_id}-watermark.pdf", content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
 
 @router.get("/check/{check_id}/download-highlighted")
 def download_highlighted_pdf(

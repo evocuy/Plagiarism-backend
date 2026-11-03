@@ -70,6 +70,7 @@ def test_sensitive_plagiarism_routes_use_required_authentication():
         plagiarism_routes.get_check_matches,
         plagiarism_routes.get_check_top_matches,
         plagiarism_routes.download_highlighted_pdf,
+        plagiarism_routes.get_comparison_source_pdf,
     )
 
     for endpoint in protected_routes:

@@ -181,3 +181,23 @@ Frontend tetap dapat memakai endpoint hasil dan PDF yang sama. Respons detail
 kecocokan menambahkan `page_start_position` dan `page_end_position`, yaitu offset
 karakter pada teks halaman yang sudah disaring. Field `start_position` dan
 `end_position` tetap relatif terhadap kalimat asal.
+
+## PDF top tiga pembanding dengan watermark
+
+`GET /api/plagiarism/check/{check_id}/top-matches` menambahkan `pdf_available`,
+`pdf_watermarked`, dan `pdf_url` pada setiap hasil. Jika tersedia, `pdf_url`
+menunjuk ke `GET /api/plagiarism/check/{check_id}/sources/{source_document_id}/pdf`.
+Endpoint mengembalikan PDF inline dengan logo kampus transparan di setiap
+halaman. Hanya pemilik hasil atau admin yang dapat mengakses tiga sumber dengan
+skor tertinggi setelah proses selesai; sumber harus masih menjadi dokumen
+alumni yang aktif. Dokumen asli tidak diubah. Salinan watermark disimpan di
+`uploads/watermarked/` dan dipakai ulang; file lama di direktori tersebut dapat
+dihapus saat pemeliharaan karena akan dibuat kembali bila diperlukan.
+
+Frontend mengambil `pdf_url` dengan header `Authorization: Bearer <token>`,
+memeriksa status HTTP, lalu membuka atau menampilkan hasil `Blob` melalui object
+URL. Membuka URL langsung di tab baru tidak otomatis menyertakan token Bearer
+yang tersimpan di localStorage. Tangani `403`, `404`, `409`, `503`, dan `504`,
+serta revoke object URL ketika tidak diperlukan. Opsi backend
+`WATERMARK_MAX_CONCURRENT` (default 2) dan `WATERMARK_TIMEOUT_SECONDS`
+(default 120) membatasi pembuatan PDF pada proses terpisah.
