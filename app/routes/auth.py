@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
+from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAccessPolicy
 
 router = APIRouter()
 
@@ -93,6 +94,8 @@ def validate_auth_configuration() -> None:
     """Fail at startup if the JWT signing configuration is unsafe."""
     _jwt_secret_key()
     LoginThrottleService()
+    if StudentAccessPolicy.from_environment().provider == "sads":
+        SadsLoginSettings.from_environment()
 
 
 def _set_no_store(response: Response) -> None:
@@ -302,6 +305,13 @@ def get_current_user(
     if user.session_version != token_session_version:
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
 
+    if user.role == "mahasiswa":
+        policy = StudentAccessPolicy.from_environment()
+        if policy.provider == "sads" or user.auth_provider == "sads":
+            if policy.provider != "sads" or user.auth_provider != "sads":
+                raise _auth_exception("Metode login mahasiswa berubah. Silakan login kembali.")
+            policy.require_test_access(user.identifier)
+
     return user
 
 
@@ -356,10 +366,22 @@ def login(
     validate_auth_configuration()
     _set_no_store(response)
     user = None
+    sads_profile = None
+    policy = StudentAccessPolicy.from_environment()
 
     def verify_credentials() -> bool:
-        nonlocal user
+        nonlocal user, sads_profile
         user = db.query(User).filter(User.identifier == request.identifier).first()
+        # Campus credentials are never tried as a local administrator password.
+        # When SADS is selected, students have no local-password fallback.
+        is_local_admin = bool(user and user.role in ("admin", "super_admin") and user.auth_provider == "local")
+        if policy.provider == "sads" and not is_local_admin:
+            if user and (not user.is_active or user.role != "mahasiswa"):
+                return False
+            policy.require_test_access(request.identifier)
+            sads_profile = SadsAuthService().authenticate(request.identifier, request.password)
+            return sads_profile is not None
+
         stored_hash = user.password if user else _DUMMY_PASSWORD_HASH
         try:
             valid = password_hash.verify(request.password, stored_hash)
@@ -368,11 +390,14 @@ def login(
             # reset; they must never become an alternate password mechanism.
             password_hash.verify(request.password, _DUMMY_PASSWORD_HASH)
             valid = False
-        return bool(user and user.is_active and user.role in SUPPORTED_USER_ROLES and valid)
+        return bool(user and user.is_active and user.auth_provider == "local" and user.role in SUPPORTED_USER_ROLES and valid)
 
     throttle = LoginThrottleService()
     if not throttle.verify(db, request.identifier, throttle.client_ip(http_request), verify_credentials):
         raise _auth_exception("Identifier atau kata sandi tidak valid.")
+
+    if sads_profile is not None:
+        user = SadsAuthService.provision_student(db, sads_profile, password_hash.hash)
 
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
@@ -461,6 +486,15 @@ def update_user(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pengguna tidak ditemukan.",
+        )
+
+    if target_user.auth_provider == "sads" and (
+        (request.identifier and request.identifier != target_user.identifier)
+        or request.password is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="NIM dan kata sandi akun SADS dikelola melalui SADS.",
         )
 
     # Validasi identifier jika diubah

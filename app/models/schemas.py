@@ -36,6 +36,7 @@ class User(Base):
     identifier = Column(String(100), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, index=True)
+    auth_provider = Column(String(20), nullable=False, default="local", server_default=text("'local'"))
     # Retired demo accounts retain document/profile references but cannot log in.
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     # Incremented on login and logout so JWTs minted before the latest session

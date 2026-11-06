@@ -166,7 +166,13 @@ class LoginThrottleService:
                 )
 
             source.attempt_count += 1
-            valid = bool(verify_credentials())
+            try:
+                valid = bool(verify_credentials())
+            except HTTPException:
+                # Upstream outages and access-policy denials consume the IP
+                # budget, but are not evidence of an incorrect password.
+                db.commit()
+                raise
             if valid:
                 # A successful password clears failures without clearing the
                 # IP's total-attempt budget (which also limits password spray).
