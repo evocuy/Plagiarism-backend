@@ -4,7 +4,7 @@ Backend REST API untuk pemeriksaan kemiripan dokumen berbasis FastAPI, PostgreSQ
 
 Panduan deployment dan batas resource: [deployment/HARDENING.md](deployment/HARDENING.md).
 
-Uji lokal login mahasiswa SADS dan izin NIM sementara:
+Uji login mahasiswa SADS tanpa pembatasan mata kuliah sementara:
 [deployment/SADS_LOGIN_PILOT.md](deployment/SADS_LOGIN_PILOT.md).
 
 ---

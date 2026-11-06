@@ -1,9 +1,9 @@
-"""Opt-in SADS login and temporary, manually approved student access.
+"""Opt-in SADS student login without course restrictions during the login trial.
 
 Only the supplied POST JSON contract and active role are interpreted here.
-The meanings of id1, id2 and sbt are deliberately not inferred. Until the KRS
-API is available, a time-limited username list is a manual testing permission,
-not evidence that a student is enrolled in a particular course.
+The meanings of id1, id2 and sbt are deliberately not inferred. Successful
+authentication is not evidence of enrolment in a particular course. The retired
+pilot username list and access deadline are no longer read.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from http.client import HTTPException as HTTPClientError
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -36,51 +35,15 @@ def auth_error(status_code: int, detail: str) -> HTTPException:
 
 
 @dataclass(frozen=True)
-class StudentAccessPolicy:
+class StudentAuthSettings:
     provider: str = "local"
-    allowed_usernames: frozenset[str] = frozenset()
-    expires_at: datetime | None = None
 
     @classmethod
-    def from_environment(cls) -> "StudentAccessPolicy":
+    def from_environment(cls) -> "StudentAuthSettings":
         provider = os.getenv("STUDENT_AUTH_PROVIDER", "local").strip().lower()
         if provider not in {"local", "sads"}:
             raise RuntimeError("STUDENT_AUTH_PROVIDER harus local atau sads.")
-        if provider == "local":
-            return cls()
-        allowed = frozenset(
-            item.strip()
-            for item in os.getenv("SADS_TEST_ALLOWED_USERNAMES", "").split(",")
-            if item.strip()
-        )
-        if any(not re.fullmatch(r"[0-9]{1,100}", item) for item in allowed):
-            raise RuntimeError("SADS_TEST_ALLOWED_USERNAMES harus berisi NIM, dipisahkan koma.")
-        expiry = os.getenv("SADS_TEST_ACCESS_EXPIRES_AT", "").strip()
-        expires_at = None
-        if expiry:
-            try:
-                expires_at = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-                if expires_at.tzinfo is None:
-                    raise ValueError
-                expires_at = expires_at.astimezone(timezone.utc)
-            except ValueError:
-                raise RuntimeError(
-                    "SADS_TEST_ACCESS_EXPIRES_AT harus berupa waktu ISO 8601 dengan zona waktu."
-                ) from None
-        return cls(provider, allowed, expires_at)
-
-    def require_test_access(self, username: str) -> None:
-        if (
-            self.provider != "sads"
-            or username not in self.allowed_usernames
-            or self.expires_at is None
-            or self.expires_at <= datetime.now(timezone.utc)
-        ):
-            raise auth_error(
-                403,
-                "Akses mahasiswa belum diizinkan. Verifikasi mata kuliah aktif belum tersedia; "
-                "hubungi admin untuk izin uji sementara.",
-            )
+        return cls(provider)
 
 
 @dataclass(frozen=True)

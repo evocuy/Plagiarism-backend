@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
-from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAccessPolicy
+from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
 
 router = APIRouter()
 
@@ -94,7 +94,7 @@ def validate_auth_configuration() -> None:
     """Fail at startup if the JWT signing configuration is unsafe."""
     _jwt_secret_key()
     LoginThrottleService()
-    if StudentAccessPolicy.from_environment().provider == "sads":
+    if StudentAuthSettings.from_environment().provider == "sads":
         SadsLoginSettings.from_environment()
 
 
@@ -306,11 +306,10 @@ def get_current_user(
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
 
     if user.role == "mahasiswa":
-        policy = StudentAccessPolicy.from_environment()
-        if policy.provider == "sads" or user.auth_provider == "sads":
-            if policy.provider != "sads" or user.auth_provider != "sads":
+        student_auth = StudentAuthSettings.from_environment()
+        if student_auth.provider == "sads" or user.auth_provider == "sads":
+            if student_auth.provider != "sads" or user.auth_provider != "sads":
                 raise _auth_exception("Metode login mahasiswa berubah. Silakan login kembali.")
-            policy.require_test_access(user.identifier)
 
     return user
 
@@ -369,7 +368,7 @@ def login(
     sads_profile = None
     used_sads_login = False
     sads_denial = None
-    policy = StudentAccessPolicy.from_environment()
+    student_auth = StudentAuthSettings.from_environment()
 
     def verify_credentials() -> bool:
         nonlocal user, sads_profile, used_sads_login, sads_denial
@@ -377,10 +376,9 @@ def login(
         # Campus credentials are never tried as a local administrator password.
         # When SADS is selected, students have no local-password fallback.
         is_local_admin = bool(user and user.role in ("admin", "super_admin") and user.auth_provider == "local")
-        if policy.provider == "sads" and not is_local_admin:
+        if student_auth.provider == "sads" and not is_local_admin:
             if user and (not user.is_active or user.role != "mahasiswa"):
                 return False
-            policy.require_test_access(request.identifier)
             used_sads_login = True
             try:
                 sads_profile = SadsAuthService().authenticate(request.identifier, request.password)

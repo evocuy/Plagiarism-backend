@@ -5,11 +5,19 @@ dimiliki kampus. Endpoint dan kredensial integrasi cukup diisi sendiri di
 `backend/.env`; jangan dibagikan melalui chat atau dimasukkan ke Git. VM baru
 diperbarui setelah pengguna push dan secara eksplisit meminta deployment.
 
-API mata kuliah aktif belum tersedia. Akses mahasiswa untuk pilot memakai
-daftar NIM yang disetujui manual dan waktu kedaluwarsa. Ini **bukan verifikasi
-KRS**. Daftar kosong, tenggat kosong, atau tenggat lewat selalu menolak akses
-mahasiswa. Daftar dan tenggat diperiksa setiap request berautentikasi, termasuk
-pada token yang sudah diterbitkan. Role dosen dan review lokal tidak ditambah.
+Sesuai permintaan uji login, pembatasan mata kuliah dan izin NIM sementara
+dihapus. Semua akun dengan kredensial SADS valid dan role aktif `Mahasiswa`
+dapat mengakses aplikasi, termasuk yang belum mengambil seminar proposal atau
+skripsi. Ini **bukan verifikasi KRS**. Autentikasi, status akun aktif, masa
+berlaku JWT, dan batas percobaan login tetap diterapkan. Role dosen dan review
+tetap ditangani di SADS, tanpa menambah alur dosen di aplikasi ini.
+
+`SADS_TEST_ALLOWED_USERNAMES` dan `SADS_TEST_ACCESS_EXPIRES_AT` sudah tidak
+dibaca. Nilai lama yang masih ada di `.env` tidak membatasi login atau sesi;
+tidak perlu mengedit `.env` untuk menerapkan perubahan ini. Nilai tersebut boleh
+dihapus sendiri saat pemilik konfigurasi merapikannya. Implementasi dan tes
+dilakukan lokal; tidak perlu membuka `.env` VM atau melakukan request nyata ke
+SADS untuk memverifikasi perubahan kebijakan ini.
 
 ## Konfigurasi
 
@@ -20,8 +28,6 @@ STUDENT_AUTH_PROVIDER=sads
 SADS_LOGIN_URL=
 SADS_LOGIN_TIMEOUT_SECONDS=10
 SADS_LOGIN_HEADERS_JSON={}
-SADS_TEST_ALLOWED_USERNAMES=
-SADS_TEST_ACCESS_EXPIRES_AT=
 ```
 
 - `SADS_LOGIN_URL`: URL HTTPS **lengkap** endpoint login resmi, diisi sendiri.
@@ -33,11 +39,6 @@ SADS_TEST_ACCESS_EXPIRES_AT=
   Default User-Agent mengidentifikasi aplikasi sebagai
   `INSTIKI-SimilarityChecker/1.0`, bukan identitas bawaan library Python.
   Header User-Agent yang diwajibkan kampus dapat diisi melalui object ini.
-- `SADS_TEST_ALLOWED_USERNAMES`: NIM/username yang boleh menguji, dipisahkan
-  koma, tanpa wildcard. Username SADS telah dikonfirmasi merupakan NIM.
-- `SADS_TEST_ACCESS_EXPIRES_AT`: tenggat uji yang dipilih admin dalam ISO 8601
-  dengan zona waktu, misalnya tanggal yang diinginkan diikuti
-  `T23:59:59+08:00`. Nilai kosong menolak mahasiswa.
 
 Restart backend lokal setelah mengubah `.env`. Untuk Uvicorn lokal melalui
 HTTP, pastikan `SESSION_COOKIE_SECURE=false` dan `SESSION_COOKIE_SAMESITE=lax`;
@@ -61,7 +62,7 @@ Content-Type: application/json
 
 Backend memetakan `identifier` ke `username` ketika memanggil SADS. Akun admin
 lokal tetap diverifikasi di database lokal dan tidak dikirim ke SADS. Untuk
-mahasiswa, backend mengecek izin uji, memvalidasi respons login SADS, menyimpan
+mahasiswa, backend memvalidasi respons login SADS dan role aktif, menyimpan
 profil seperlunya, lalu mengembalikan JWT dan cookie sesi lokal seperti biasa.
 Respons tetap `{"token":"...","user":{...}}`.
 
@@ -82,8 +83,8 @@ edit pengguna lokal. Migrasi runtime hanya menambah `users.auth_provider`
 dengan default `local`; tidak menghapus akun, dokumen, atau hasil.
 
 Login/logout tetap merotasi versi sesi; throttle akun/IP tetap berlaku. Gangguan
-SADS, blokir perantara, atau penolakan izin manual menghabiskan kuota percobaan
-IP, tetapi tidak menambah penghitung kegagalan autentikasi akun. HTTP 401 dan
+SADS atau blokir perantara menghabiskan kuota percobaan IP, tetapi tidak
+menambah penghitung kegagalan autentikasi akun. HTTP 401 dan
 penolakan terstruktur 403 tetap dihitung sebagai login gagal. Penolakan role
 aktif selain mahasiswa juga tetap ditolak. Adapter tidak melakukan retry login
 otomatis. Error hanya memuat status HTTP dan arahan umum; URL, header, dan isi
@@ -94,7 +95,7 @@ Status yang perlu ditangani frontend:
 | Status | Arti |
 | --- | --- |
 | 401 | Autentikasi ditolak SADS (HTTP 401), kredensial lokal ditolak, atau sesi tidak berlaku |
-| 403 | Izin uji tidak aktif, role bukan mahasiswa, atau SADS menolak akses dengan respons JSON HTTP 403 |
+| 403 | Role bukan mahasiswa, akun tidak dapat ditautkan, atau SADS menolak akses dengan respons JSON HTTP 403 |
 | 409 | Akun sedang diperbarui oleh login bersamaan; ulangi login |
 | 429 | Batas percobaan login backend tercapai; ikuti Retry-After |
 | 502 | Respons SADS tidak sesuai contoh JSON atau request ditolak dengan HTTP 4xx selain 401/403/429 |
@@ -122,16 +123,17 @@ dengan tim SADS bila penolakan berlanjut.
 
 Pengujian otomatis menggunakan respons SADS tiruan, akun sintetis, dan database
 SQLite terisolasi. Termasuk penolakan role lain, tidak adanya fallback lokal,
-izin kedaluwarsa/dicabut, preservasi histori, redaksi error, kegagalan jaringan,
-batas percobaan, dan penolakan redirect dengan server HTTP loopback untuk test.
+login beberapa mahasiswa tanpa daftar izin, pengabaian daftar/tenggat lama,
+pemisahan akun dan sesi mahasiswa, preservasi histori, redaksi error, kegagalan
+jaringan, batas percobaan, serta penolakan redirect dengan server HTTP loopback.
 Tidak ada request ke endpoint SADS asli dalam suite tersebut.
 
 Setelah mengisi konfigurasi sendiri, uji dari Insomnia ke backend lokal dengan
-NIM yang diizinkan. Periksa login benar, password salah, NIM di luar daftar,
-`GET /api/auth/me`, dan logout. Bila muncul 502, cocokkan bentuk respons tanpa
+beberapa NIM mahasiswa. Periksa login benar, password salah, penolakan role
+selain mahasiswa, `GET /api/auth/me`, dan logout. Bila muncul 502, cocokkan bentuk respons tanpa
 membagikan credential/token. Jangan menyalin response mahasiswa asli ke Git.
 
 Pilot ini belum mencakup API mata kuliah, pengiriman hasil ke SADS, pemetaan
 pembimbing, atau review. Dokumen mahasiswa tetap privat dan tidak otomatis
-masuk repositori pembanding. Sebelum dibuka untuk mahasiswa secara umum, ganti
-izin manual dengan validasi KRS resmi beserta pemetaan kode mata kuliahnya.
+masuk repositori pembanding. Validasi KRS resmi beserta pemetaan kode mata
+kuliah ditambahkan setelah kontrak API tersedia dan pekerjaan itu diminta.

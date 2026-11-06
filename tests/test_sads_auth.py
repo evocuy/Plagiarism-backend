@@ -61,8 +61,8 @@ def environment(monkeypatch):
     monkeypatch.setenv("SADS_LOGIN_URL", "https://campus.example.invalid/private-login")
     monkeypatch.setenv("SADS_LOGIN_TIMEOUT_SECONDS", "10")
     monkeypatch.setenv("SADS_LOGIN_HEADERS_JSON", json.dumps({"X-API-Key": PRIVATE_VALUE}))
-    monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", NIM)
-    monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "2099-01-01T00:00:00+08:00")
+    monkeypatch.delenv("SADS_TEST_ALLOWED_USERNAMES", raising=False)
+    monkeypatch.delenv("SADS_TEST_ACCESS_EXPIRES_AT", raising=False)
     monkeypatch.setenv("LOGIN_ACCOUNT_MAX_FAILURES", "5")
     monkeypatch.setenv("LOGIN_IP_MAX_ATTEMPTS", "30")
     monkeypatch.setattr(auth, "JWT_SECRET_KEY", "sads-tests-only-secret-which-is-more-than-32-characters")
@@ -118,31 +118,37 @@ def test_login_uses_post_json_and_local_session_without_sads_secrets(environment
     assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {body['token']}")[0] == 401
 
 
-@pytest.mark.parametrize("permission", ["unlisted", "empty", "missing_deadline", "expired"])
-def test_manual_permission_denied_before_contacting_sads(environment, monkeypatch, permission):
+@pytest.mark.parametrize("legacy_settings", ["missing", "other_nim_only", "empty", "expired", "invalid"])
+def test_sads_student_login_has_no_manual_nim_or_enrolment_gate(environment, monkeypatch, legacy_settings):
     app, db, opener = environment
-    if permission == "unlisted":
-        username = "2400000002"
-    else:
-        username = NIM
-        if permission == "empty":
-            monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", "")
-        elif permission == "missing_deadline":
-            monkeypatch.delenv("SADS_TEST_ACCESS_EXPIRES_AT")
-        else:
-            monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "2020-01-01T00:00:00Z")
+    username = "2400000002"
+    if legacy_settings == "other_nim_only":
+        monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", NIM)
+        monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "2099-01-01T00:00:00Z")
+    elif legacy_settings == "empty":
+        monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", "")
+        monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "")
+    elif legacy_settings == "expired":
+        monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", username)
+        monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "2020-01-01T00:00:00Z")
+    elif legacy_settings == "invalid":
+        monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", "retired-setting")
+        monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "retired-setting")
     code, headers, body = login(app, username)
-    assert code == 403
+    assert code == 200
     assert headers["cache-control"] == "no-store"
-    assert "mata kuliah" in body["detail"]
-    assert not opener.requests
-    assert db.query(User).count() == 0
+    assert body["user"]["identifier"] == username
+    assert body["user"]["role"] == "mahasiswa"
+    assert len(opener.requests) == 1
+    assert json.loads(opener.requests[0][0].data)["username"] == username
+    assert db.query(User).count() == 1
+    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {body['token']}")[0] == 200
     assert db.query(LoginThrottle).filter(LoginThrottle.key.like("ip:%")).one().attempt_count == 1
     assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 0
 
 
-@pytest.mark.parametrize("change", ["removed", "expired", "disabled"])
-def test_existing_student_session_respects_permission_changes(environment, monkeypatch, change):
+@pytest.mark.parametrize("change", ["removed", "expired", "invalid", "disabled"])
+def test_student_session_uses_auth_provider_and_ignores_retired_pilot_limits(environment, monkeypatch, change):
     app, _, _ = environment
     _, _, body = login(app)
     token = body["token"]
@@ -150,14 +156,29 @@ def test_existing_student_session_respects_permission_changes(environment, monke
         monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", "")
     elif change == "expired":
         monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "2020-01-01T00:00:00Z")
+    elif change == "invalid":
+        monkeypatch.setenv("SADS_TEST_ALLOWED_USERNAMES", "retired-setting")
+        monkeypatch.setenv("SADS_TEST_ACCESS_EXPIRES_AT", "retired-setting")
     else:
         monkeypatch.setenv("STUDENT_AUTH_PROVIDER", "local")
-    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {token}")[0] == (401 if change == "disabled" else 403)
+    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {token}")[0] == (401 if change == "disabled" else 200)
 
 
-def test_active_role_must_be_mahasiswa_even_if_role_list_contains_it(environment):
+def test_two_sads_students_keep_separate_accounts_and_valid_sessions(environment):
+    app, db, _ = environment
+    first_code, _, first = login(app)
+    second_code, _, second = login(app, "2400000002")
+    assert first_code == second_code == 200
+    assert first["user"]["id"] != second["user"]["id"]
+    assert db.query(User).count() == 2
+    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {first['token']}")[2]["identifier"] == NIM
+    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {second['token']}")[2]["identifier"] == "2400000002"
+
+
+@pytest.mark.parametrize("active_role", ["Admin", "Dosen"])
+def test_active_role_must_be_mahasiswa_even_if_role_list_contains_it(environment, active_role):
     app, db, opener = environment
-    opener.payload["role"]["name"] = "Admin"
+    opener.payload["role"]["name"] = active_role
     code, _, body = login(app)
     assert code == 403
     assert db.query(User).count() == 0
