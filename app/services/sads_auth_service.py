@@ -155,9 +155,10 @@ class SadsAuthService:
             self.settings.url,
             data=json.dumps({"username": username, "password": password}).encode("utf-8"),
             headers={
-                **dict(self.settings.extra_headers),
+                "User-Agent": "INSTIKI-SimilarityChecker/1.0",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                **dict(self.settings.extra_headers),
             },
             method="POST",
         )
@@ -168,10 +169,43 @@ class SadsAuthService:
                 content = response.read(self.max_response_bytes + 1)
         except HTTPError as error:
             code = error.code
+            headers = error.headers or {}
+            media_type = headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            json_response = media_type == "application/json" or media_type.endswith("+json")
+            challenge = headers.get("cf-mitigated", "").lower() == "challenge"
             error.close()
-            if code in {401, 403}:
+            # A gateway denial must not become a wrong-password response or
+            # consume the student's failed-authentication budget. Inspect only
+            # status/content type; never expose response bodies or headers.
+            if challenge or (code == 403 and not json_response):
+                raise auth_error(
+                    503,
+                    f"Server/perantara SADS menolak request login (HTTP {code}). "
+                    "Periksa izin akses server dan header integrasi.",
+                ) from None
+            if code == 401:
                 return None
-            raise auth_error(503, "Login SADS sementara tidak tersedia. Silakan coba kembali.") from None
+            if code == 403:
+                raise auth_error(
+                    403,
+                    "SADS menolak akses login (HTTP 403). "
+                    "Periksa izin akun dan header integrasi yang diwajibkan SADS.",
+                ) from None
+            if 300 <= code < 400:
+                raise auth_error(
+                    503,
+                    f"Endpoint login SADS mengarahkan request (HTTP {code}). "
+                    "Cocokkan URL endpoint final di Insomnia; redirect tidak diikuti.",
+                ) from None
+            if code == 429:
+                raise auth_error(503, "SADS membatasi request login (HTTP 429). Tunggu sebelum mencoba kembali.") from None
+            if 400 <= code < 500:
+                raise auth_error(
+                    502,
+                    f"SADS menolak request login (HTTP {code}). "
+                    "Cocokkan method, format JSON, dan header yang diwajibkan di Insomnia.",
+                ) from None
+            raise auth_error(503, f"Login SADS sementara tidak tersedia (HTTP {code}). Silakan coba kembali.") from None
         except (URLError, OSError, HTTPClientError, ValueError):
             raise auth_error(503, "Login SADS sementara tidak tersedia. Silakan coba kembali.") from None
         if len(content) > self.max_response_bytes:

@@ -30,6 +30,9 @@ SADS_TEST_ACCESS_EXPIRES_AT=
 - `SADS_LOGIN_HEADERS_JSON`: header autentikasi tambahan jika diwajibkan SADS.
   Contoh bentuk tanpa secret: `{"X-API-Key":"isi-sendiri-di-env"}`. Header ini
   hanya dikirim backend. TLS tetap diverifikasi dan redirect ditolak.
+  Default User-Agent mengidentifikasi aplikasi sebagai
+  `INSTIKI-SimilarityChecker/1.0`, bukan identitas bawaan library Python.
+  Header User-Agent yang diwajibkan kampus dapat diisi melalui object ini.
 - `SADS_TEST_ALLOWED_USERNAMES`: NIM/username yang boleh menguji, dipisahkan
   koma, tanpa wildcard. Username SADS telah dikonfirmasi merupakan NIM.
 - `SADS_TEST_ACCESS_EXPIRES_AT`: tenggat uji yang dipilih admin dalam ISO 8601
@@ -79,24 +82,41 @@ edit pengguna lokal. Migrasi runtime hanya menambah `users.auth_provider`
 dengan default `local`; tidak menghapus akun, dokumen, atau hasil.
 
 Login/logout tetap merotasi versi sesi; throttle akun/IP tetap berlaku. Gangguan
-SADS atau penolakan izin manual menghabiskan kuota percobaan IP, tetapi tidak
-dianggap password salah. Adapter tidak melakukan retry login otomatis.
+SADS, blokir perantara, atau penolakan izin manual menghabiskan kuota percobaan
+IP, tetapi tidak menambah penghitung kegagalan autentikasi akun. HTTP 401 dan
+penolakan terstruktur 403 tetap dihitung sebagai login gagal. Penolakan role
+aktif selain mahasiswa juga tetap ditolak. Adapter tidak melakukan retry login
+otomatis. Error hanya memuat status HTTP dan arahan umum; URL, header, dan isi
+response privat SADS tidak disertakan.
 
 Status yang perlu ditangani frontend:
 
 | Status | Arti |
 | --- | --- |
-| 401 | Kredensial ditolak (HTTP 401/403 upstream) atau sesi tidak berlaku |
-| 403 | Izin uji tidak aktif, akun nonaktif, atau role aktif bukan mahasiswa |
+| 401 | Autentikasi ditolak SADS (HTTP 401), kredensial lokal ditolak, atau sesi tidak berlaku |
+| 403 | Izin uji tidak aktif, role bukan mahasiswa, atau SADS menolak akses dengan respons JSON HTTP 403 |
 | 409 | Akun sedang diperbarui oleh login bersamaan; ulangi login |
 | 429 | Batas percobaan login backend tercapai; ikuti Retry-After |
-| 502 | Respons SADS tidak sesuai contoh JSON; tidak ada sesi yang diterbitkan |
-| 503 | SADS tidak dapat dihubungi, timeout, redirect, atau gangguan upstream |
+| 502 | Respons SADS tidak sesuai contoh JSON atau request ditolak dengan HTTP 4xx selain 401/403/429 |
+| 503 | SADS tidak terjangkau, timeout, redirect, HTTP 429/5xx, atau blokir HTTP 403 non-JSON/challenge |
 
-Kontrak respons **login gagal** dari SADS belum diberikan. Adapter menganggap
-HTTP 401/403 sebagai kredensial ditolak. Respons 2xx tanpa profil valid ditolak
-dengan 502; setelah pola gagal resmi diketahui, pemetaannya dapat disesuaikan.
-Jangan melonggarkan validasi menjadi "semua HTTP 200 berarti berhasil".
+Kontrak respons **login gagal** dari SADS belum diberikan. HTTP 401 dilaporkan
+sebagai autentikasi ditolak; penyebab bisa kredensial mahasiswa maupun header
+integrasi yang kurang. HTTP 403 JSON dilaporkan sebagai akses ditolak tanpa
+menyatakan password salah. HTTP 403 non-JSON/challenge dianggap penolakan
+server/perantara, bukan kegagalan password. Respons 2xx tanpa profil valid
+ditolak dengan 502. Setelah pola gagal resmi diketahui, pemetaannya dapat
+disesuaikan. Jangan melonggarkan validasi menjadi "semua HTTP 200 berarti berhasil".
+
+Pada investigasi awal, client Python bawaan menerima HTTP 403/error 1010 dari
+domain publik backend, sedangkan client dengan User-Agent aplikasi mendapat
+200. Itu **belum membuktikan** endpoint SADS mengalami hal yang sama. Cloudflare
+mendokumentasikan bahwa identitas bawaan urllib bisa ditolak dan menyarankan
+identitas aplikasi yang jelas:
+[Error 1010](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/).
+Jangan menonaktifkan TLS, melewati challenge, mengubah firewall, atau mencoba
+berulang-ulang untuk mengatasi penolakan. Cocokkan kontrak resmi/izin integrasi
+dengan tim SADS bila penolakan berlanjut.
 
 ## Verifikasi
 

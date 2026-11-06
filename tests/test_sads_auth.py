@@ -99,6 +99,7 @@ def test_login_uses_post_json_and_local_session_without_sads_secrets(environment
     assert outgoing.method == "POST"
     assert json.loads(outgoing.data) == {"username": NIM, "password": PASSWORD}
     assert outgoing.get_header("Content-type") == "application/json"
+    assert outgoing.get_header("User-agent") == "INSTIKI-SimilarityChecker/1.0"
     assert outgoing.get_header("X-api-key") == PRIVATE_VALUE
     assert timeout == 10
     assert body["user"]["identifier"] == NIM
@@ -195,6 +196,79 @@ def test_sads_unavailability_is_redacted_and_keeps_ip_budget(environment, caplog
     assert PRIVATE_VALUE not in json.dumps(body) + caplog.text
     assert PASSWORD not in json.dumps(body) + caplog.text
     assert db.query(LoginThrottle).filter(LoginThrottle.key.like("ip:%")).one().attempt_count == 1
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 0
+
+
+@pytest.mark.parametrize("content_type", ["text/html", "text/plain", ""])
+def test_non_json_forbidden_reports_upstream_block_without_counting_bad_passwords(environment, caplog, content_type):
+    app, db, opener = environment
+    opener.error = HTTPError(
+        "https://private.invalid/login?secret=" + PRIVATE_VALUE,
+        403, "Forbidden", {"Content-Type": content_type, "Server": "cloudflare"},
+        io.BytesIO(("error code: 1010 " + PRIVATE_VALUE + PASSWORD).encode()),
+    )
+    code, headers, body = login(app)
+    assert code == 503
+    assert "HTTP 403" in body["detail"]
+    assert "kata sandi tidak valid" not in body["detail"]
+    assert "set-cookie" not in headers
+    assert PRIVATE_VALUE not in json.dumps(body) + caplog.text
+    assert PASSWORD not in json.dumps(body) + caplog.text
+    assert "private.invalid" not in json.dumps(body) + caplog.text
+    assert db.query(User).count() == 0
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 0
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("ip:%")).one().attempt_count == 1
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "application/problem+json; charset=utf-8"])
+def test_json_forbidden_reports_upstream_denial_without_claiming_wrong_password(environment, content_type):
+    app, db, opener = environment
+    opener.error = HTTPError(
+        "https://private.invalid/login", 403, "Forbidden", {"Content-Type": content_type},
+        io.BytesIO(json.dumps({"private_error": PRIVATE_VALUE}).encode()),
+    )
+    code, headers, body = login(app)
+    assert code == 403
+    assert "HTTP 403" in body["detail"]
+    assert PRIVATE_VALUE not in json.dumps(body)
+    assert "set-cookie" not in headers
+    assert db.query(User).count() == 0
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 1
+
+
+def test_rejected_sads_authentication_labels_upstream_401_and_counts_failure(environment):
+    app, db, opener = environment
+    opener.error = HTTPError("https://private.invalid", 401, "Unauthorized", {}, io.BytesIO())
+    code, _, body = login(app)
+    assert code == 401
+    assert "SADS" in body["detail"]
+    assert "HTTP 401" in body["detail"]
+    assert db.query(User).count() == 0
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 1
+
+
+@pytest.mark.parametrize("header_name", ["User-Agent", "user-agent"])
+def test_explicit_user_agent_header_can_override_application_identity(environment, monkeypatch, header_name):
+    app, _, opener = environment
+    monkeypatch.setenv("SADS_LOGIN_HEADERS_JSON", json.dumps({header_name: "CampusApprovedClient/1.0"}))
+    assert login(app)[0] == 200
+    assert opener.requests[0][0].get_header("User-agent") == "CampusApprovedClient/1.0"
+
+
+@pytest.mark.parametrize("status", [302, 422, 429, 500])
+def test_upstream_failures_report_only_status_without_secrets(environment, status):
+    app, db, opener = environment
+    opener.error = HTTPError(
+        "https://private.invalid/?token=" + PRIVATE_VALUE, status, "private reason " + PRIVATE_VALUE,
+        {}, io.BytesIO(PRIVATE_VALUE.encode()),
+    )
+    code, headers, body = login(app)
+    assert code in {502, 503}
+    assert f"HTTP {status}" in body["detail"]
+    assert "set-cookie" not in headers
+    assert PRIVATE_VALUE not in json.dumps(body)
+    assert "private.invalid" not in json.dumps(body)
+    assert db.query(User).count() == 0
     assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 0
 
 

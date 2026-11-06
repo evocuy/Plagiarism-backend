@@ -367,10 +367,12 @@ def login(
     _set_no_store(response)
     user = None
     sads_profile = None
+    used_sads_login = False
+    sads_denial = None
     policy = StudentAccessPolicy.from_environment()
 
     def verify_credentials() -> bool:
-        nonlocal user, sads_profile
+        nonlocal user, sads_profile, used_sads_login, sads_denial
         user = db.query(User).filter(User.identifier == request.identifier).first()
         # Campus credentials are never tried as a local administrator password.
         # When SADS is selected, students have no local-password fallback.
@@ -379,7 +381,16 @@ def login(
             if user and (not user.is_active or user.role != "mahasiswa"):
                 return False
             policy.require_test_access(request.identifier)
-            sads_profile = SadsAuthService().authenticate(request.identifier, request.password)
+            used_sads_login = True
+            try:
+                sads_profile = SadsAuthService().authenticate(request.identifier, request.password)
+            except HTTPException as error:
+                if error.status_code != 403:
+                    raise
+                # A structured rejection is still a failed login and retains
+                # account throttling, but does not claim the password is wrong.
+                sads_denial = error
+                return False
             return sads_profile is not None
 
         stored_hash = user.password if user else _DUMMY_PASSWORD_HASH
@@ -394,6 +405,13 @@ def login(
 
     throttle = LoginThrottleService()
     if not throttle.verify(db, request.identifier, throttle.client_ip(http_request), verify_credentials):
+        if sads_denial is not None:
+            raise sads_denial
+        if used_sads_login:
+            raise _auth_exception(
+                "SADS menolak autentikasi (HTTP 401). "
+                "Periksa NIM, kata sandi, dan header integrasi yang diwajibkan SADS."
+            )
         raise _auth_exception("Identifier atau kata sandi tidak valid.")
 
     if sads_profile is not None:
