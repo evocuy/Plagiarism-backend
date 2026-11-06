@@ -148,6 +148,10 @@ class SadsAuthService:
                 ) from None
             if code == 401:
                 return None
+            if code == 422:
+                # SADS returned 422 for an intentionally incorrect password.
+                # Keep this a client validation error; never expose its body.
+                raise auth_error(422, "Data login tidak valid. Periksa NIM dan kata sandi Anda.") from None
             if code == 403:
                 raise auth_error(
                     403,

@@ -84,8 +84,8 @@ dengan default `local`; tidak menghapus akun, dokumen, atau hasil.
 
 Login/logout tetap merotasi versi sesi; throttle akun/IP tetap berlaku. Gangguan
 SADS atau blokir perantara menghabiskan kuota percobaan IP, tetapi tidak
-menambah penghitung kegagalan autentikasi akun. HTTP 401 dan
-penolakan terstruktur 403 tetap dihitung sebagai login gagal. Penolakan role
+menambah penghitung kegagalan autentikasi akun. HTTP 401, penolakan terstruktur
+403, dan penolakan validasi 422 tetap dihitung sebagai login gagal. Penolakan role
 aktif selain mahasiswa juga tetap ditolak. Adapter tidak melakukan retry login
 otomatis. Error hanya memuat status HTTP dan arahan umum; URL, header, dan isi
 response privat SADS tidak disertakan.
@@ -97,17 +97,24 @@ Status yang perlu ditangani frontend:
 | 401 | Autentikasi ditolak SADS (HTTP 401), kredensial lokal ditolak, atau sesi tidak berlaku |
 | 403 | Role bukan mahasiswa, akun tidak dapat ditautkan, atau SADS menolak akses dengan respons JSON HTTP 403 |
 | 409 | Akun sedang diperbarui oleh login bersamaan; ulangi login |
+| 422 | Data login ditolak SADS; pesan aman meminta pengguna memeriksa NIM dan kata sandi |
 | 429 | Batas percobaan login backend tercapai; ikuti Retry-After |
-| 502 | Respons SADS tidak sesuai contoh JSON atau request ditolak dengan HTTP 4xx selain 401/403/429 |
+| 502 | Respons SADS tidak sesuai contoh JSON atau request ditolak dengan HTTP 4xx selain 401/403/422/429 |
 | 503 | SADS tidak terjangkau, timeout, redirect, HTTP 429/5xx, atau blokir HTTP 403 non-JSON/challenge |
 
 Kontrak respons **login gagal** dari SADS belum diberikan. HTTP 401 dilaporkan
 sebagai autentikasi ditolak; penyebab bisa kredensial mahasiswa maupun header
 integrasi yang kurang. HTTP 403 JSON dilaporkan sebagai akses ditolak tanpa
 menyatakan password salah. HTTP 403 non-JSON/challenge dianggap penolakan
-server/perantara, bukan kegagalan password. Respons 2xx tanpa profil valid
-ditolak dengan 502. Setelah pola gagal resmi diketahui, pemetaannya dapat
-disesuaikan. Jangan melonggarkan validasi menjadi "semua HTTP 200 berarti berhasil".
+server/perantara, bukan kegagalan password. Dalam satu uji VM dengan password
+tiruan, SADS mengembalikan HTTP 422. Backend mempertahankan status 422 dengan
+pesan `Data login tidak valid. Periksa NIM dan kata sandi Anda.`; status ini
+tidak lagi diubah menjadi 502/gangguan server. Detail/body privat SADS tetap
+tidak diteruskan. Ini juga mempertahankan batas lima login gagal per akun sesuai
+konfigurasi. Login gagal tidak mengubah profil, password lokal, atau sesi yang
+sudah valid. Respons 2xx tanpa profil valid ditolak dengan 502. Setelah pola
+gagal resmi lainnya diketahui, pemetaannya dapat disesuaikan. Jangan melonggarkan
+validasi menjadi "semua HTTP 200 berarti berhasil".
 
 Pada investigasi awal, client Python bawaan menerima HTTP 403/error 1010 dari
 domain publik backend, sedangkan client dengan User-Agent aplikasi mendapat

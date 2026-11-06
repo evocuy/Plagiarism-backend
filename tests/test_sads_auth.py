@@ -276,7 +276,7 @@ def test_explicit_user_agent_header_can_override_application_identity(environmen
     assert opener.requests[0][0].get_header("User-agent") == "CampusApprovedClient/1.0"
 
 
-@pytest.mark.parametrize("status", [302, 422, 429, 500])
+@pytest.mark.parametrize("status", [302, 429, 500])
 def test_upstream_failures_report_only_status_without_secrets(environment, status):
     app, db, opener = environment
     opener.error = HTTPError(
@@ -291,6 +291,52 @@ def test_upstream_failures_report_only_status_without_secrets(environment, statu
     assert "private.invalid" not in json.dumps(body)
     assert db.query(User).count() == 0
     assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 0
+
+
+@pytest.mark.parametrize("error_body", [b"", json.dumps({"message": PRIVATE_VALUE, "errors": {"password": [PRIVATE_VALUE]}}).encode()])
+def test_sads_validation_rejection_returns_readable_client_error(environment, caplog, error_body):
+    app, db, opener = environment
+    opener.error = HTTPError(
+        "https://private.invalid/?secret=" + PRIVATE_VALUE, 422, "private reason " + PRIVATE_VALUE,
+        {"Content-Type": "application/json"}, io.BytesIO(error_body),
+    )
+    code, headers, body = login(app)
+    assert code == 422
+    assert body == {"detail": "Data login tidak valid. Periksa NIM dan kata sandi Anda."}
+    assert headers["cache-control"] == "no-store"
+    assert "set-cookie" not in headers
+    assert db.query(User).count() == 0
+    assert len(opener.requests) == 1
+    assert db.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one().attempt_count == 1
+    assert PRIVATE_VALUE not in json.dumps(body) + caplog.text
+    assert "private.invalid" not in json.dumps(body) + caplog.text
+
+
+def test_sads_validation_rejections_remain_subject_to_login_attempt_limit(environment):
+    app, db, opener = environment
+    for _ in range(5):
+        opener.error = HTTPError("https://private.invalid", 422, "Rejected", {}, io.BytesIO())
+        assert login(app)[0] == 422
+    code, headers, _ = login(app)
+    assert code == 429
+    assert int(headers["retry-after"]) > 0
+    assert len(opener.requests) == 5
+    assert db.query(User).count() == 0
+
+
+def test_sads_validation_rejection_preserves_existing_user_and_session(environment):
+    app, db, opener = environment
+    code, _, signed_in = login(app)
+    assert code == 200
+    user = db.query(User).one()
+    original_state = (user.id, user.password, user.auth_provider, user.session_version)
+    opener.error = HTTPError("https://private.invalid", 422, "Rejected", {}, io.BytesIO())
+    code, headers, _ = login(app)
+    assert code == 422
+    assert "set-cookie" not in headers
+    db.refresh(user)
+    assert (user.id, user.password, user.auth_provider, user.session_version) == original_state
+    assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {signed_in['token']}")[0] == 200
 
 
 def test_rejected_passwords_remain_throttled_without_local_fallback(environment):

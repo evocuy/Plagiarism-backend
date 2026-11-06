@@ -383,7 +383,7 @@ def login(
             try:
                 sads_profile = SadsAuthService().authenticate(request.identifier, request.password)
             except HTTPException as error:
-                if error.status_code != 403:
+                if error.status_code not in (403, 422):
                     raise
                 # A structured rejection is still a failed login and retains
                 # account throttling, but does not claim the password is wrong.
