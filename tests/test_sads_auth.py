@@ -5,6 +5,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -16,6 +17,7 @@ from app.database.session import Base, get_db
 from app.models.schemas import Document, LoginThrottle, Mahasiswa, PlagiarismCheck, User
 from app.routes import auth
 from app.services import sads_auth_service as sads
+from app.services import sads_course_service as sads_courses
 from test_auth_session import request
 
 
@@ -55,12 +57,31 @@ class FakeOpener:
         return FakeResponse(self.raw if self.raw is not None else json.dumps(self.payload).encode())
 
 
+class FakeCoursesOpener(FakeOpener):
+    def __init__(self):
+        super().__init__()
+        self.payload = {
+            "mahasiswa": {"nim": NIM},
+            "periode": "2099-1",
+            "jadwal_matakuliah": [{"kdmk": "DEMO-SEMINAR", "matkul": "Seminar"}],
+        }
+        self.use_requested_nim = True
+
+    def open(self, outgoing, *, timeout):
+        if self.use_requested_nim:
+            self.payload["mahasiswa"]["nim"] = unquote(urlsplit(outgoing.full_url).path.rsplit("/", 1)[-1])
+        return super().open(outgoing, timeout=timeout)
+
+
 @pytest.fixture
 def environment(monkeypatch):
     monkeypatch.setenv("STUDENT_AUTH_PROVIDER", "sads")
     monkeypatch.setenv("SADS_LOGIN_URL", "https://campus.example.invalid/private-login")
     monkeypatch.setenv("SADS_LOGIN_TIMEOUT_SECONDS", "10")
     monkeypatch.setenv("SADS_LOGIN_HEADERS_JSON", json.dumps({"X-API-Key": PRIVATE_VALUE}))
+    monkeypatch.setenv("SADS_ACTIVE_COURSES_URL_TEMPLATE", "https://courses.example.invalid/current/{nim}")
+    monkeypatch.setenv("SADS_ACTIVE_COURSES_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("SADS_ACTIVE_COURSES_HEADERS_JSON", json.dumps({"secret": PRIVATE_VALUE}))
     monkeypatch.delenv("SADS_TEST_ALLOWED_USERNAMES", raising=False)
     monkeypatch.delenv("SADS_TEST_ACCESS_EXPIRES_AT", raising=False)
     monkeypatch.setenv("LOGIN_ACCOUNT_MAX_FAILURES", "5")
@@ -69,7 +90,9 @@ def environment(monkeypatch):
     monkeypatch.setattr(auth, "JWT_EXPIRE_MINUTES", 60)
     monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", True)
     opener = FakeOpener()
+    opener.courses = FakeCoursesOpener()
     monkeypatch.setattr(sads, "build_opener", lambda *handlers: opener)
+    monkeypatch.setattr(sads_courses, "build_opener", lambda *handlers: opener.courses)
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
@@ -109,6 +132,7 @@ def test_login_uses_post_json_and_local_session_without_sads_secrets(environment
     assert PRIVATE_VALUE not in json.dumps(body)
     assert PASSWORD not in json.dumps(body)
     assert "sbt" not in json.dumps(body)
+    assert len(opener.courses.requests) == 1
     user = db.query(User).one()
     assert user.auth_provider == "sads"
     assert user.password != PASSWORD
@@ -119,7 +143,7 @@ def test_login_uses_post_json_and_local_session_without_sads_secrets(environment
 
 
 @pytest.mark.parametrize("legacy_settings", ["missing", "other_nim_only", "empty", "expired", "invalid"])
-def test_sads_student_login_has_no_manual_nim_or_enrolment_gate(environment, monkeypatch, legacy_settings):
+def test_eligible_sads_students_ignore_retired_manual_nim_gate(environment, monkeypatch, legacy_settings):
     app, db, opener = environment
     username = "2400000002"
     if legacy_settings == "other_nim_only":
@@ -140,6 +164,7 @@ def test_sads_student_login_has_no_manual_nim_or_enrolment_gate(environment, mon
     assert body["user"]["identifier"] == username
     assert body["user"]["role"] == "mahasiswa"
     assert len(opener.requests) == 1
+    assert len(opener.courses.requests) == 1
     assert json.loads(opener.requests[0][0].data)["username"] == username
     assert db.query(User).count() == 1
     assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {body['token']}")[0] == 200

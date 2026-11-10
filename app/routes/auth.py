@@ -15,6 +15,7 @@ from app.database.session import get_db
 from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
+from app.services.sads_course_service import SadsActiveCoursesService
 
 router = APIRouter()
 
@@ -217,7 +218,7 @@ class UpdateUserRequest(BaseModel):
         return data
 
 
-def create_access_token(user: User) -> str:
+def create_access_token(user: User, *, sads_courses_verified: bool = False) -> str:
     secret = _jwt_secret_key()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
     return jwt.encode(
@@ -226,6 +227,7 @@ def create_access_token(user: User) -> str:
             "identifier": user.identifier,
             "role": user.role,
             "sv": user.session_version,
+            "sads_courses_verified": sads_courses_verified,
             "exp": expires_at,
         },
         secret,
@@ -244,7 +246,7 @@ def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     return parts[1]
 
 
-def _decode_access_token(token: str) -> tuple[int, int]:
+def _decode_access_token(token: str) -> tuple[int, int, bool]:
     try:
         payload = jwt.decode(
             token,
@@ -264,7 +266,7 @@ def _decode_access_token(token: str) -> tuple[int, int]:
 
     if user_id <= 0 or isinstance(session_version, bool) or not isinstance(session_version, int) or session_version < 0:
         raise _auth_exception("Token autentikasi tidak valid.")
-    return user_id, session_version
+    return user_id, session_version, payload.get("sads_courses_verified") is True
 
 
 def _rotate_session_version(db: Session, user: User) -> None:
@@ -293,10 +295,10 @@ def get_current_user(
     if bearer_claims and cookie_claims:
         if bearer_claims[0] != cookie_claims[0]:
             raise _auth_exception("Credential Bearer dan cookie berasal dari akun yang berbeda.")
-        if bearer_claims[1] != cookie_claims[1]:
+        if bearer_claims[1:] != cookie_claims[1:]:
             raise _auth_exception("Credential Bearer dan cookie berasal dari sesi yang berbeda.")
 
-    user_id, token_session_version = bearer_claims or cookie_claims
+    user_id, token_session_version, sads_courses_verified = bearer_claims or cookie_claims
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active or user.role not in SUPPORTED_USER_ROLES:
@@ -310,6 +312,8 @@ def get_current_user(
         if student_auth.provider == "sads" or user.auth_provider == "sads":
             if student_auth.provider != "sads" or user.auth_provider != "sads":
                 raise _auth_exception("Metode login mahasiswa berubah. Silakan login kembali.")
+            if not sads_courses_verified:
+                raise _auth_exception("Sesi belum memverifikasi mata kuliah aktif. Silakan login kembali.")
 
     return user
 
@@ -413,12 +417,21 @@ def login(
         raise _auth_exception("Identifier atau kata sandi tidak valid.")
 
     if sads_profile is not None:
+        # Enrollment is an authorization check, separate from password failures.
+        # Verify before provisioning a profile or issuing/rotating a session.
+        try:
+            SadsActiveCoursesService().require_eligible_student(sads_profile.username)
+        except HTTPException as error:
+            if error.status_code == 403 and user is not None and user.auth_provider == "sads":
+                # A definitive loss of eligibility also revokes a previous grant.
+                _rotate_session_version(db, user)
+            raise
         user = SadsAuthService.provision_student(db, sads_profile, password_hash.hash)
 
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
     _rotate_session_version(db, user)
-    token = create_access_token(user)
+    token = create_access_token(user, sads_courses_verified=sads_profile is not None)
     _set_session_cookie(response, token)
 
     return {

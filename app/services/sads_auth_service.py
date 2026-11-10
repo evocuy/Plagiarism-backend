@@ -1,9 +1,9 @@
-"""Opt-in SADS student login without course restrictions during the login trial.
+"""SADS student credentials and minimal local profile provisioning.
 
 Only the supplied POST JSON contract and active role are interpreted here.
 The meanings of id1, id2 and sbt are deliberately not inferred. Successful
-authentication is not evidence of enrolment in a particular course. The retired
-pilot username list and access deadline are no longer read.
+authentication is not evidence of enrolment in a particular course; the login
+route checks active courses separately before granting a session.
 """
 
 from __future__ import annotations
@@ -46,6 +46,49 @@ class StudentAuthSettings:
         return cls(provider)
 
 
+def read_sads_http_settings(
+    url_setting: str, timeout_setting: str, headers_setting: str,
+) -> tuple[str, int, tuple[tuple[str, str], ...]]:
+    """Read server-owned integration settings without reflecting private values."""
+    url = os.getenv(url_setting, "").strip()
+    try:
+        parts = urlsplit(url)
+        valid_url = (
+            parts.scheme == "https"
+            and bool(parts.hostname)
+            and parts.username is None
+            and parts.password is None
+            and not parts.fragment
+            and not any(character.isspace() or ord(character) < 32 for character in url)
+        )
+        parts.port  # Validate a supplied port without exposing the URL.
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise RuntimeError(f"Isi {url_setting} dengan URL HTTPS endpoint resmi.")
+    try:
+        timeout = int(os.getenv(timeout_setting, "10"))
+    except ValueError:
+        timeout = 0
+    if not 1 <= timeout <= 30:
+        raise RuntimeError(f"{timeout_setting} harus antara 1 dan 30.")
+    try:
+        headers = json.loads(os.getenv(headers_setting, "{}"))
+    except (json.JSONDecodeError, TypeError):
+        headers = None
+    reserved = {"host", "content-length", "transfer-encoding", "connection", "content-type", "accept"}
+    if not isinstance(headers, dict) or any(
+        not isinstance(key, str)
+        or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)
+        or key.lower() in reserved
+        or not isinstance(value, str)
+        or any(ord(character) < 32 or ord(character) > 126 for character in value)
+        for key, value in headers.items()
+    ):
+        raise RuntimeError(f"{headers_setting} harus berupa object header autentikasi yang valid.")
+    return url, timeout, tuple(headers.items())
+
+
 @dataclass(frozen=True)
 class SadsLoginSettings:
     url: str
@@ -54,43 +97,9 @@ class SadsLoginSettings:
 
     @classmethod
     def from_environment(cls) -> "SadsLoginSettings":
-        url = os.getenv("SADS_LOGIN_URL", "").strip()
-        try:
-            parts = urlsplit(url)
-            valid_url = (
-                parts.scheme == "https"
-                and bool(parts.hostname)
-                and parts.username is None
-                and parts.password is None
-                and not parts.fragment
-                and not any(character.isspace() or ord(character) < 32 for character in url)
-            )
-            parts.port  # Validate a supplied port without exposing the URL.
-        except ValueError:
-            valid_url = False
-        if not valid_url:
-            raise RuntimeError("Isi SADS_LOGIN_URL dengan URL HTTPS endpoint login resmi.")
-        try:
-            timeout = int(os.getenv("SADS_LOGIN_TIMEOUT_SECONDS", "10"))
-        except ValueError:
-            timeout = 0
-        if not 1 <= timeout <= 30:
-            raise RuntimeError("SADS_LOGIN_TIMEOUT_SECONDS harus antara 1 dan 30.")
-        try:
-            headers = json.loads(os.getenv("SADS_LOGIN_HEADERS_JSON", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            headers = None
-        reserved = {"host", "content-length", "transfer-encoding", "connection", "content-type", "accept"}
-        if not isinstance(headers, dict) or any(
-            not isinstance(key, str)
-            or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)
-            or key.lower() in reserved
-            or not isinstance(value, str)
-            or any(ord(character) < 32 or ord(character) > 126 for character in value)
-            for key, value in headers.items()
-        ):
-            raise RuntimeError("SADS_LOGIN_HEADERS_JSON harus berupa object header autentikasi yang valid.")
-        return cls(url, timeout, tuple(headers.items()))
+        return cls(*read_sads_http_settings(
+            "SADS_LOGIN_URL", "SADS_LOGIN_TIMEOUT_SECONDS", "SADS_LOGIN_HEADERS_JSON",
+        ))
 
 
 @dataclass(frozen=True)

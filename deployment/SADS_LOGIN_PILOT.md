@@ -1,23 +1,22 @@
-# Uji lokal login SADS
+# Login SADS dan akses mata kuliah aktif
 
 Integrasi ini menguji login mahasiswa menggunakan endpoint SADS yang sudah
 dimiliki kampus. Endpoint dan kredensial integrasi cukup diisi sendiri di
 `backend/.env`; jangan dibagikan melalui chat atau dimasukkan ke Git. VM baru
 diperbarui setelah pengguna push dan secara eksplisit meminta deployment.
 
-Sesuai permintaan uji login, pembatasan mata kuliah dan izin NIM sementara
-dihapus. Semua akun dengan kredensial SADS valid dan role aktif `Mahasiswa`
-dapat mengakses aplikasi, termasuk yang belum mengambil seminar proposal atau
-skripsi. Ini **bukan verifikasi KRS**. Autentikasi, status akun aktif, masa
-berlaku JWT, dan batas percobaan login tetap diterapkan. Role dosen dan review
-tetap ditangani di SADS, tanpa menambah alur dosen di aplikasi ini.
+Mahasiswa harus memiliki kredensial SADS valid, role aktif `Mahasiswa`, dan
+mengambil mata kuliah `Seminar` atau `Skripsi` pada periode aktif dari API mata
+kuliah kampus. Nama ini dikonfirmasi pengguna; pencocokan nama utuh mengabaikan
+kapitalisasi dan spasi tepi. `Seminar Proposal`, `Seminar Nasional`, dan
+`Pra Skripsi` tidak dianggap nama mata kuliah yang sama. Kode `kdmk` belum
+dipakai sebagai aturan karena kode resmi kedua mata kuliah belum diberikan.
+Role dosen dan review tetap ditangani di SADS.
 
 `SADS_TEST_ALLOWED_USERNAMES` dan `SADS_TEST_ACCESS_EXPIRES_AT` sudah tidak
-dibaca. Nilai lama yang masih ada di `.env` tidak membatasi login atau sesi;
-tidak perlu mengedit `.env` untuk menerapkan perubahan ini. Nilai tersebut boleh
-dihapus sendiri saat pemilik konfigurasi merapikannya. Implementasi dan tes
-dilakukan lokal; tidak perlu membuka `.env` VM atau melakukan request nyata ke
-SADS untuk memverifikasi perubahan kebijakan ini.
+dibaca dan tidak dapat melewati pemeriksaan mata kuliah. Implementasi dan tes
+dilakukan lokal dengan data sintetis; response mahasiswa asli tidak dimasukkan
+ke Git. Daftar izin NIM manual tidak menggantikan verifikasi mata kuliah.
 
 ## Konfigurasi
 
@@ -28,6 +27,9 @@ STUDENT_AUTH_PROVIDER=sads
 SADS_LOGIN_URL=
 SADS_LOGIN_TIMEOUT_SECONDS=10
 SADS_LOGIN_HEADERS_JSON={}
+SADS_ACTIVE_COURSES_URL_TEMPLATE=
+SADS_ACTIVE_COURSES_TIMEOUT_SECONDS=10
+SADS_ACTIVE_COURSES_HEADERS_JSON={"secret":"isi-sendiri-di-env"}
 ```
 
 - `SADS_LOGIN_URL`: URL HTTPS **lengkap** endpoint login resmi, diisi sendiri.
@@ -39,6 +41,17 @@ SADS_LOGIN_HEADERS_JSON={}
   Default User-Agent mengidentifikasi aplikasi sebagai
   `INSTIKI-SimilarityChecker/1.0`, bukan identitas bawaan library Python.
   Header User-Agent yang diwajibkan kampus dapat diisi melalui object ini.
+- `SADS_ACTIVE_COURSES_URL_TEMPLATE`: URL HTTPS lengkap endpoint mata kuliah
+  aktif dengan tepat satu placeholder `{nim}` di path, mengikuti endpoint
+  privat yang disediakan pengguna. Backend menggantinya dengan NIM hasil login
+  yang di-encode sebagai komponen URL dan mengirim `GET` tanpa body.
+- `SADS_ACTIVE_COURSES_HEADERS_JSON`: header wajib `secret` dengan nilai tetap,
+  dikonfirmasi pengguna. Nilainya hanya di `.env`. Header login tidak otomatis
+  diteruskan ke endpoint mata kuliah; konfigurasi keduanya terpisah.
+- Timeout mata kuliah default 10 detik, dapat diatur antara 1–30 detik. TLS
+  diverifikasi, redirect ditolak, dan respons dibatasi 256 KiB. Konfigurasi
+  URL/header mata kuliah yang belum lengkap memblokir login mahasiswa dengan
+  503; admin lokal tetap dapat masuk untuk pengelolaan.
 
 Restart backend lokal setelah mengubah `.env`. Untuk Uvicorn lokal melalui
 HTTP, pastikan `SESSION_COOKIE_SECURE=false` dan `SESSION_COOKIE_SAMESITE=lax`;
@@ -62,9 +75,28 @@ Content-Type: application/json
 
 Backend memetakan `identifier` ke `username` ketika memanggil SADS. Akun admin
 lokal tetap diverifikasi di database lokal dan tidak dikirim ke SADS. Untuk
-mahasiswa, backend memvalidasi respons login SADS dan role aktif, menyimpan
-profil seperlunya, lalu mengembalikan JWT dan cookie sesi lokal seperti biasa.
+mahasiswa, backend memvalidasi respons login SADS dan role aktif, lalu memanggil
+API mata kuliah. `mahasiswa.nim` harus cocok dengan NIM login, `periode` harus
+terisi, dan `jadwal_matakuliah` harus berupa daftar mata kuliah valid. Semua
+baris dianggap berada pada periode aktif sesuai kontrak endpoint; data jadwal
+historis tidak dicampurkan. Jika ada `matkul` Seminar/Skripsi, backend menyimpan
+profil seperlunya lalu mengembalikan JWT dan cookie sesi lokal seperti biasa.
 Respons tetap `{"token":"...","user":{...}}`.
+
+Tanpa mata kuliah yang diizinkan, backend mengembalikan 403 tanpa membuat akun
+atau menerbitkan sesi baru. Gangguan/penolakan HTTP API mata kuliah menghasilkan
+503, sedangkan respons rusak atau NIM tidak cocok menghasilkan 502. Keduanya
+memblokir login baru dan tidak dianggap salah password. Raw response, URL,
+header `secret`, daftar dosen, dan jadwal kuliah tidak disimpan atau diteruskan
+ke frontend.
+
+JWT memuat penanda boolean verifikasi mata kuliah. Token mahasiswa SADS lama
+tanpa penanda ini ditolak dengan 401 dan harus login ulang. Verifikasi dilakukan
+setiap login, bukan pada setiap polling hasil. Izin mengikuti masa sesi JWT
+(`JWT_EXPIRE_MINUTES`, contoh konfigurasi 60 menit); perubahan KRS baru diperiksa
+saat login berikutnya. Jika pemeriksaan login berikutnya memastikan mahasiswa
+sudah tidak memenuhi syarat, sesi sebelumnya ikut dicabut. Kegagalan password
+atau gangguan API tidak mencabut sesi yang sebelumnya sudah terverifikasi.
 
 Adapter mengikuti contoh respons yang diberikan: object top-level dengan
 `id1`, `id2`, `nama`, `role.name`, dan `jurusan`. Role aktif harus `Mahasiswa`;
@@ -95,12 +127,12 @@ Status yang perlu ditangani frontend:
 | Status | Arti |
 | --- | --- |
 | 401 | Autentikasi ditolak SADS (HTTP 401), kredensial lokal ditolak, atau sesi tidak berlaku |
-| 403 | Role bukan mahasiswa, akun tidak dapat ditautkan, atau SADS menolak akses dengan respons JSON HTTP 403 |
+| 403 | Tidak mengambil Seminar/Skripsi aktif, role bukan mahasiswa, akun tidak dapat ditautkan, atau login SADS ditolak dengan JSON HTTP 403 |
 | 409 | Akun sedang diperbarui oleh login bersamaan; ulangi login |
 | 422 | Data login ditolak SADS; pesan aman meminta pengguna memeriksa NIM dan kata sandi |
 | 429 | Batas percobaan login backend tercapai; ikuti Retry-After |
-| 502 | Respons SADS tidak sesuai contoh JSON atau request ditolak dengan HTTP 4xx selain 401/403/422/429 |
-| 503 | SADS tidak terjangkau, timeout, redirect, HTTP 429/5xx, atau blokir HTTP 403 non-JSON/challenge |
+| 502 | Respons login/mata kuliah SADS rusak, NIM mata kuliah tidak cocok, atau request login ditolak dengan HTTP 4xx lainnya |
+| 503 | Verifikasi mata kuliah belum dikonfigurasi atau API tidak tersedia; termasuk timeout, redirect, dan penolakan HTTP API mata kuliah |
 
 Kontrak respons **login gagal** dari SADS belum diberikan. HTTP 401 dilaporkan
 sebagai autentikasi ditolak; penyebab bisa kredensial mahasiswa maupun header
@@ -130,17 +162,21 @@ dengan tim SADS bila penolakan berlanjut.
 
 Pengujian otomatis menggunakan respons SADS tiruan, akun sintetis, dan database
 SQLite terisolasi. Termasuk penolakan role lain, tidak adanya fallback lokal,
-login beberapa mahasiswa tanpa daftar izin, pengabaian daftar/tenggat lama,
+login beberapa mahasiswa yang memenuhi syarat, pengabaian daftar/tenggat lama,
 pemisahan akun dan sesi mahasiswa, preservasi histori, redaksi error, kegagalan
 jaringan, batas percobaan, serta penolakan redirect dengan server HTTP loopback.
-Tidak ada request ke endpoint SADS asli dalam suite tersebut.
+Termasuk mata kuliah yang diizinkan, penolakan nama mirip, NIM yang tidak cocok,
+respons mata kuliah rusak, header server, serta penolakan token lama yang belum
+terverifikasi. Tidak ada request ke endpoint SADS asli dalam suite tersebut.
 
 Setelah mengisi konfigurasi sendiri, uji dari Insomnia ke backend lokal dengan
-beberapa NIM mahasiswa. Periksa login benar, password salah, penolakan role
-selain mahasiswa, `GET /api/auth/me`, dan logout. Bila muncul 502, cocokkan bentuk respons tanpa
+beberapa NIM mahasiswa. Periksa mahasiswa dengan Seminar/Skripsi aktif, mahasiswa
+tanpa keduanya (403), password salah, penolakan role selain mahasiswa,
+`GET /api/auth/me`, dan logout. Bila muncul 502, cocokkan bentuk respons tanpa
 membagikan credential/token. Jangan menyalin response mahasiswa asli ke Git.
 
-Pilot ini belum mencakup API mata kuliah, pengiriman hasil ke SADS, pemetaan
-pembimbing, atau review. Dokumen mahasiswa tetap privat dan tidak otomatis
-masuk repositori pembanding. Validasi KRS resmi beserta pemetaan kode mata
-kuliah ditambahkan setelah kontrak API tersedia dan pekerjaan itu diminta.
+Integrasi ini belum mencakup pengiriman hasil ke SADS, pemetaan pembimbing,
+atau review. Dokumen mahasiswa tetap privat dan tidak otomatis masuk repositori
+pembanding. Tidak ada perubahan endpoint frontend atau migrasi database untuk
+pembatasan mata kuliah ini. Deployment VM menunggu push dan permintaan pengguna;
+URL beserta header mata kuliah juga perlu diisi pada konfigurasi VM saat itu.
