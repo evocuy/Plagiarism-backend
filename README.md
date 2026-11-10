@@ -185,6 +185,20 @@ kecocokan menambahkan `page_start_position` dan `page_end_position`, yaitu offse
 karakter pada teks halaman yang sudah disaring. Field `start_position` dan
 `end_position` tetap relatif terhadap kalimat asal.
 
+## Respons dan status indexing embedding
+
+Layanan embedding harus mengembalikan `index` integer unik untuk setiap input
+batch. Backend memasangkan vektor berdasarkan indeks tersebut meskipun urutan
+respons berubah. Respons dengan indeks hilang/duplikat, jumlah vektor tidak
+sesuai, vektor kosong/tidak valid, atau dimensi batch tidak konsisten ditolak.
+
+Status dan ringkasan dari `ensure_document_embeddings` dihitung dari seluruh
+chunk setelah proses indexing. `completed` hanya diberikan jika tidak ada
+chunk yang masih pending atau gagal. Kegagalan lama tetap dihitung saat batch
+lain dilanjutkan; `refresh_embeddings=true` pada endpoint indexing dapat dipakai
+untuk mencoba ulang chunk gagal. Counter di `index_result` tetap menunjukkan
+pekerjaan pada percobaan tersebut. Endpoint dan format request tidak berubah.
+
 ## PDF top tiga pembanding dengan watermark
 
 `GET /api/plagiarism/check/{check_id}/top-matches` menambahkan `pdf_available`,

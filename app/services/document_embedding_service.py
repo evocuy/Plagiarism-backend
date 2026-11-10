@@ -112,12 +112,14 @@ class DocumentEmbeddingService:
             refresh_chunks=refresh_chunks,
             refresh_embeddings=refresh_embeddings,
         )
-        if index_result["total_failed"] and not index_result["total_indexed"]:
-            status = "failed"
-        elif index_result["total_failed"]:
+        # Include earlier failures and remaining batches, not just this attempt.
+        summary = self.summarize_document_embeddings(document, db)
+        if not summary["total_failed_chunks"] and not summary["total_pending_chunks"]:
+            status = "completed"
+        elif summary["total_indexed_chunks"]:
             status = "partial"
         else:
-            status = "completed"
+            status = "failed"
 
         return {
             **summary,

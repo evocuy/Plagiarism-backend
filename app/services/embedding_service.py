@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
@@ -35,18 +36,43 @@ class EmbeddingService:
                 "input": clean_texts,
             },
         )
-        data = response.get("data") or []
-        embeddings = [item.get("embedding") for item in data]
+        if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+            raise RuntimeError("Format respons embedding tidak valid.")
+        data = response["data"]
 
-        if len(embeddings) != len(clean_texts):
+        if len(data) != len(clean_texts):
             raise RuntimeError(
-                f"Jumlah embedding tidak sesuai. Diterima {len(embeddings)} dari {len(clean_texts)} input."
+                f"Jumlah embedding tidak sesuai. Diterima {len(data)} dari {len(clean_texts)} input."
             )
 
-        return [
-            [float(value) for value in embedding]
-            for embedding in embeddings
-        ]
+        embeddings: List[List[float]] = [[] for _ in clean_texts]
+        seen_indices = set()
+        dimensions = None
+        for item in data:
+            if not isinstance(item, dict):
+                raise RuntimeError("Format respons embedding tidak valid.")
+            index = item.get("index")
+            if type(index) is not int or not 0 <= index < len(clean_texts) or index in seen_indices:
+                raise RuntimeError("Indeks embedding tidak valid atau duplikat.")
+
+            raw_vector = item.get("embedding")
+            if not isinstance(raw_vector, list) or not raw_vector:
+                raise RuntimeError("Vektor embedding tidak valid.")
+            try:
+                vector = [float(value) for value in raw_vector]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("Vektor embedding tidak valid.") from exc
+            if not all(math.isfinite(value) for value in vector):
+                raise RuntimeError("Vektor embedding mengandung nilai tidak valid.")
+            if dimensions is not None and len(vector) != dimensions:
+                raise RuntimeError("Dimensi embedding dalam satu batch tidak konsisten.")
+
+            dimensions = len(vector)
+            seen_indices.add(index)
+            # Providers may return data out of order; index identifies the input.
+            embeddings[index] = vector
+
+        return embeddings
 
     def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
