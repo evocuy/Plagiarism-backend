@@ -1,11 +1,12 @@
 import os
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional, List
+from typing import Annotated, Literal, Optional, List
 
 import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Request, Response, status
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
 from sqlalchemy import func, update
@@ -16,6 +17,7 @@ from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
 from app.services.sads_course_service import SadsActiveCoursesService
+from app.services import impersonation_service
 
 router = APIRouter()
 
@@ -25,6 +27,7 @@ router = APIRouter()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "plagiarism_session")
+IMPERSONATION_COOKIE_NAME = SESSION_COOKIE_NAME + "_impersonation"
 AUTH_NO_STORE_VALUE = "no-store"
 
 
@@ -54,6 +57,9 @@ def _read_boolean_setting(name: str, default: bool) -> bool:
 
 
 JWT_EXPIRE_MINUTES = _read_positive_int_setting("JWT_EXPIRE_MINUTES", 1440)
+IMPERSONATION_EXPIRE_MINUTES = _read_positive_int_setting("IMPERSONATION_EXPIRE_MINUTES", 15)
+if IMPERSONATION_EXPIRE_MINUTES > 60:
+    raise RuntimeError("IMPERSONATION_EXPIRE_MINUTES maksimal 60 menit.")
 # Secure-by-default. Local HTTP development can opt out explicitly with
 # SESSION_COOKIE_SECURE=false; production must never rely on APP_ENV spelling.
 SESSION_COOKIE_SECURE = _read_boolean_setting(
@@ -114,24 +120,26 @@ def _auth_exception(detail: str, *, status_code: int = status.HTTP_401_UNAUTHORI
     return HTTPException(status_code=status_code, detail=detail, headers=headers)
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _set_session_cookie(
+    response: Response, token: str, *, cookie_name: str = SESSION_COOKIE_NAME, max_age: int | None = None,
+) -> None:
     response.set_cookie(
-        key=SESSION_COOKIE_NAME,
+        key=cookie_name,
         value=token,
         httponly=True,
         secure=SESSION_COOKIE_SECURE,
-        max_age=JWT_EXPIRE_MINUTES * 60,
+        max_age=JWT_EXPIRE_MINUTES * 60 if max_age is None else max_age,
         samesite=SESSION_COOKIE_SAMESITE,
         domain=SESSION_COOKIE_DOMAIN,
         path=SESSION_COOKIE_PATH,
     )
 
 
-def _clear_session_cookie(response: Response) -> None:
+def _clear_session_cookie(response: Response, *, cookie_name: str = SESSION_COOKIE_NAME) -> None:
     # Cookie scope must exactly match the login cookie; otherwise browsers can
     # retain the old cookie alongside the expired one.
     response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
+        key=cookie_name,
         path=SESSION_COOKIE_PATH,
         domain=SESSION_COOKIE_DOMAIN,
         secure=SESSION_COOKIE_SECURE,
@@ -143,6 +151,22 @@ def _clear_session_cookie(response: Response) -> None:
 class LoginRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=256)
+
+
+class ImpersonationRequest(BaseModel):
+    nim: str = Field(min_length=1, max_length=100)
+
+    @field_validator("nim")
+    @classmethod
+    def normalize_nim(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("NIM wajib diisi.")
+        return value
+
+
+class StopImpersonationRequest(BaseModel):
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 class UserResponse(BaseModel):
     """
@@ -218,21 +242,23 @@ class UpdateUserRequest(BaseModel):
         return data
 
 
-def create_access_token(user: User, *, sads_courses_verified: bool = False) -> str:
+def create_access_token(
+    user: User, *, sads_courses_verified: bool = False,
+    impersonation_id: str | None = None, expires_at: datetime | None = None,
+) -> str:
     secret = _jwt_secret_key()
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
-    return jwt.encode(
-        {
-            "sub": str(user.id),
-            "identifier": user.identifier,
-            "role": user.role,
-            "sv": user.session_version,
-            "sads_courses_verified": sads_courses_verified,
-            "exp": expires_at,
-        },
-        secret,
-        algorithm=JWT_ALGORITHM,
-    )
+    expires_at = expires_at or datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user.id),
+        "identifier": user.identifier,
+        "role": user.role,
+        "sv": user.session_version,
+        "sads_courses_verified": sads_courses_verified,
+        "exp": expires_at,
+    }
+    if impersonation_id is not None:
+        payload["impersonation_id"] = impersonation_id
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -246,7 +272,20 @@ def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     return parts[1]
 
 
-def _decode_access_token(token: str) -> tuple[int, int, bool]:
+@dataclass(frozen=True)
+class AccessTokenClaims:
+    user_id: int
+    session_version: int
+    sads_courses_verified: bool
+    expires_at: datetime
+    impersonation_id: str | None = None
+
+    @property
+    def session_identity(self) -> tuple:
+        return self.user_id, self.session_version, self.sads_courses_verified, self.impersonation_id
+
+
+def _decode_access_token(token: str) -> AccessTokenClaims:
     try:
         payload = jwt.decode(
             token,
@@ -266,7 +305,19 @@ def _decode_access_token(token: str) -> tuple[int, int, bool]:
 
     if user_id <= 0 or isinstance(session_version, bool) or not isinstance(session_version, int) or session_version < 0:
         raise _auth_exception("Token autentikasi tidak valid.")
-    return user_id, session_version, payload.get("sads_courses_verified") is True
+    impersonation_id = payload.get("impersonation_id")
+    if "impersonation_id" in payload and (
+        not isinstance(impersonation_id, str) or len(impersonation_id) != 32
+        or any(character not in "0123456789abcdef" for character in impersonation_id)
+    ):
+        raise _auth_exception("Token impersonasi tidak valid.")
+    try:
+        expires_at = datetime.fromtimestamp(int(payload["exp"]), timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        raise _auth_exception("Token autentikasi tidak valid.") from None
+    return AccessTokenClaims(
+        user_id, session_version, payload.get("sads_courses_verified") is True, expires_at, impersonation_id,
+    )
 
 
 def _rotate_session_version(db: Session, user: User) -> None:
@@ -284,37 +335,53 @@ def get_current_user(
     authorization: Optional[str] = Header(default=None),
     plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     db: Session = Depends(get_db),
+    impersonation_session: Annotated[Optional[str], Cookie(alias=IMPERSONATION_COOKIE_NAME)] = None,
+    http_request: Request = None,
 ) -> User:
     bearer_token = _extract_bearer_token(authorization)
     bearer_claims = _decode_access_token(bearer_token) if bearer_token else None
-    cookie_claims = _decode_access_token(plagiarism_session) if plagiarism_session else None
+    # The parent cookie stays private and intact; the overlay is the effective
+    # student session. An invalid overlay never falls back to admin privileges.
+    effective_cookie = impersonation_session if impersonation_session is not None else plagiarism_session
+    cookie_claims = _decode_access_token(effective_cookie) if effective_cookie is not None else None
+    if impersonation_session is not None and not cookie_claims.impersonation_id:
+        raise _auth_exception("Cookie impersonasi tidak valid.")
 
     if not bearer_claims and not cookie_claims:
         raise _auth_exception("Autentikasi diperlukan. Silakan login terlebih dahulu.")
 
     if bearer_claims and cookie_claims:
-        if bearer_claims[0] != cookie_claims[0]:
+        if bearer_claims.user_id != cookie_claims.user_id:
             raise _auth_exception("Credential Bearer dan cookie berasal dari akun yang berbeda.")
-        if bearer_claims[1:] != cookie_claims[1:]:
+        if bearer_claims.session_identity != cookie_claims.session_identity:
             raise _auth_exception("Credential Bearer dan cookie berasal dari sesi yang berbeda.")
 
-    user_id, token_session_version, sads_courses_verified = bearer_claims or cookie_claims
+    claims = bearer_claims or cookie_claims
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == claims.user_id).first()
     if not user or not user.is_active or user.role not in SUPPORTED_USER_ROLES:
         raise _auth_exception("User tidak ditemukan.")
 
-    if user.session_version != token_session_version:
+    if user.session_version != claims.session_version:
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
 
-    if user.role == "mahasiswa":
+    impersonation = None
+    if claims.impersonation_id is not None:
+        if not claims.sads_courses_verified:
+            raise _auth_exception("Sesi belum memverifikasi mata kuliah aktif.")
+        impersonation = impersonation_service.resolve_impersonation(db, claims.impersonation_id, user)
+    elif user.role == "mahasiswa":
         student_auth = StudentAuthSettings.from_environment()
         if student_auth.provider == "sads" or user.auth_provider == "sads":
             if student_auth.provider != "sads" or user.auth_provider != "sads":
                 raise _auth_exception("Metode login mahasiswa berubah. Silakan login kembali.")
-            if not sads_courses_verified:
+            if not claims.sads_courses_verified:
                 raise _auth_exception("Sesi belum memverifikasi mata kuliah aktif. Silakan login kembali.")
 
+    if http_request is not None:
+        http_request.state.access_claims = claims
+        http_request.state.access_token = bearer_token or effective_cookie
+        http_request.state.impersonation = impersonation
     return user
 
 
@@ -322,15 +389,19 @@ def get_optional_current_user(
     authorization: Optional[str] = Header(default=None),
     plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
     db: Session = Depends(get_db),
+    impersonation_session: Annotated[Optional[str], Cookie(alias=IMPERSONATION_COOKIE_NAME)] = None,
+    http_request: Request = None,
 ) -> Optional[User]:
     # Optional only means anonymous requests are accepted.  Once a client sends
     # any credential, an invalid or conflicting credential must remain a 401.
-    if authorization is None and plagiarism_session is None:
+    if authorization is None and plagiarism_session is None and impersonation_session is None:
         return None
     return get_current_user(
         authorization=authorization,
         plagiarism_session=plagiarism_session,
         db=db,
+        impersonation_session=impersonation_session,
+        http_request=http_request,
     )
 
 
@@ -341,6 +412,22 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
             detail="Akses ditolak: Hanya administrator yang memiliki izin untuk operasi ini.",
         )
     return current_user
+
+
+def require_original_admin(
+    http_request: Request,
+    authorization: Optional[str] = Header(default=None),
+    plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+    db: Session = Depends(get_db),
+) -> User:
+    """Recovery requires the parent credential, never the student's overlay."""
+    user = get_current_user(
+        authorization=authorization, plagiarism_session=plagiarism_session, db=db,
+        impersonation_session=None, http_request=http_request,
+    )
+    if user.role not in ("admin", "super_admin") or http_request.state.access_claims.impersonation_id:
+        raise _auth_exception("Sesi admin asli diperlukan untuk kembali dari impersonasi.", status_code=403)
+    return user
 
 
 def seed_initial_users(db: Session) -> None:
@@ -432,12 +519,74 @@ def login(
     # this account before minting the new pair.
     _rotate_session_version(db, user)
     token = create_access_token(user, sads_courses_verified=sads_profile is not None)
+    _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _set_session_cookie(response, token)
 
     return {
         "token": token,
         "user": _build_user_response(user),
     }
+
+
+@router.post("/impersonation")
+def start_admin_impersonation(
+    request: ImpersonationRequest,
+    http_request: Request,
+    response: Response,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    _set_no_store(response)
+    claims = http_request.state.access_claims
+    target, session = impersonation_service.start_impersonation(
+        db, admin, request.nim, actor_claims=claims,
+        minutes=IMPERSONATION_EXPIRE_MINUTES, hash_password=password_hash.hash,
+    )
+    token = create_access_token(
+        target, sads_courses_verified=True, impersonation_id=session.id,
+        expires_at=session.expires_at.replace(tzinfo=timezone.utc),
+    )
+    # Keep the overlay cookie until the parent expires. After the shorter JWT
+    # expires, requests must fail instead of silently reverting to admin rights.
+    remaining = max(0, int((claims.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    _set_session_cookie(response, token, cookie_name=IMPERSONATION_COOKIE_NAME, max_age=remaining)
+    return {
+        "token": token,
+        "user": _build_user_response(target),
+        "impersonation": impersonation_service.impersonation_data(session),
+    }
+
+
+@router.get("/impersonation")
+def get_impersonation_status(
+    http_request: Request,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    _set_no_store(response)
+    session = http_request.state.impersonation
+    return impersonation_service.impersonation_data(session) if session else {"active": False}
+
+
+@router.post("/impersonation/stop")
+def stop_admin_impersonation(
+    request: StopImpersonationRequest,
+    http_request: Request,
+    response: Response,
+    admin: User = Depends(require_original_admin),
+    db: Session = Depends(get_db),
+):
+    _set_no_store(response)
+    claims = http_request.state.access_claims
+    impersonation_service.stop_impersonation(
+        db, admin, request.session_id, session_version=claims.session_version,
+    )
+    # Return the existing credential without extending the admin session.
+    token = http_request.state.access_token
+    remaining = max(0, int((claims.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
+    _set_session_cookie(response, token, max_age=remaining)
+    return {"token": token, "user": _build_user_response(admin), "impersonation": {"active": False}}
 
 
 @router.get("/me", response_model=UserResponse)
@@ -449,11 +598,18 @@ def get_me(response: Response, current_user: User = Depends(get_current_user)):
 @router.post("/logout")
 def logout(
     response: Response,
+    http_request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _set_no_store(response)
+    session = http_request.state.impersonation
+    if session is not None:
+        impersonation_service.end_impersonation(db, session.id, "logout")
+        _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
+        return {"message": "Sesi impersonasi dihentikan."}
     _rotate_session_version(db, current_user)
+    _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _clear_session_cookie(response)
     return {"message": "Berhasil keluar dari sesi."}
 

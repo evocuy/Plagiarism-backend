@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, build_opener
 
-from app.services.sads_auth_service import _NoLoginRedirects, auth_error, read_sads_http_settings
+from app.services.sads_auth_service import _NoLoginRedirects, SadsStudentProfile, auth_error, read_sads_http_settings
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,19 @@ class SadsActiveCoursesService:
         self.opener = build_opener(_NoLoginRedirects())
 
     def require_eligible_student(self, username: str) -> None:
+        self._get_eligible_student_payload(username)
+
+    def get_eligible_student_profile(self, username: str) -> SadsStudentProfile:
+        """Use only the supplied identity fields when an admin selects a NIM."""
+        payload = self._get_eligible_student_payload(username)
+        student = payload["mahasiswa"]
+        name = student.get("nama")
+        program = student.get("prodi_kode")
+        if any(not isinstance(value, str) or not value.strip() or len(value) > 255 for value in (name, program)):
+            raise auth_error(502, "Profil mahasiswa dari SADS tidak dapat diproses.")
+        return SadsStudentProfile(username, name.strip(), program.strip())
+
+    def _get_eligible_student_payload(self, username: str) -> dict:
         request = Request(
             self.settings.url_template.replace("{nim}", quote(username, safe="")),
             headers={
@@ -106,3 +119,4 @@ class SadsActiveCoursesService:
                 403,
                 "Akses hanya untuk mahasiswa yang sedang mengambil mata kuliah Seminar atau Skripsi pada periode aktif.",
             )
+        return payload

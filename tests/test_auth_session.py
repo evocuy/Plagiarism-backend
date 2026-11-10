@@ -17,13 +17,16 @@ from app.routes import auth
 TEST_JWT_SECRET = "auth-session-test-secret-that-is-long-enough-1234567890"
 
 
-def request(app, method, path, *, authorization=None, cookie=None, body=None):
+def request(app, method, path, *, authorization=None, cookie=None, cookies=None, body=None):
     body_bytes = json.dumps(body).encode() if body is not None else b""
     headers = [(b"content-type", b"application/json")]
     if authorization is not None:
         headers.append((b"authorization", authorization.encode()))
+    cookie_values = dict(cookies or {})
     if cookie is not None:
-        headers.append((b"cookie", f"{auth.SESSION_COOKIE_NAME}={cookie}".encode()))
+        cookie_values[auth.SESSION_COOKIE_NAME] = cookie
+    if cookie_values:
+        headers.append((b"cookie", "; ".join(f"{key}={value}" for key, value in cookie_values.items()).encode()))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -55,6 +58,7 @@ def request(app, method, path, *, authorization=None, cookie=None, body=None):
     start = next(event for event in events if event["type"] == "http.response.start")
     content = b"".join(event.get("body", b"") for event in events if event["type"] == "http.response.body")
     response_headers = {key.decode().lower(): value.decode() for key, value in start["headers"]}
+    response_headers["set-cookie-all"] = [value.decode() for key, value in start["headers"] if key == b"set-cookie"]
     return start["status"], response_headers, json.loads(content)
 
 

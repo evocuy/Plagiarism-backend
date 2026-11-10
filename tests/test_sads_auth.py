@@ -61,7 +61,7 @@ class FakeCoursesOpener(FakeOpener):
     def __init__(self):
         super().__init__()
         self.payload = {
-            "mahasiswa": {"nim": NIM},
+            "mahasiswa": {"nim": NIM, "nama": "Mahasiswa Uji", "prodi_kode": "IF-DEMO"},
             "periode": "2099-1",
             "jadwal_matakuliah": [{"kdmk": "DEMO-SEMINAR", "matkul": "Seminar"}],
         }

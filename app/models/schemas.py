@@ -79,6 +79,22 @@ class LoginThrottle(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
 
 
+class ImpersonationSession(Base):
+    """Revocable support sessions and their audit trail; never store JWTs."""
+    __tablename__ = "impersonation_sessions"
+
+    id = Column(String(32), primary_key=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    target_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    actor_identifier = Column(String(100), nullable=False)
+    target_identifier = Column(String(100), nullable=False)
+    actor_session_version = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    end_reason = Column(String(40), nullable=True)
+
+
 class Mahasiswa(Base):
     """
     Tabel mahasiswa (Profil detail mahasiswa):
