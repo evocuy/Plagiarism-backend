@@ -16,8 +16,11 @@ from test_auth_session import request
 from test_sads_auth import NIM, PASSWORD, PRIVATE_VALUE, environment, login
 
 
-@pytest.mark.parametrize("course_names", [["Seminar"], ["Skripsi"], ["  SEMINAR  "], ["Seminar", "Skripsi"]])
-def test_only_current_seminar_or_skripsi_grants_a_student_session(environment, course_names):
+@pytest.mark.parametrize("course_names", [
+    ["Seminar"], ["Skripsi"], ["  SEMINAR  "], ["Seminar", "Skripsi"],
+    ["Tugas Akhir"], ["  TUGAS   AKHIR  "],
+])
+def test_only_eligible_current_courses_grant_a_student_session(environment, course_names):
     app, _, opener = environment
     opener.courses.payload["jadwal_matakuliah"] = [{"matkul": name} for name in course_names]
 
@@ -39,7 +42,10 @@ def test_only_current_seminar_or_skripsi_grants_a_student_session(environment, c
     assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {body['token']}")[0] == 200
 
 
-@pytest.mark.parametrize("names", [[], ["Seminar Proposal"], ["Seminar Nasional"], ["Pra Skripsi"], ["Skripsi Lanjutan"], ["Basis Data Lanjut"]])
+@pytest.mark.parametrize("names", [
+    [], ["Seminar Proposal"], ["Seminar Nasional"], ["Pra Skripsi"], ["Skripsi Lanjutan"],
+    ["Basis Data Lanjut"], ["Pra Tugas Akhir"], ["Tugas Akhir Lanjutan"],
+])
 def test_unenrolled_student_cannot_obtain_a_token_or_bypass_using_client_fields(environment, names):
     app, db, opener = environment
     opener.courses.payload["jadwal_matakuliah"] = [{"matkul": name} for name in names]
@@ -50,7 +56,7 @@ def test_unenrolled_student_cannot_obtain_a_token_or_bypass_using_client_fields(
     })
 
     assert code == 403
-    assert "Seminar atau Skripsi" in body["detail"]
+    assert "Seminar, Skripsi, atau Tugas Akhir" in body["detail"]
     assert headers["cache-control"] == "no-store"
     assert "set-cookie" not in headers
     assert "token" not in body

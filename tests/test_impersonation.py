@@ -116,20 +116,20 @@ def test_first_time_nim_is_provisioned_from_verified_campus_identity(context):
     assert not context.opener.requests
 
 
-@pytest.mark.parametrize("name", ["Seminar", "Skripsi", "  SKRIPSI  "])
+@pytest.mark.parametrize("name", ["Seminar", "Skripsi", "  SKRIPSI  ", "Tugas Akhir", "  TUGAS   AKHIR  "])
 def test_course_requirement_is_also_enforced_for_admin_impersonation(context, name):
     context.opener.courses.payload["jadwal_matakuliah"] = [{"matkul": name}]
     assert start(context)[0] == 200
 
 
-@pytest.mark.parametrize("names", [[], ["Seminar Nasional"], ["Pra Skripsi"]])
+@pytest.mark.parametrize("names", [[], ["Seminar Nasional"], ["Pra Skripsi"], ["Pra Tugas Akhir"], ["Tugas Akhir Lanjutan"]])
 def test_missing_required_courses_cannot_be_bypassed_by_admin(context, names):
     context.opener.courses.payload["jadwal_matakuliah"] = [{"matkul": name} for name in names]
 
     code, headers, body = start(context, "2400000099")
 
     assert code == 403
-    assert "Seminar atau Skripsi" in body["detail"]
+    assert "Seminar, Skripsi, atau Tugas Akhir" in body["detail"]
     assert "token" not in body
     assert "set-cookie" not in headers
     assert context.db.query(User).filter_by(identifier="2400000099").first() is None

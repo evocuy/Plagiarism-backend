@@ -4,7 +4,7 @@ Backend REST API untuk pemeriksaan kemiripan dokumen berbasis FastAPI, PostgreSQ
 
 Panduan deployment dan batas resource: [deployment/HARDENING.md](deployment/HARDENING.md).
 
-Login mahasiswa SADS dengan pembatasan mata kuliah aktif Seminar/Skripsi:
+Login mahasiswa SADS dengan pembatasan mata kuliah aktif Seminar/Skripsi/Tugas Akhir:
 [deployment/SADS_LOGIN_PILOT.md](deployment/SADS_LOGIN_PILOT.md).
 
 Impersonasi mahasiswa oleh admin melalui NIM, termasuk kontrak frontend:

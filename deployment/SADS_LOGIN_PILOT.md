@@ -6,11 +6,11 @@ dimiliki kampus. Endpoint dan kredensial integrasi cukup diisi sendiri di
 diperbarui setelah pengguna push dan secara eksplisit meminta deployment.
 
 Mahasiswa harus memiliki kredensial SADS valid, role aktif `Mahasiswa`, dan
-mengambil mata kuliah `Seminar` atau `Skripsi` pada periode aktif dari API mata
+mengambil mata kuliah `Seminar`, `Skripsi`, atau `Tugas Akhir` pada periode aktif dari API mata
 kuliah kampus. Nama ini dikonfirmasi pengguna; pencocokan nama utuh mengabaikan
-kapitalisasi dan spasi tepi. `Seminar Proposal`, `Seminar Nasional`, dan
+kapitalisasi dan normalisasi spasi. `Seminar Proposal`, `Seminar Nasional`, dan
 `Pra Skripsi` tidak dianggap nama mata kuliah yang sama. Kode `kdmk` belum
-dipakai sebagai aturan karena kode resmi kedua mata kuliah belum diberikan.
+dipakai sebagai aturan karena kode resmi ketiga mata kuliah belum diberikan.
 Role dosen dan review tetap ditangani di SADS.
 
 `SADS_TEST_ALLOWED_USERNAMES` dan `SADS_TEST_ACCESS_EXPIRES_AT` sudah tidak
@@ -79,7 +79,7 @@ mahasiswa, backend memvalidasi respons login SADS dan role aktif, lalu memanggil
 API mata kuliah. `mahasiswa.nim` harus cocok dengan NIM login, `periode` harus
 terisi, dan `jadwal_matakuliah` harus berupa daftar mata kuliah valid. Semua
 baris dianggap berada pada periode aktif sesuai kontrak endpoint; data jadwal
-historis tidak dicampurkan. Jika ada `matkul` Seminar/Skripsi, backend menyimpan
+historis tidak dicampurkan. Jika ada `matkul` Seminar/Skripsi/Tugas Akhir, backend menyimpan
 profil seperlunya lalu mengembalikan JWT dan cookie sesi lokal seperti biasa.
 Respons tetap `{"token":"...","user":{...}}`.
 
@@ -127,7 +127,7 @@ Status yang perlu ditangani frontend:
 | Status | Arti |
 | --- | --- |
 | 401 | Autentikasi ditolak SADS (HTTP 401), kredensial lokal ditolak, atau sesi tidak berlaku |
-| 403 | Tidak mengambil Seminar/Skripsi aktif, role bukan mahasiswa, akun tidak dapat ditautkan, atau login SADS ditolak dengan JSON HTTP 403 |
+| 403 | Tidak mengambil Seminar/Skripsi/Tugas Akhir aktif, role bukan mahasiswa, akun tidak dapat ditautkan, atau login SADS ditolak dengan JSON HTTP 403 |
 | 409 | Akun sedang diperbarui oleh login bersamaan; ulangi login |
 | 422 | Data login ditolak SADS; pesan aman meminta pengguna memeriksa NIM dan kata sandi |
 | 429 | Batas percobaan login backend tercapai; ikuti Retry-After |
@@ -170,8 +170,8 @@ respons mata kuliah rusak, header server, serta penolakan token lama yang belum
 terverifikasi. Tidak ada request ke endpoint SADS asli dalam suite tersebut.
 
 Setelah mengisi konfigurasi sendiri, uji dari Insomnia ke backend lokal dengan
-beberapa NIM mahasiswa. Periksa mahasiswa dengan Seminar/Skripsi aktif, mahasiswa
-tanpa keduanya (403), password salah, penolakan role selain mahasiswa,
+beberapa NIM mahasiswa. Periksa mahasiswa dengan Seminar/Skripsi/Tugas Akhir aktif,
+mahasiswa tanpa ketiganya (403), password salah, penolakan role selain mahasiswa,
 `GET /api/auth/me`, dan logout. Bila muncul 502, cocokkan bentuk respons tanpa
 membagikan credential/token. Jangan menyalin response mahasiswa asli ke Git.
 

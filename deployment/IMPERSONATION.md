@@ -2,8 +2,8 @@
 
 Admin yang sudah login dapat menguji aplikasi sebagai mahasiswa dengan
 memasukkan NIM, tanpa password mahasiswa. Backend memeriksa NIM dan mata kuliah
-melalui API mata kuliah aktif SADS. Tetap wajib mengambil `Seminar` atau
-`Skripsi`; konfigurasi API yang belum lengkap, gangguan API, atau data identitas
+melalui API mata kuliah aktif SADS. Tetap wajib mengambil `Seminar`, `Skripsi`,
+atau `Tugas Akhir`; konfigurasi API yang belum lengkap, gangguan API, atau data identitas
 yang tidak cocok tidak memberi akses. API login SADS tidak dipanggil untuk
 impersonasi dan nilai header `secret` tetap di backend.
 

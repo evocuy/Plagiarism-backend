@@ -38,7 +38,7 @@ class SadsActiveCoursesSettings:
 
 class SadsActiveCoursesService:
     max_response_bytes = 256 * 1024
-    eligible_course_names = frozenset({"seminar", "skripsi"})
+    eligible_course_names = frozenset({"seminar", "skripsi", "tugas akhir"})
 
     def __init__(self, settings: SadsActiveCoursesSettings | None = None):
         try:
@@ -117,6 +117,6 @@ class SadsActiveCoursesService:
         ):
             raise auth_error(
                 403,
-                "Akses hanya untuk mahasiswa yang sedang mengambil mata kuliah Seminar atau Skripsi pada periode aktif.",
+                "Akses hanya untuk mahasiswa yang sedang mengambil mata kuliah Seminar, Skripsi, atau Tugas Akhir pada periode aktif.",
             )
         return payload
