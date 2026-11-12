@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base, get_db
-from app.models.schemas import Document, LoginThrottle, Mahasiswa, PlagiarismCheck, User
+from app.models.schemas import Document, LoginThrottle, PlagiarismCheck, User
 from app.routes import auth
 from app.services import sads_auth_service as sads
 from app.services import sads_course_service as sads_courses
@@ -396,10 +396,10 @@ def test_admin_login_stays_local_during_sads_outage(environment, monkeypatch):
 
 def test_linking_same_nim_preserves_documents_scores_and_account_identity(environment):
     app, db, _ = environment
-    user = User(identifier=NIM, password=auth.password_hash.hash("old-local-password"), role="mahasiswa")
+    user = User(identifier=NIM, password=auth.password_hash.hash("old-local-password"), role="mahasiswa",
+                nama_lengkap="Profil Lama", program_studi="Lama", fakultas="Fakultas Lama")
     db.add(user)
     db.flush()
-    user.mahasiswa = Mahasiswa(nama_lengkap="Profil Lama", program_studi="Lama", fakultas="Fakultas Lama")
     document = Document(user_id=user.id, title="Existing.pdf", file_path="existing.pdf")
     db.add(document)
     db.flush()
@@ -417,8 +417,8 @@ def test_linking_same_nim_preserves_documents_scores_and_account_identity(enviro
     db.refresh(user)
     assert user.auth_provider == "sads"
     assert not auth.password_hash.verify("old-local-password", user.password)
-    assert user.mahasiswa.nama_lengkap == "Mahasiswa Uji"
-    assert user.mahasiswa.fakultas == "Fakultas Lama"
+    assert user.nama_lengkap == "Mahasiswa Uji"
+    assert user.fakultas == "Fakultas Lama"
     assert db.get(Document, document_id).user_id == user_id
     assert db.get(PlagiarismCheck, check_id).overall_similarity == 0.42
     assert request(app, "GET", "/api/auth/me", authorization=f"Bearer {old_token}")[0] == 401

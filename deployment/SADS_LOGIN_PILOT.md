@@ -111,8 +111,10 @@ dengan NIM **persis sama** mempertahankan ID, dokumen, profil fakultas, serta
 riwayatnya. Password lokalnya diganti hash acak yang tidak diketahui dan metode
 autentikasi menjadi `sads`. Akun nonaktif tidak diaktifkan ulang dan role lain
 tidak diubah. Tautan NIM/kata sandi akun SADS tidak dapat diubah melalui endpoint
-edit pengguna lokal. Migrasi runtime hanya menambah `users.auth_provider`
-dengan default `local`; tidak menghapus akun, dokumen, atau hasil.
+edit pengguna lokal. `users.auth_provider` memiliki default `local`. Profil
+nama/prodi/fakultas juga disimpan langsung di `users`; migrasi profil lama
+dijelaskan di [USER_PROFILE_MIGRATION.md](USER_PROFILE_MIGRATION.md). ID akun,
+dokumen, dan hasil tetap dipertahankan.
 
 Login/logout tetap merotasi versi sesi; throttle akun/IP tetap berlaku. Gangguan
 SADS atau blokir perantara menghabiskan kuota percobaan IP, tetapi tidak

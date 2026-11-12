@@ -10,7 +10,7 @@ import jwt
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.models.schemas import Document, ImpersonationSession, Mahasiswa, PlagiarismCheck, User, utc_now
+from app.models.schemas import Document, ImpersonationSession, PlagiarismCheck, User, utc_now
 from app.routes import auth, documents, plagiarism
 from test_auth_session import request
 from test_sads_auth import NIM, PRIVATE_VALUE, environment
@@ -27,7 +27,9 @@ def context(environment, monkeypatch):
     other = User(identifier="2400000002", password="other-student-hash", role="mahasiswa", auth_provider="sads")
     db.add_all([admin, student, other])
     db.flush()
-    student.mahasiswa = Mahasiswa(nama_lengkap="Existing Student", program_studi="Existing Program", fakultas="Existing Faculty")
+    student.nama_lengkap = "Existing Student"
+    student.program_studi = "Existing Program"
+    student.fakultas = "Existing Faculty"
     target_doc = Document(user_id=student.id, title="target.pdf", file_path="target.pdf", document_type="proposal")
     other_doc = Document(user_id=other.id, title="other.pdf", file_path="other.pdf", document_type="proposal")
     db.add_all([target_doc, other_doc])
@@ -109,8 +111,8 @@ def test_first_time_nim_is_provisioned_from_verified_campus_identity(context):
     user = context.db.query(User).filter_by(identifier=nim).one()
     assert user.auth_provider == "sads"
     assert user.role == "mahasiswa"
-    assert user.mahasiswa.nama_lengkap == "Mahasiswa Uji"
-    assert user.mahasiswa.program_studi == "IF-DEMO"
+    assert user.nama_lengkap == "Mahasiswa Uji"
+    assert user.program_studi == "IF-DEMO"
     assert user.session_version == 0
     assert me(context, body["token"])[0] == 200
     assert not context.opener.requests

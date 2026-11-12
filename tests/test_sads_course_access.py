@@ -76,7 +76,7 @@ def test_course_denial_preserves_existing_local_account(environment):
 
     db.refresh(user)
     assert (user.id, user.password, user.auth_provider, user.session_version) == original_state
-    assert user.mahasiswa is None
+    assert (user.nama_lengkap, user.program_studi, user.fakultas) == (None, None, None)
 
 
 @pytest.mark.parametrize("error", [

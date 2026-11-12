@@ -209,7 +209,7 @@ def get_check_history(
             "id": check.id,
             "document_id": check.document_id,
             "user_id": check.user_id or (doc.user_id if doc else None),
-            "owner_name": doc_user.nama_lengkap if doc_user else "Anonim",
+            "owner_name": doc_user.name if doc_user else "Anonim",
             "owner_identifier": doc_user.identifier if doc_user else "-",
             "title": doc.title if doc else "Dokumen tidak ditemukan",
             "document_type": doc.document_type if doc else "Unknown",

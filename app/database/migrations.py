@@ -3,13 +3,7 @@ from sqlalchemy import text
 from app.database.session import engine
 
 
-def migrate_alumni_repository_workflow(conn) -> None:
-    """Archive retired workflow metadata, then apply the alumni-only corpus.
-
-    The caller owns one PostgreSQL transaction. Any unexpected dependency or
-    failed statement rolls back the archive and schema/data changes together.
-    Account/document/check identities and score history are never deleted.
-    """
+def _ensure_legacy_workflow_archive(conn) -> None:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS legacy_workflow_archive (
             entity_type VARCHAR(40) NOT NULL,
@@ -19,6 +13,16 @@ def migrate_alumni_repository_workflow(conn) -> None:
             PRIMARY KEY (entity_type, entity_id)
         )
     """))
+
+
+def migrate_alumni_repository_workflow(conn) -> None:
+    """Archive retired workflow metadata, then apply the alumni-only corpus.
+
+    The caller owns one PostgreSQL transaction. Any unexpected dependency or
+    failed statement rolls back the archive and schema/data changes together.
+    Account/document/check identities and score history are never deleted.
+    """
+    _ensure_legacy_workflow_archive(conn)
     conn.execute(text("""
         DO $$ BEGIN
             IF to_regclass('dosen') IS NOT NULL THEN
@@ -56,7 +60,7 @@ def migrate_alumni_repository_workflow(conn) -> None:
             session_version = COALESCE(session_version, 0) + 1
         WHERE role = 'dosen' AND is_active IS DISTINCT FROM FALSE
     """))
-    conn.execute(text("ALTER TABLE mahasiswa DROP COLUMN IF EXISTS dosen_pembimbing_id"))
+    conn.execute(text("ALTER TABLE IF EXISTS mahasiswa DROP COLUMN IF EXISTS dosen_pembimbing_id"))
     # No CASCADE: an unanticipated dependency must fail instead of deleting it.
     conn.execute(text("DROP TABLE IF EXISTS dosen"))
     conn.execute(text("ALTER TABLE plagiarism_checks DROP COLUMN IF EXISTS approval_status"))
@@ -99,8 +103,49 @@ def migrate_alumni_repository_workflow(conn) -> None:
     conn.execute(text("ALTER TABLE plagiarism_checks ALTER COLUMN comparison_status SET NOT NULL"))
 
 
+def migrate_student_profiles_to_users(conn) -> None:
+    """Merge legacy profiles without changing user IDs or history references.
+
+    The caller owns the PostgreSQL transaction. Archive each old profile,
+    populate only unset user fields, and remove the old table without CASCADE.
+    Missing owners or unexpected dependencies abort the entire migration.
+    """
+    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS nama_lengkap VARCHAR(255)"))
+    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS program_studi VARCHAR(255)"))
+    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS fakultas VARCHAR(255)"))
+    _ensure_legacy_workflow_archive(conn)
+    conn.execute(text("""
+        DO $$ BEGIN
+            IF to_regclass('mahasiswa') IS NOT NULL THEN
+                LOCK TABLE mahasiswa IN ACCESS EXCLUSIVE MODE;
+                IF EXISTS (
+                    SELECT 1 FROM mahasiswa AS m
+                    LEFT JOIN users AS u ON u.id = m.id
+                    WHERE u.id IS NULL
+                ) THEN
+                    RAISE EXCEPTION 'Student profile migration found a profile without a user';
+                END IF;
+
+                INSERT INTO legacy_workflow_archive (entity_type, entity_id, payload)
+                SELECT 'student_profile', id, to_jsonb(m) FROM mahasiswa AS m
+                ON CONFLICT DO NOTHING;
+
+                UPDATE users AS u SET
+                    nama_lengkap = COALESCE(u.nama_lengkap, m.nama_lengkap),
+                    program_studi = COALESCE(u.program_studi, m.program_studi),
+                    fakultas = COALESCE(u.fakultas, m.fakultas)
+                FROM mahasiswa AS m WHERE u.id = m.id;
+
+                DROP TABLE mahasiswa;
+            END IF;
+        END $$
+    """))
+
+
 def ensure_runtime_columns() -> None:
     with engine.connect() as conn:
+        # Multiple API processes can start together; serialize schema changes.
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('plagiarism_backend_runtime_schema'))"))
         # Existing databases need this before JWTs with a session version are
         # accepted. The default safely invalidates pre-versioned JWTs.
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0"))
@@ -251,6 +296,7 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_author_created_at ON support_messages(author_id, created_at)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_support_messages_ticket_created_at ON support_messages(ticket_id, created_at)"))
         migrate_alumni_repository_workflow(conn)
+        migrate_student_profiles_to_users(conn)
         conn.commit()
 
     try:

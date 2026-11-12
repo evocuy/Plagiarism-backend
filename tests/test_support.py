@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base, get_db
-from app.models.schemas import Mahasiswa, SupportMessage, SupportTicket, User
+from app.models.schemas import SupportMessage, SupportTicket, User
 from app.routes import support
 from app.routes.auth import create_access_token, get_current_user, require_admin
 from app.services import support_service
@@ -59,16 +59,14 @@ def environment(monkeypatch):
     Base.metadata.create_all(bind=engine)
     factory = sessionmaker(bind=engine)
     db = factory()
-    student = User(identifier="1234", password="hash", role="mahasiswa")
-    other = User(identifier="5678", password="hash", role="mahasiswa")
+    student = User(identifier="1234", password="hash", role="mahasiswa",
+                   nama_lengkap="Mahasiswa Pertama", program_studi="TI", fakultas="FT")
+    other = User(identifier="5678", password="hash", role="mahasiswa",
+                 nama_lengkap="Mahasiswa Kedua", program_studi="TI", fakultas="FT")
     admin = User(identifier="admin", password="hash", role="admin")
     lecturer = User(identifier="lecturer", password="hash", role="dosen")
     db.add_all([student, other, admin, lecturer])
     db.flush()
-    db.add_all([
-        Mahasiswa(id=student.id, nama_lengkap="Mahasiswa Pertama", program_studi="TI", fakultas="FT"),
-        Mahasiswa(id=other.id, nama_lengkap="Mahasiswa Kedua", program_studi="TI", fakultas="FT"),
-    ])
     db.commit()
     tokens = {name: create_access_token(user) for name, user in {
         "student": student, "other": other, "admin": admin, "lecturer": lecturer,
@@ -263,16 +261,16 @@ def test_postgresql_concurrent_requests_cannot_bypass_account_limits(monkeypatch
         schema_created = True
         engine = create_engine(url, connect_args={"options": f"-csearch_path={schema_name}"})
         Base.metadata.create_all(bind=engine, tables=[
-            User.__table__, Mahasiswa.__table__, SupportTicket.__table__, SupportMessage.__table__,
+            User.__table__, SupportTicket.__table__, SupportMessage.__table__,
         ])
         factory = sessionmaker(bind=engine, expire_on_commit=False)
         clock = [datetime(2026, 10, 19, 1, 0, 0)]
         monkeypatch.setattr(support_service, "utc_now", lambda: clock[0])
         with factory() as db:
-            student = User(identifier="concurrent-student", password="hash", role="mahasiswa")
+            student = User(identifier="concurrent-student", password="hash", role="mahasiswa",
+                           nama_lengkap="Student", program_studi="TI", fakultas="FT")
             db.add(student)
             db.flush()
-            db.add(Mahasiswa(id=student.id, nama_lengkap="Student", program_studi="TI", fakultas="FT"))
             for age in (timedelta(minutes=2), timedelta(minutes=1)):
                 timestamp = clock[0] - age
                 ticket = SupportTicket(

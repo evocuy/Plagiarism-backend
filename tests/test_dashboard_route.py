@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database.session import Base
-from app.models.schemas import Document, Mahasiswa, PlagiarismCheck, User
+from app.models.schemas import Document, PlagiarismCheck, User
 from app.routes.dashboard import get_dashboard_summary
 
 
@@ -16,11 +16,11 @@ def _make_session():
 
 def _seed_dashboard_data(db):
     admin = User(identifier="admin", password="secret", role="admin")
-    student = User(identifier="student", password="secret", role="mahasiswa")
+    student = User(identifier="student", password="secret", role="mahasiswa",
+                   nama_lengkap="Mahasiswa", program_studi="Informatika", fakultas="Teknik")
     other = User(identifier="other", password="secret", role="mahasiswa")
     db.add_all([admin, student, other])
     db.flush()
-    db.add(Mahasiswa(id=student.id, nama_lengkap="Mahasiswa", program_studi="Informatika", fakultas="Teknik"))
     own = Document(user_id=student.id, title="Own.pdf", document_type="proposal", file_path="own.pdf")
     elsewhere = Document(user_id=other.id, title="Other.pdf", document_type="skripsi", file_path="other.pdf")
     db.add_all([own, elsewhere])

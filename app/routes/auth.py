@@ -13,7 +13,7 @@ from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
-from app.models.schemas import User, Mahasiswa, SUPPORTED_USER_ROLES
+from app.models.schemas import User, SUPPORTED_USER_ROLES
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
 from app.services.sads_course_service import SadsActiveCoursesService
@@ -192,12 +192,12 @@ def _build_user_response(user: User) -> dict:
         "id": user.id,
         "identifier": user.identifier,
         "role": user.role,
-        "nama_lengkap": user.nama_lengkap,
-        "name": user.nama_lengkap,
+        "nama_lengkap": user.name,
+        "name": user.name,
     }
-    if user.role == "mahasiswa" and user.mahasiswa:
-        res["program_studi"] = user.mahasiswa.program_studi
-        res["fakultas"] = user.mahasiswa.fakultas
+    if user.role == "mahasiswa":
+        res["program_studi"] = user.program_studi
+        res["fakultas"] = user.fakultas
     return res
 
 class LoginResponse(BaseModel):
@@ -640,18 +640,12 @@ def create_user(
         identifier=request.identifier,
         password=password_hash.hash(request.password),
         role=request.role,
+        nama_lengkap=request.nama_lengkap or request.identifier,
     )
     db.add(new_user)
-    db.flush()  # dapatkan new_user.id
-
-    # Buat profil ekstensi One-to-One spesifik sesuai role
     if request.role == "mahasiswa":
-        db.add(Mahasiswa(
-            id=new_user.id,
-            nama_lengkap=request.name,
-            program_studi=request.program_studi or "Teknik Informatika",
-            fakultas=request.fakultas or "Fakultas Ilmu Komputer",
-        ))
+        new_user.program_studi = request.program_studi or "Teknik Informatika"
+        new_user.fakultas = request.fakultas or "Fakultas Ilmu Komputer"
 
     db.commit()
     db.refresh(new_user)
@@ -700,23 +694,13 @@ def update_user(
         password_changed = True
 
     nama = request.nama_lengkap or request.name
-
-    # Update profil sesuai role
+    if nama:
+        target_user.nama_lengkap = nama
     if target_user.role == "mahasiswa":
-        if not target_user.mahasiswa:
-            target_user.mahasiswa = Mahasiswa(
-                id=target_user.id,
-                nama_lengkap=nama or target_user.identifier,
-                program_studi=request.program_studi or "Teknik Informatika",
-                fakultas=request.fakultas or "Fakultas Ilmu Komputer",
-            )
-        else:
-            if nama:
-                target_user.mahasiswa.nama_lengkap = nama
-            if request.program_studi:
-                target_user.mahasiswa.program_studi = request.program_studi
-            if request.fakultas:
-                target_user.mahasiswa.fakultas = request.fakultas
+        if request.program_studi or target_user.program_studi is None:
+            target_user.program_studi = request.program_studi or "Teknik Informatika"
+        if request.fakultas or target_user.fakultas is None:
+            target_user.fakultas = request.fakultas or "Fakultas Ilmu Komputer"
 
     if password_changed:
         db.execute(
@@ -749,7 +733,7 @@ def delete_user(
             detail="Pengguna tidak ditemukan.",
         )
 
-    nama = target_user.nama_lengkap
+    nama = target_user.name
     db.delete(target_user)
     db.commit()
     return {"message": f"Pengguna '{nama}' berhasil dihapus."}

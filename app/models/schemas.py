@@ -24,7 +24,7 @@ SUPPORTED_USER_ROLES = ("admin", "super_admin", "mahasiswa")
 
 class User(Base):
     """
-    Tabel users (Khusus autentikasi dan role dasar):
+    Tabel users (Autentikasi, role, dan profil pengguna):
     - id (Primary Key)
     - identifier (String, unique, index) -> NIM mahasiswa atau identifier admin
     - password (String) -> untuk simpan hashed password
@@ -36,6 +36,9 @@ class User(Base):
     identifier = Column(String(100), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, index=True)
+    nama_lengkap = Column(String(255), nullable=True)
+    program_studi = Column(String(255), nullable=True)
+    fakultas = Column(String(255), nullable=True)
     auth_provider = Column(String(20), nullable=False, default="local", server_default=text("'local'"))
     # Retired demo accounts retain document/profile references but cannot log in.
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
@@ -43,32 +46,14 @@ class User(Base):
     # change cannot remain valid server-side.
     session_version = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
-    # Relasi One-to-One ke profil ekstensi (One-to-One Profile Extension)
-    mahasiswa = relationship("Mahasiswa", back_populates="user", uselist=False, cascade="all, delete-orphan")
-
     # Relasi dokumen & pengecekan plagiarisme
     documents = relationship("Document", back_populates="user", cascade="all, delete-orphan")
     checks = relationship("PlagiarismCheck", back_populates="user")
 
-    # Helper properties agar ORM / Pydantic dapat mengakses data flat secara elegan
-    @property
-    def nama_lengkap(self) -> str:
-        if self.mahasiswa and self.mahasiswa.nama_lengkap:
-            return self.mahasiswa.nama_lengkap
-        return self.identifier
-
     @property
     def name(self) -> str:
-        """Alias backwards-compatibility untuk nama_lengkap."""
-        return self.nama_lengkap
-
-    @property
-    def program_studi(self) -> Optional[str]:
-        return self.mahasiswa.program_studi if self.mahasiswa else None
-
-    @property
-    def fakultas(self) -> Optional[str]:
-        return self.mahasiswa.fakultas if self.mahasiswa else None
+        """Nama tampilan dengan fallback untuk akun lama tanpa profil."""
+        return self.nama_lengkap or self.identifier
 
 class LoginThrottle(Base):
     """Expiring login counters shared by all API processes and restarts."""
@@ -94,24 +79,6 @@ class ImpersonationSession(Base):
     ended_at = Column(DateTime, nullable=True)
     end_reason = Column(String(40), nullable=True)
 
-
-class Mahasiswa(Base):
-    """
-    Tabel mahasiswa (Profil detail mahasiswa):
-    - id (Primary Key, sekaligus Foreign Key me-referensi ke users.id dengan relasi One-to-One)
-    - nama_lengkap (String)
-    - program_studi (String)
-    - fakultas (String)
-    """
-    __tablename__ = "mahasiswa"
-
-    id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    nama_lengkap = Column(String(255), nullable=False)
-    program_studi = Column(String(255), nullable=False)
-    fakultas = Column(String(255), nullable=False)
-
-    # Relasi One-to-One kembali ke User
-    user = relationship("User", back_populates="mahasiswa")
 
 class Document(Base):
     __tablename__ = "documents"

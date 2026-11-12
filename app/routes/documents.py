@@ -461,7 +461,7 @@ def get_all_documents(
         results.append({
             "id": doc.id,
             "user_id": doc.user_id,
-            "owner_name": doc.user.nama_lengkap if doc.user else "Anonim",
+            "owner_name": doc.user.name if doc.user else "Anonim",
             "owner_identifier": doc.user.identifier if doc.user else "-",
             "title": doc.title,
             "document_type": doc.document_type,

@@ -168,7 +168,7 @@ def create_ticket(db: Session, current_user: User, category: str, subject: str, 
 
     ticket = SupportTicket(
         owner_id=user.id,
-        owner_name=user.nama_lengkap,
+        owner_name=user.name,
         owner_identifier=user.identifier,
         category=category,
         subject=subject,
@@ -181,7 +181,7 @@ def create_ticket(db: Session, current_user: User, category: str, subject: str, 
     db.add(SupportMessage(
         ticket_id=ticket.id,
         author_id=user.id,
-        author_name=user.nama_lengkap,
+        author_name=user.name,
         author_role="mahasiswa",
         message=message,
         created_at=now,
@@ -213,7 +213,7 @@ def add_message(db: Session, current_user: User, ticket_id: int, message: str) -
     db.add(SupportMessage(
         ticket_id=ticket.id,
         author_id=user.id,
-        author_name=user.nama_lengkap,
+        author_name=user.name,
         author_role="admin" if is_admin else "mahasiswa",
         message=message,
         created_at=now,

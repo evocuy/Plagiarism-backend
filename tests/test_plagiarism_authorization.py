@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database.session import Base
-from app.models.schemas import Document, Mahasiswa, PlagiarismCheck, User
+from app.models.schemas import Document, PlagiarismCheck, User
 from app.routes import plagiarism as plagiarism_routes
 from app.routes.auth import get_current_user
 
@@ -18,17 +18,10 @@ def _make_session():
 
 
 def _add_student(db, identifier):
-    student = User(identifier=identifier, password="secret", role="mahasiswa")
+    student = User(identifier=identifier, password="secret", role="mahasiswa",
+                   nama_lengkap=identifier, program_studi="Informatika", fakultas="Teknik")
     db.add(student)
     db.flush()
-    db.add(
-        Mahasiswa(
-            id=student.id,
-            nama_lengkap=identifier,
-            program_studi="Informatika",
-            fakultas="Teknik",
-        )
-    )
     return student
 
 

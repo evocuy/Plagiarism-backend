@@ -10,6 +10,9 @@ Login mahasiswa SADS dengan pembatasan mata kuliah aktif Seminar/Skripsi/Tugas A
 Impersonasi mahasiswa oleh admin melalui NIM, termasuk kontrak frontend:
 [deployment/IMPERSONATION.md](deployment/IMPERSONATION.md).
 
+Penggabungan profil mahasiswa ke `users` dan migrasi PostgreSQL:
+[deployment/USER_PROFILE_MIGRATION.md](deployment/USER_PROFILE_MIGRATION.md).
+
 ---
 
 ## 📁 Struktur Direktori Backend
@@ -20,11 +23,11 @@ backend/
 │   ├── database/
 │   │   └── session.py            # Koneksi database SQLAlchemy engine & session
 │   ├── models/
-│   │   └── schemas.py            # Model tabel database (User, Mahasiswa, Dosen, Document, PlagiarismReport, dll.)
+│   │   └── schemas.py            # Model pengguna/profil, dokumen, hasil kemiripan, dan sesi impersonasi
 │   ├── routes/
 │   │   ├── auth.py               # Endpoint autentikasi, JWT cookie/header, CRUD pengguna, & seeding user
 │   │   ├── documents.py          # Endpoint upload file, daftar dokumen, & download/view dokumen
-│   │   └── plagiarism.py         # Endpoint analisis plagiarisme, approval dosen, dan riwayat cek
+│   │   └── plagiarism.py         # Endpoint analisis kemiripan, highlight, dan riwayat cek
 │   ├── services/
 │   │   ├── pdf_service.py        # Ekstraksi teks & pemrosesan file PDF
 │   │   └── preprocessing_service.py # Normalisasi teks, tokenisasi, n-gram, & komparasi kemiripan
@@ -108,7 +111,8 @@ Server akan aktif di:
 
 Tidak ada password bawaan dalam kode. Untuk database baru, isi
 `BOOTSTRAP_ADMIN_PASSWORD` di `.env` saat bootstrap admin `cihuy`, lalu kosongkan
-setelah akun berhasil dibuat. Akun mahasiswa dan dosen dibuat oleh admin.
+setelah akun berhasil dibuat. Mahasiswa dapat dibuat melalui login SADS atau
+impersonasi yang memenuhi syarat; admin juga dapat membuat akun lokal.
 ---
 
 ## 📌 Ringkasan Endpoint Utama

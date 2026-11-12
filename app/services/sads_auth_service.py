@@ -23,7 +23,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.schemas import Mahasiswa, User
+from app.models.schemas import User
 
 
 def auth_error(status_code: int, detail: str) -> HTTPException:
@@ -240,14 +240,9 @@ class SadsAuthService:
         except IntegrityError:
             db.rollback()
             raise auth_error(409, "Akun sedang diperbarui. Silakan ulangi login.") from None
-        if user.mahasiswa is None:
-            user.mahasiswa = Mahasiswa(
-                nama_lengkap=profile.name,
-                program_studi=profile.study_program,
-                fakultas="",  # Not supplied by the observed SADS response.
-            )
-        else:
-            user.mahasiswa.nama_lengkap = profile.name
-            user.mahasiswa.program_studi = profile.study_program
+        user.nama_lengkap = profile.name
+        user.program_studi = profile.study_program
+        if user.fakultas is None:
+            user.fakultas = ""  # Not supplied by the observed SADS response.
         # The caller commits the profile and session-version rotation together.
         return user
