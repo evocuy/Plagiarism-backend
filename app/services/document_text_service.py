@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.models.schemas import Document
 from app.services.pdf_service import PDFService, PDF_EXTRACTION_VERSION
 from app.services.similarity_service import SimilarityService
+from app.services.error_service import TEXT_ERROR, report_error
 
 
 class DocumentTextService:
@@ -51,7 +52,7 @@ class DocumentTextService:
                 "cleaned_text": document.cleaned_text or "",
             }
         except Exception as exc:
-            document.text_extraction_error = str(exc)
+            document.text_extraction_error = report_error(exc, TEXT_ERROR, operation="extract_document_text").text
             db.add(document)
             db.commit()
             raise

@@ -18,6 +18,7 @@ from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
 from app.services.sads_course_service import SadsActiveCoursesService
 from app.services import impersonation_service
+from app.services.csrf_service import create_csrf_token
 
 router = APIRouter()
 
@@ -203,6 +204,7 @@ def _build_user_response(user: User) -> dict:
 class LoginResponse(BaseModel):
     token: str
     user: UserResponse
+    csrf_token: str
 
 class CreateUserRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
@@ -525,6 +527,7 @@ def login(
     return {
         "token": token,
         "user": _build_user_response(user),
+        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
     }
 
 
@@ -554,6 +557,7 @@ def start_admin_impersonation(
         "token": token,
         "user": _build_user_response(target),
         "impersonation": impersonation_service.impersonation_data(session),
+        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
     }
 
 
@@ -586,7 +590,25 @@ def stop_admin_impersonation(
     remaining = max(0, int((claims.expires_at - datetime.now(timezone.utc)).total_seconds()))
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _set_session_cookie(response, token, max_age=remaining)
-    return {"token": token, "user": _build_user_response(admin), "impersonation": {"active": False}}
+    return {
+        "token": token, "user": _build_user_response(admin), "impersonation": {"active": False},
+        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
+    }
+
+
+@router.get("/csrf")
+def get_csrf_token(http_request: Request, response: Response):
+    """Bootstrap protection, including an expired overlay when returning to admin.
+
+    This endpoint does not authenticate or renew a session. Normal route
+    dependencies still validate JWTs; stopping impersonation validates the
+    original admin credential independently of the overlay.
+    """
+    _set_no_store(response)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    cookies = http_request.cookies
+    token = cookies.get(IMPERSONATION_COOKIE_NAME) if IMPERSONATION_COOKIE_NAME in cookies else cookies.get(SESSION_COOKIE_NAME)
+    return {"csrf_token": create_csrf_token(token, _jwt_secret_key()) if token is not None else None}
 
 
 @router.get("/me", response_model=UserResponse)

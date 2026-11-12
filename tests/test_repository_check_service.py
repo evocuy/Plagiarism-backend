@@ -270,7 +270,7 @@ def test_repository_check_marks_provisional_check_failed_without_exposing_raw_er
     db.refresh(provisional_check)
     assert provisional_check.status == "failed"
     assert provisional_check.processing_stage == "failed"
-    assert provisional_check.error_message == "Pengecekan gagal diproses. Silakan coba lagi."
+    assert provisional_check.error_message.startswith("Pengecekan gagal diproses. Silakan coba lagi. (ID error: ")
     assert "internal parser detail" not in provisional_check.error_message
 
 

@@ -4,6 +4,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from app.services.error_service import EMBEDDING_ERROR, report_error
 
 
 class EmbeddingService:
@@ -92,7 +93,6 @@ class EmbeddingService:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Embedding API error {exc.code}: {error_body}") from exc
+            raise RuntimeError(report_error(exc, EMBEDDING_ERROR, operation="embedding_http_request").text) from None
         except URLError as exc:
-            raise RuntimeError(f"Gagal menghubungi Embedding API: {exc.reason}") from exc
+            raise RuntimeError(report_error(exc, EMBEDDING_ERROR, operation="embedding_connection").text) from None

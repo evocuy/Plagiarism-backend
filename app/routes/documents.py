@@ -28,6 +28,10 @@ from app.services.document_structure_service import DocumentStructureService
 from app.services.document_text_service import DocumentTextService
 from app.services.check_queue_service import CheckQueueService
 from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
+from app.services.error_service import (
+    CHUNK_ERROR, DELETE_ERROR, EMBEDDING_ERROR, REINDEX_ERROR, TEXT_ERROR,
+    public_error_message, report_error,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -126,14 +130,14 @@ def _delete_managed_upload_file(file_path: Optional[str]) -> bool:
         upload_root = UPLOAD_DIR.resolve()
         candidate = Path(file_path).resolve()
         if not candidate.is_relative_to(upload_root):
-            logger.warning("Melewati penghapusan file di luar upload directory: %s", candidate)
+            logger.warning("Melewati penghapusan file di luar upload directory")
             return False
         if not candidate.is_file():
             return False
         candidate.unlink()
         return True
     except (OSError, RuntimeError, ValueError) as error:
-        logger.warning("Gagal menghapus file dokumen %s: %s", file_path, error)
+        report_error(error, DELETE_ERROR, operation="delete_managed_artifact")
         return False
 
 
@@ -177,7 +181,7 @@ async def _store_uploaded_document(
     try:
         clean_type = document_structure_service.normalize_document_type(document_type)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Tipe dokumen harus berupa Skripsi atau Proposal.") from None
 
     stored_filename = f"{uuid4().hex}_{original_filename}"
     file_path = UPLOAD_DIR / stored_filename
@@ -242,7 +246,7 @@ async def _store_uploaded_document(
             if file_path.exists():
                 file_path.unlink()
         except OSError as cleanup_error:
-            logger.warning("Gagal menghapus file upload yang dibatalkan %s: %s", file_path, cleanup_error)
+            report_error(cleanup_error, DELETE_ERROR, operation="cleanup_rejected_upload")
         raise
 
 @router.post("/upload")
@@ -281,16 +285,14 @@ async def upload_document(
         await run_in_threadpool(document_text_service.get_or_extract_text, db_doc, db)
     except Exception as err:
         text_cache_status = "failed"
-        text_cache_error = str(err)
-        logger.warning(f"Gagal membuat cache teks untuk dokumen {db_doc.id}: {err}")
+        text_cache_error = report_error(err, TEXT_ERROR, operation="upload_text_cache").text
 
     try:
         chunks = await run_in_threadpool(document_chunk_service.get_or_build_sentence_chunks, db_doc, db)
         chunk_count = len(chunks)
     except Exception as err:
         chunk_cache_status = "failed"
-        chunk_cache_error = str(err)
-        logger.warning(f"Gagal membuat cache chunk untuk dokumen {db_doc.id}: {err}")
+        chunk_cache_error = report_error(err, CHUNK_ERROR, operation="upload_chunk_cache").text
 
     if auto_index_embeddings:
         try:
@@ -309,14 +311,15 @@ async def upload_document(
             }
         except Exception as err:
             db.rollback()
+            error = report_error(err, EMBEDDING_ERROR, operation="upload_embeddings")
             embedding_auto_index = {
                 "enabled": True,
                 "configured": document_embedding_service.embedding_service.is_configured(),
                 "embedding_model": document_embedding_service.embedding_service.model,
                 "status": "failed",
-                "reason": str(err),
+                "reason": "embedding_index_failed",
+                "error_id": error.error_id,
             }
-            logger.warning(f"Gagal auto-index embedding dokumen {db_doc.id}: {err}")
 
     return {
         "id": db_doc.id,
@@ -413,11 +416,7 @@ async def upload_and_check_document(
                 if stored_file_path.exists():
                     stored_file_path.unlink()
             except OSError as cleanup_error:
-                logger.warning(
-                    "Gagal menghapus file upload untuk check yang batal %s: %s",
-                    stored_file_path,
-                    cleanup_error,
-                )
+                report_error(cleanup_error, DELETE_ERROR, operation="cleanup_rejected_check")
         raise
 
     return {
@@ -477,7 +476,7 @@ def get_all_documents(
             # display-safe filename rather than the internal storage path.
             "file_path": doc.title,
             "text_cache_status": "completed" if doc.text_extracted_at else "pending",
-            "text_extraction_error": doc.text_extraction_error,
+            "text_extraction_error": public_error_message(doc.text_extraction_error, TEXT_ERROR),
             "chunk_count": len(doc.chunks),
             "created_at": doc.created_at.isoformat() if doc.created_at else None,
         })
@@ -503,12 +502,13 @@ def reindex_documents(
         try:
             results.append(document_index_service.reindex_document(document, db))
         except Exception as err:
+            error = report_error(err, REINDEX_ERROR, operation="batch_reindex")
             failed.append({
                 "document_id": document.id,
                 "title": document.title,
-                "error": str(err),
+                "error": error.text,
+                "error_id": error.error_id,
             })
-            logger.warning(f"Gagal reindex dokumen {document.id}: {err}")
 
     return {
         "total_requested": len(document_ids) if document_ids else len(documents),
@@ -554,12 +554,13 @@ def index_document_embeddings(
                 )
             )
         except Exception as err:
+            error = report_error(err, EMBEDDING_ERROR, operation="batch_embeddings")
             failed.append({
                 "document_id": document.id,
                 "title": document.title,
-                "error": str(err),
+                "error": error.text,
+                "error_id": error.error_id,
             })
-            logger.warning(f"Gagal index embedding dokumen {document.id}: {err}")
 
     return {
         "embedding_model": document_embedding_service.embedding_service.model,
@@ -588,8 +589,7 @@ def reindex_document(
     try:
         result = document_index_service.reindex_document(document, db)
     except Exception as err:
-        logger.warning(f"Gagal reindex dokumen {document.id}: {err}")
-        raise HTTPException(status_code=500, detail=f"Gagal reindex dokumen: {str(err)}")
+        raise report_error(err, REINDEX_ERROR, operation="reindex_document").http_exception() from None
 
     return result
 
@@ -623,8 +623,7 @@ def index_single_document_embeddings(
             refresh_embeddings=request.refresh_embeddings if request else False,
         )
     except Exception as err:
-        logger.warning(f"Gagal index embedding dokumen {document.id}: {err}")
-        raise HTTPException(status_code=500, detail=f"Gagal index embedding dokumen: {str(err)}")
+        raise report_error(err, EMBEDDING_ERROR, operation="document_embeddings").http_exception() from None
 
 @router.delete("/clear")
 def clear_all_documents(
@@ -682,8 +681,7 @@ def delete_document(
         db.refresh(document)
     except Exception as error:
         db.rollback()
-        logger.exception("Gagal menonaktifkan dokumen %s: %s", document_id, error)
-        raise HTTPException(status_code=500, detail="Gagal menonaktifkan dokumen.") from error
+        raise report_error(error, DELETE_ERROR, operation="delete_document").http_exception() from None
 
     return {
         "document_id": document_id,

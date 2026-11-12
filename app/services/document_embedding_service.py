@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.schemas import Document, DocumentChunk
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.embedding_service import EmbeddingService
+from app.services.error_service import EMBEDDING_ERROR, report_error
 
 
 class DocumentEmbeddingService:
@@ -175,13 +176,15 @@ class DocumentEmbeddingService:
             try:
                 vectors = self.embedding_service.embed_texts([chunk.cleaned_text for chunk in batch])
             except Exception as err:
+                error = report_error(err, EMBEDDING_ERROR, operation="embed_chunk_batch")
                 for chunk in batch:
-                    self._mark_chunk_embedding_error(chunk, db, str(err))
+                    self._mark_chunk_embedding_error(chunk, db, error.text)
                 failed.extend([
                     {
                         "chunk_id": chunk.id,
                         "chunk_index": chunk.chunk_index,
-                        "error": str(err),
+                        "error": error.text,
+                        "error_id": error.error_id,
                     }
                     for chunk in batch
                 ])
@@ -192,11 +195,13 @@ class DocumentEmbeddingService:
                     self._store_chunk_embedding(chunk, vector, db)
                     indexed += 1
                 except Exception as err:
-                    self._mark_chunk_embedding_error(chunk, db, str(err))
+                    error = report_error(err, EMBEDDING_ERROR, operation="store_chunk_embedding")
+                    self._mark_chunk_embedding_error(chunk, db, error.text)
                     failed.append({
                         "chunk_id": chunk.id,
                         "chunk_index": chunk.chunk_index,
-                        "error": str(err),
+                        "error": error.text,
+                        "error_id": error.error_id,
                     })
 
         return {

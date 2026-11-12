@@ -17,16 +17,20 @@ from app.routes import auth
 TEST_JWT_SECRET = "auth-session-test-secret-that-is-long-enough-1234567890"
 
 
-def request(app, method, path, *, authorization=None, cookie=None, cookies=None, body=None):
-    body_bytes = json.dumps(body).encode() if body is not None else b""
-    headers = [(b"content-type", b"application/json")]
+def request(app, method, path, *, authorization=None, cookie=None, cookies=None, body=None, headers=None, raw_body=None):
+    body_bytes = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else b"")
+    request_headers = [(b"content-type", b"application/json")]
     if authorization is not None:
-        headers.append((b"authorization", authorization.encode()))
+        request_headers.append((b"authorization", authorization.encode()))
     cookie_values = dict(cookies or {})
     if cookie is not None:
         cookie_values[auth.SESSION_COOKIE_NAME] = cookie
     if cookie_values:
-        headers.append((b"cookie", "; ".join(f"{key}={value}" for key, value in cookie_values.items()).encode()))
+        request_headers.append((b"cookie", "; ".join(f"{key}={value}" for key, value in cookie_values.items()).encode()))
+    for key, value in (headers or {}).items():
+        key_bytes = key.lower().encode()
+        request_headers = [(name, content) for name, content in request_headers if name != key_bytes]
+        request_headers.append((key_bytes, value.encode()))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -37,7 +41,7 @@ def request(app, method, path, *, authorization=None, cookie=None, cookies=None,
         "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
-        "headers": headers,
+        "headers": request_headers,
         "client": ("test", 1),
         "server": ("test", 443),
     }
@@ -59,7 +63,11 @@ def request(app, method, path, *, authorization=None, cookie=None, cookies=None,
     content = b"".join(event.get("body", b"") for event in events if event["type"] == "http.response.body")
     response_headers = {key.decode().lower(): value.decode() for key, value in start["headers"]}
     response_headers["set-cookie-all"] = [value.decode() for key, value in start["headers"] if key == b"set-cookie"]
-    return start["status"], response_headers, json.loads(content)
+    try:
+        parsed_content = json.loads(content)
+    except json.JSONDecodeError:
+        parsed_content = content.decode()
+    return start["status"], response_headers, parsed_content
 
 
 def token_from_set_cookie(set_cookie: str) -> str:

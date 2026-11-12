@@ -13,6 +13,9 @@ Impersonasi mahasiswa oleh admin melalui NIM, termasuk kontrak frontend:
 Penggabungan profil mahasiswa ke `users` dan migrasi PostgreSQL:
 [deployment/USER_PROFILE_MIGRATION.md](deployment/USER_PROFILE_MIGRATION.md).
 
+CSRF untuk sesi cookie, kesiapan PDF highlight, dan error tanpa detail internal:
+[deployment/COOKIE_PDF_ERROR_HARDENING.md](deployment/COOKIE_PDF_ERROR_HARDENING.md).
+
 ---
 
 ## 📁 Struktur Direktori Backend

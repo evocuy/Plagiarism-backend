@@ -1,5 +1,9 @@
 # Impersonasi mahasiswa oleh admin
 
+Untuk sesi cookie, start/stop impersonasi sekarang wajib memakai X-CSRF-Token.
+Simpan csrf_token dari respons dan ikuti bootstrap saat reload/overlay expired
+di [COOKIE_PDF_ERROR_HARDENING.md](COOKIE_PDF_ERROR_HARDENING.md).
+
 Admin yang sudah login dapat menguji aplikasi sebagai mahasiswa dengan
 memasukkan NIM, tanpa password mahasiswa. Backend memeriksa NIM dan mata kuliah
 melalui API mata kuliah aktif SADS. Tetap wajib mengambil `Seminar`, `Skripsi`,

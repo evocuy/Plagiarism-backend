@@ -21,6 +21,7 @@ from app.services.similarity_result_service import SimilarityResultService
 from app.services.watermark_service import WatermarkService
 from app.routes.auth import get_current_user
 from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
+from app.services.error_service import CHECK_ERROR, public_error_message
 
 router = APIRouter()
 pdf_service = PDFService()
@@ -204,7 +205,7 @@ def get_check_history(
     for check in checks:
         doc = check.document
         doc_user = doc.user if doc and doc.user else (check.user if check.user else None)
-        has_highlighted = bool(check.highlighted_file_path and os.path.exists(check.highlighted_file_path))
+        has_highlighted = bool(check.status == "completed" and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path))
         results.append({
             "id": check.id,
             "document_id": check.document_id,
@@ -222,8 +223,8 @@ def get_check_history(
             "status": check.status,
             "progress": 100 if check.status == "completed" else int(check.progress or 0),
             "processing_stage": check.processing_stage,
-            "processing_message": check.processing_message,
-            "error_message": check.error_message if check.status == "failed" else None,
+            "processing_message": public_error_message(check.processing_message, CHECK_ERROR) if check.status == "failed" else check.processing_message,
+            "error_message": public_error_message(check.error_message, CHECK_ERROR) if check.status == "failed" else None,
             "repository_status": doc.repository_status if doc else None,
             "repository_published_at": (
                 doc.repository_published_at.isoformat()
@@ -283,7 +284,7 @@ def _get_active_check(check_id: int, db: Session) -> Optional[PlagiarismCheck]:
 def _serialize_check_progress(check: PlagiarismCheck) -> dict:
     is_completed = check.status == "completed"
     has_highlighted_pdf = bool(
-        check.highlighted_file_path and os.path.exists(check.highlighted_file_path)
+        is_completed and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path)
     )
     progress = 100 if is_completed else int(check.progress or 0)
     return {
@@ -292,8 +293,8 @@ def _serialize_check_progress(check: PlagiarismCheck) -> dict:
         "status": check.status,
         "progress": progress,
         "stage": check.processing_stage or ("completed" if is_completed else "queued"),
-        "message": check.processing_message,
-        "error": check.error_message if check.status == "failed" else None,
+        "message": public_error_message(check.processing_message, CHECK_ERROR) if check.status == "failed" else check.processing_message,
+        "error": public_error_message(check.error_message, CHECK_ERROR) if check.status == "failed" else None,
         "is_finished": check.status in {"completed", "failed"},
         "comparison_status": check.comparison_status,
         "overall_similarity": check.overall_similarity if is_completed and check.comparison_status != "no_comparison_sources" else None,
@@ -425,7 +426,7 @@ def _serialize_check_final_result(
         else {}
     )
     highlighted_pdf_available = bool(
-        check.highlighted_file_path and os.path.exists(check.highlighted_file_path)
+        check.status == "completed" and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path)
     )
     is_completed = check.status == "completed"
 
@@ -435,8 +436,8 @@ def _serialize_check_final_result(
         "status": check.status,
         "progress": 100 if is_completed else int(check.progress or 0),
         "is_finished": check.status in {"completed", "failed"},
-        "message": check.processing_message,
-        "error": check.error_message if check.status == "failed" else None,
+        "message": public_error_message(check.processing_message, CHECK_ERROR) if check.status == "failed" else check.processing_message,
+        "error": public_error_message(check.error_message, CHECK_ERROR) if check.status == "failed" else None,
         "target_document": target_document.title if target_document else "Dokumen tidak ditemukan",
         "comparison_status": check.comparison_status,
         "overall_similarity": None if check.comparison_status == "no_comparison_sources" else check.overall_similarity,
@@ -615,26 +616,22 @@ def download_highlighted_pdf(
     if not _can_access_check(check, current_user, db):
         raise HTTPException(status_code=403, detail="Anda tidak memiliki izin untuk melihat dokumen ini.")
 
+    if check.status != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="PDF hasil belum siap. Tunggu hingga pengecekan selesai." if check.status in {"pending", "processing"} else "PDF hasil tidak tersedia karena pengecekan belum berhasil.",
+            headers={"Cache-Control": "no-store", **({"Retry-After": "5"} if check.status in {"pending", "processing"} else {})},
+        )
+
     file_to_send = check.highlighted_file_path
-    if not file_to_send or not os.path.exists(file_to_send):
-        # Fallback jika belum di-generate atau file terhapus, generate sekarang dari dokumen asli
-        if check.document and os.path.exists(check.document.file_path):
-            output_filename = f"highlighted_check_{check.id}_{Path(check.document.file_path).stem}.pdf"
-            file_to_send = pdf_service.generate_highlighted_pdf(
-                source_pdf_path=check.document.file_path,
-                plagiarized_sentences=[],
-                output_filename=output_filename,
-            )
-            check.highlighted_file_path = file_to_send
-            db.commit()
-            db.refresh(check)
-        else:
-            raise HTTPException(status_code=404, detail="File PDF hasil stabilo tidak tersedia di server.")
+    if not file_to_send or not os.path.isfile(file_to_send):
+        raise HTTPException(status_code=404, detail="File PDF hasil tidak tersedia. Silakan ulangi pengecekan.", headers={"Cache-Control": "no-store"})
 
     clean_filename = f"Hasil_Plagiasi_{Path(file_to_send).name}"
     return FileResponse(
         path=file_to_send,
         media_type="application/pdf",
         filename=clean_filename,
-        headers={"Content-Disposition": f"inline; filename={clean_filename}"},
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
     )

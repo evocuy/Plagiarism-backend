@@ -8,6 +8,7 @@ from app.services.document_chunk_service import DocumentChunkService
 from app.services.embedding_service import EmbeddingService
 from app.services.tfidf_service import TfidfService
 from app.services.pdf_service import PDF_EXTRACTION_VERSION
+from app.services.error_service import EMBEDDING_ERROR, report_error
 
 
 class RepositoryCandidateService:
@@ -320,9 +321,10 @@ class RepositoryCandidateService:
         except Exception as err:
             if hasattr(db, "rollback"):
                 db.rollback()
+            report_error(err, EMBEDDING_ERROR, operation="semantic_candidate_query")
             return {
                 **empty_result,
-                "reason": f"semantic_query_failed:{err}",
+                "reason": "semantic_query_failed",
             }
 
     def _calculate_coverage(self, indexed_count: int, total_count: int) -> float:

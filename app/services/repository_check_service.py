@@ -27,6 +27,7 @@ from app.services.repository_candidate_service import RepositoryCandidateService
 from app.services.similarity_result_service import SimilarityResultService
 from app.services.similarity_service import SimilarityService
 from app.services.repository_policy_service import comparison_source_filters, is_comparison_source
+from app.services.error_service import CHECK_ERROR, EMBEDDING_ERROR, TEXT_ERROR, report_error
 
 
 ProgressReporter = Callable[[int, str, str], None]
@@ -119,11 +120,7 @@ class RepositoryCheckService:
                 target_data = self.document_text_service.get_or_extract_text(target_doc, db)
                 clean_target = target_data["cleaned_text"]
             except Exception as exc:
-                self.logger.error("Gagal mengekstrak teks dari dokumen target %s: %s", target_doc.id, exc)
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Gagal membaca teks dokumen target '{target_doc.title}': {str(exc)}",
-                ) from exc
+                raise report_error(exc, TEXT_ERROR, operation="check_target_extraction").http_exception() from None
 
             self._set_progress(
                 check_record,
@@ -215,11 +212,7 @@ class RepositoryCheckService:
                         db=db,
                     )
                 except Exception as highlight_error:
-                    self.logger.warning(
-                        "Gagal membuat highlighted PDF untuk check %s: %s",
-                        check_record.id,
-                        highlight_error,
-                    )
+                    report_error(highlight_error, CHECK_ERROR, operation="empty_repository_highlight")
                     highlighted_file = self._generate_fallback_highlighted_pdf(
                         check_record=check_record,
                         target_doc=target_doc,
@@ -296,11 +289,7 @@ class RepositoryCheckService:
                         }
                     )
                 except Exception as repo_err:
-                    self.logger.warning(
-                        "Melewati dokumen repositori ID %s karena error: %s",
-                        repo_doc.id,
-                        repo_err,
-                    )
+                    report_error(repo_err, CHECK_ERROR, operation="compare_repository_source")
 
             if not results:
                 raise RuntimeError("Tidak ada sumber yang berhasil dibandingkan.")
@@ -392,11 +381,7 @@ class RepositoryCheckService:
                 )
             except Exception as highlight_error:
                 # Similarity result remains useful even if the optional PDF artifact fails.
-                self.logger.warning(
-                    "Gagal membuat highlighted PDF untuk check %s: %s",
-                    check_record.id,
-                    highlight_error,
-                )
+                report_error(highlight_error, CHECK_ERROR, operation="repository_highlight")
                 highlighted_file = self._generate_fallback_highlighted_pdf(
                     check_record=check_record,
                     target_doc=target_doc,
@@ -590,11 +575,7 @@ class RepositoryCheckService:
                     db=db,
                 )
             except Exception as highlight_error:
-                self.logger.warning(
-                    "Gagal membuat highlighted PDF untuk check langsung %s: %s",
-                    check_record.id,
-                    highlight_error,
-                )
+                report_error(highlight_error, CHECK_ERROR, operation="direct_check_highlight")
                 highlighted_file = self._generate_fallback_highlighted_pdf(
                     check_record=check_record,
                     target_doc=target_doc,
@@ -705,7 +686,7 @@ class RepositoryCheckService:
         self._notify_progress(report_progress, 100, "completed", check_record.processing_message)
 
     def _mark_failed(self, check_id: int, db: Session, error: Exception) -> None:
-        self.logger.exception("Pengecekan repository %s gagal: %s", check_id, error)
+        public_error = report_error(error, CHECK_ERROR, operation="repository_check_failed")
         try:
             db.rollback()
             check_record = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
@@ -714,17 +695,13 @@ class RepositoryCheckService:
             check_record.status = "failed"
             check_record.processing_stage = "failed"
             check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
-            check_record.error_message = "Pengecekan gagal diproses. Silakan coba lagi."
+            check_record.error_message = public_error.text
             check_record.updated_at = utc_now()
             check_record.heartbeat_at = check_record.updated_at
             db.add(check_record)
             db.commit()
         except Exception as persist_error:
-            self.logger.error(
-                "Gagal menyimpan status gagal untuk check %s: %s",
-                check_id,
-                persist_error,
-            )
+            report_error(persist_error, CHECK_ERROR, operation="persist_failed_check")
 
     def _auto_index_embeddings_for_check(
         self,
@@ -771,15 +748,16 @@ class RepositoryCheckService:
                 return status
         except Exception as err:
             db.rollback()
+            error = report_error(err, EMBEDDING_ERROR, operation="check_target_embeddings")
             status["target"] = {
                 "document_id": target_doc.id,
                 "title": target_doc.title,
                 "status": "failed",
-                "reason": str(err),
+                "reason": "embedding_index_failed",
+                "error_id": error.error_id,
             }
             status["total_failed"] += 1
             status["reason"] = "target_embedding_failed_tfidf_fallback"
-            self.logger.warning("Gagal auto-index embedding target %s: %s", target_doc.id, err)
             return status
 
         repository_docs_to_index = list(repo_docs[:repository_limit]) if repository_limit else []
@@ -804,16 +782,17 @@ class RepositoryCheckService:
                     status["total_failed"] += 1
             except Exception as err:
                 db.rollback()
+                error = report_error(err, EMBEDDING_ERROR, operation="check_repository_embeddings")
                 status["repository"].append(
                     {
                         "document_id": document.id,
                         "title": document.title,
                         "status": "failed",
-                        "reason": str(err),
+                        "reason": "embedding_index_failed",
+                        "error_id": error.error_id,
                     }
                 )
                 status["total_failed"] += 1
-                self.logger.warning("Gagal auto-index embedding repository %s: %s", document.id, err)
 
         status["reason"] = status["reason"] or "best_effort_completed"
         return status
@@ -985,7 +964,7 @@ def run_repository_check_in_background(
     except Exception as exc:
         # The service normally persists this state itself.  This fallback also
         # covers errors before its processing loop can start.
-        logger.exception("Background check %s gagal: %s", check_id, exc)
+        public_error = report_error(exc, CHECK_ERROR, operation="background_check_failed")
         try:
             db.rollback()
             check_record = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
@@ -993,13 +972,13 @@ def run_repository_check_in_background(
                 check_record.status = "failed"
                 check_record.processing_stage = "failed"
                 check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
-                check_record.error_message = "Pengecekan gagal diproses. Silakan coba lagi."
+                check_record.error_message = public_error.text
                 check_record.updated_at = utc_now()
                 check_record.heartbeat_at = check_record.updated_at
                 db.add(check_record)
                 db.commit()
         except Exception as persist_error:
-            logger.error("Gagal menyimpan kegagalan background check %s: %s", check_id, persist_error)
+            report_error(persist_error, CHECK_ERROR, operation="persist_background_failure")
     finally:
         db.close()
 
@@ -1027,7 +1006,7 @@ def run_direct_check_in_background(
             existing_check_id=check_id,
         )
     except Exception as exc:
-        logger.exception("Direct check %s gagal: %s", check_id, exc)
+        public_error = report_error(exc, CHECK_ERROR, operation="background_direct_check_failed")
         try:
             db.rollback()
             check_record = db.query(PlagiarismCheck).filter(PlagiarismCheck.id == check_id).first()
@@ -1035,12 +1014,12 @@ def run_direct_check_in_background(
                 check_record.status = "failed"
                 check_record.processing_stage = "failed"
                 check_record.processing_message = "Pengecekan gagal diproses. Silakan coba lagi."
-                check_record.error_message = check_record.processing_message
+                check_record.error_message = public_error.text
                 check_record.updated_at = utc_now()
                 check_record.heartbeat_at = check_record.updated_at
                 db.add(check_record)
                 db.commit()
         except Exception as persist_error:
-            logger.error("Gagal menyimpan kegagalan direct check %s: %s", check_id, persist_error)
+            report_error(persist_error, CHECK_ERROR, operation="persist_direct_failure")
     finally:
         db.close()
