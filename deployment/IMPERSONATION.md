@@ -5,7 +5,10 @@ Simpan csrf_token dari respons dan ikuti bootstrap saat reload/overlay expired
 di [COOKIE_PDF_ERROR_HARDENING.md](COOKIE_PDF_ERROR_HARDENING.md).
 
 Admin yang sudah login dapat menguji aplikasi sebagai mahasiswa dengan
-memasukkan NIM, tanpa password mahasiswa. Backend memeriksa NIM dan mata kuliah
+memasukkan NIM dan password khusus impersonasi, tanpa password mahasiswa.
+Password khusus ini dipakai bersama oleh admin yang berwenang dan diverifikasi
+di backend pada setiap permintaan mulai sesi. Ini tidak menggantikan login admin.
+Backend memeriksa NIM dan mata kuliah
 melalui API mata kuliah aktif SADS. Tetap wajib mengambil `Seminar`, `Skripsi`,
 atau `Tugas Akhir`; konfigurasi API yang belum lengkap, gangguan API, atau data identitas
 yang tidak cocok tidak memberi akses. API login SADS tidak dipanggil untuk
@@ -16,6 +19,40 @@ NIM yang belum pernah login dibuat sebagai akun SADS dari `mahasiswa.nama` dan
 `mahasiswa.prodi_kode` yang telah diverifikasi oleh API mata kuliah. Akun yang
 sudah ada mempertahankan password, provider, profil, dokumen, dan versi sesi.
 
+## Konfigurasi password impersonasi
+
+Simpan hash Argon2 password yang dipilih di `IMPERSONATION_PASSWORD_HASH` dalam
+`.env` privat backend. Tidak ada password bawaan di source code atau frontend.
+Untuk membuat hash, jalankan dari environment Python backend:
+
+```powershell
+python -c "from getpass import getpass; from pwdlib import PasswordHash; print(PasswordHash.recommended().hash(getpass('Password impersonasi: ')))"
+```
+
+Masukkan password saat prompt; input tidak ditampilkan atau menjadi argumen
+command. Tempel hasil hash ke `.env` dengan tanda kutip tunggal:
+
+```env
+IMPERSONATION_PASSWORD_HASH='HASH_ARGON2_DARI_PERINTAH'
+```
+
+Tanda kutip tunggal diperlukan agar karakter `$` pada hash tetap utuh saat
+Docker Compose membaca `.env`. Restart backend setelah mengubah konfigurasi.
+Jangan commit nilai password, hash privat, atau `.env` ke Git. Konfigurasi ini
+harus diisi terpisah pada backend lokal dan VM; tidak dikirim melalui Git.
+
+Jika hash kosong/tidak valid, mulai impersonasi ditolak dengan HTTP 503, sementara
+login admin dan penghentian sesi impersonasi tetap tersedia. Password salah
+menghasilkan HTTP 403 sebelum API SADS dipanggil dan sebelum sesi lama diganti.
+Password yang tidak dikirim/kosong/melebihi 256 karakter menghasilkan HTTP 422.
+Gunakan nilai password persis, termasuk huruf besar/kecil dan spasi.
+
+Percobaan memakai batas akun/IP dan jendela waktu dari `LOGIN_*`, tetapi bucket
+impersonasi terpisah dari login biasa. Dengan default saat ini, setelah 5
+kesalahan per admin atau 30 percobaan per IP selama 900 detik, request berikutnya
+ditolak dengan HTTP 429 dan Retry-After. Counter hanya menyimpan hash identitas,
+bukan password. Kegagalan password tidak mencabut sesi admin/mahasiswa.
+
 ## Mulai impersonasi
 
 Gunakan credential admin biasa dan endpoint berikut:
@@ -24,7 +61,7 @@ Gunakan credential admin biasa dan endpoint berikut:
 POST /api/auth/impersonation
 Content-Type: application/json
 
-{"nim":"NIM_MAHASISWA"}
+{"nim":"NIM_MAHASISWA","impersonation_password":"PASSWORD_DARI_INPUT_ADMIN"}
 ```
 
 Respons 200:
@@ -32,6 +69,7 @@ Respons 200:
 ```json
 {
   "token": "JWT_SESI_IMPERSONASI",
+  "csrf_token": "CSRF_SESI_IMPERSONASI",
   "user": {"id": 123, "identifier": "NIM_MAHASISWA", "role": "mahasiswa"},
   "impersonation": {
     "active": true,
@@ -48,6 +86,13 @@ Respons 200:
 dan profil aktif dengan respons tersebut, menyimpan `session_id`, lalu membuka
 dashboard mahasiswa. Tampilkan banner "Mode impersonasi: NIM ..." beserta
 tombol kembali ke admin. Halaman frontend lokal tidak diubah oleh pekerjaan ini.
+
+Frontend perlu menambah input `type="password"` di form mulai impersonasi dan
+mengirim nilainya sebagai `impersonation_password`. Kirim nilai dari input pada
+setiap start; jangan hardcode, menaruhnya di URL/log/localStorage, atau memakai
+password mahasiswa/admin sebagai pengganti. Kosongkan input setelah request
+selesai. Untuk sesi cookie, header X-CSRF-Token dan credentials include tetap
+wajib. Setelah berhasil, simpan token/user/CSRF baru sesuai panduan CSRF.
 
 Backend memasang cookie HttpOnly terpisah bernama
 `<SESSION_COOKIE_NAME>_impersonation`. Cookie sesi admin asli dipertahankan.
@@ -79,7 +124,7 @@ Authorization mahasiswa**. Contoh melalui proxy frontend:
 const response = await fetch("/api/auth/impersonation/stop", {
   method: "POST",
   credentials: "include",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
   body: JSON.stringify({ session_id: impersonation.session_id }),
 });
 ```
@@ -94,6 +139,8 @@ Respons 200 kembali berisi `token`, `user` admin, dan
 metadata impersonasi, lalu membuka dashboard admin. Backend menghapus cookie
 impersonasi dan mencabut token impersonasi di database. Token admin yang
 dikembalikan adalah credential asli dengan batas waktu yang sama.
+Endpoint stop tidak meminta password impersonasi agar admin tetap dapat kembali
+meskipun password khusus diganti atau konfigurasinya sedang bermasalah.
 
 ## Masa sesi dan hasil pengujian
 

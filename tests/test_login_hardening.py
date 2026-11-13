@@ -198,7 +198,8 @@ def test_lecturer_creation_and_supervisor_endpoint_are_removed():
 
 
 @pytest.mark.skipif(not os.getenv("LOGIN_TEST_DATABASE_URL"), reason="isolated PostgreSQL test URL not configured")
-def test_postgresql_concurrent_failures_cannot_exceed_account_budget():
+@pytest.mark.parametrize("purpose", ["login", "impersonation"])
+def test_postgresql_concurrent_failures_cannot_exceed_account_budget(purpose):
     # A dedicated random schema keeps this check independent of application data.
     engine = create_engine(os.environ["LOGIN_TEST_DATABASE_URL"])
     if engine.dialect.name != "postgresql":
@@ -215,7 +216,7 @@ def test_postgresql_concurrent_failures_cannot_exceed_account_budget():
     def attempt(index):
         with factory() as session:
             try:
-                LoginThrottleService(settings).verify(session, account, f"198.51.100.{index}", lambda: False)
+                LoginThrottleService(settings).verify(session, account, f"198.51.100.{index}", lambda: False, purpose=purpose)
                 return 401
             except HTTPException as error:
                 return error.status_code
@@ -226,7 +227,8 @@ def test_postgresql_concurrent_failures_cannot_exceed_account_budget():
         assert codes.count(401) == 5
         assert codes.count(429) == 3
         with factory() as session:
-            bucket = session.query(LoginThrottle).filter(LoginThrottle.key.like("account:%")).one()
+            kind = "imp_account" if purpose == "impersonation" else "account"
+            bucket = session.query(LoginThrottle).filter(LoginThrottle.key.like(f"{kind}:%")).one()
             assert bucket.attempt_count == 5
     finally:
         with engine.begin() as connection:

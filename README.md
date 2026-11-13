@@ -7,7 +7,7 @@ Panduan deployment dan batas resource: [deployment/HARDENING.md](deployment/HARD
 Login mahasiswa SADS dengan pembatasan mata kuliah aktif Seminar/Skripsi/Tugas Akhir:
 [deployment/SADS_LOGIN_PILOT.md](deployment/SADS_LOGIN_PILOT.md).
 
-Impersonasi mahasiswa oleh admin melalui NIM, termasuk kontrak frontend:
+Impersonasi mahasiswa oleh admin melalui NIM dan password khusus, termasuk kontrak frontend:
 [deployment/IMPERSONATION.md](deployment/IMPERSONATION.md).
 
 Penggabungan profil mahasiswa ke `users` dan migrasi PostgreSQL:

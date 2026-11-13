@@ -9,7 +9,7 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from fastapi import HTTPException, Request
 from sqlalchemy import text
@@ -131,15 +131,23 @@ class LoginThrottleService:
             bucket.expires_at = now + timedelta(seconds=window)
         return bucket
 
-    def verify(self, db: Session, identifier: str, client_ip: str, verify_credentials: Callable[[], bool]) -> bool:
+    def verify(
+        self, db: Session, identifier: str, client_ip: str, verify_credentials: Callable[[], bool],
+        *, purpose: Literal["login", "impersonation"] = "login",
+    ) -> bool:
         """Count every IP attempt and failed account attempts in one transaction.
 
         Locks remain held while the password is checked, so concurrent attempts
         cannot all pass admission before their failures are counted. Buckets
         contain hashes of identifiers/IPs, never passwords or tokens.
         """
-        account_key = self._key("account", identifier.strip().casefold())
-        ip_key = self._key("ip", client_ip)
+        if purpose not in {"login", "impersonation"}:
+            raise ValueError("Unsupported credential purpose")
+        # Separate kinds keep impersonation failures out of normal login
+        # counters. Prefixes also stay within LoginThrottle.key's 80 characters.
+        account_kind, ip_kind = ("imp_account", "imp_ip") if purpose == "impersonation" else ("account", "ip")
+        account_key = self._key(account_kind, identifier.strip().casefold())
+        ip_key = self._key(ip_kind, client_ip)
         now = self.now_provider()
         try:
             # Prune before acquiring admission locks to keep lock order stable.

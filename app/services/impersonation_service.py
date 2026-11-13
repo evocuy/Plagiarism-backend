@@ -1,16 +1,36 @@
 """Short-lived admin-to-student sessions with independent revocation."""
+import os
 from datetime import timedelta, timezone
 from uuid import uuid4
 
+from pwdlib.exceptions import UnknownHashError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models.schemas import ImpersonationSession, User, utc_now
+from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, auth_error
 from app.services.sads_course_service import SadsActiveCoursesService
 
 
 ADMIN_ROLES = ("admin", "super_admin")
+
+
+def verify_start_password(db: Session, admin: User, password: str, request, *, verify_password) -> None:
+    """Check a separate private credential before contacting SADS or changing sessions."""
+    configured_hash = os.getenv("IMPERSONATION_PASSWORD_HASH", "").strip()
+    if not configured_hash:
+        raise auth_error(503, "Password impersonasi belum dikonfigurasi. Hubungi pengelola backend.")
+
+    def verify() -> bool:
+        try:
+            return verify_password(password, configured_hash)
+        except (UnknownHashError, ValueError):
+            raise auth_error(503, "Konfigurasi password impersonasi tidak valid. Hubungi pengelola backend.") from None
+
+    throttle = LoginThrottleService()
+    if not throttle.verify(db, str(admin.id), throttle.client_ip(request), verify, purpose="impersonation"):
+        raise auth_error(403, "Password impersonasi tidak valid.")
 
 
 def _student_is_available(user: User | None) -> None:

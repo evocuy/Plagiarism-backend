@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Optional, List
 
 import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Request, Response, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
 from sqlalchemy import func, update
@@ -156,6 +156,7 @@ class LoginRequest(BaseModel):
 
 class ImpersonationRequest(BaseModel):
     nim: str = Field(min_length=1, max_length=100)
+    impersonation_password: SecretStr = Field(min_length=1, max_length=256)
 
     @field_validator("nim")
     @classmethod
@@ -540,6 +541,10 @@ def start_admin_impersonation(
     db: Session = Depends(get_db),
 ):
     _set_no_store(response)
+    impersonation_service.verify_start_password(
+        db, admin, request.impersonation_password.get_secret_value(), http_request,
+        verify_password=password_hash.verify,
+    )
     claims = http_request.state.access_claims
     target, session = impersonation_service.start_impersonation(
         db, admin, request.nim, actor_claims=claims,

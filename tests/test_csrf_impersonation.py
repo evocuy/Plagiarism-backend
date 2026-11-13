@@ -7,7 +7,7 @@ import pytest
 from app.routes import auth
 from app.services.csrf_service import CsrfMiddleware
 from test_auth_session import request
-from test_impersonation import context, overlay_cookies
+from test_impersonation import IMPERSONATION_TEST_PASSWORD, context, overlay_cookies
 from test_sads_auth import NIM, environment
 
 
@@ -19,7 +19,8 @@ def test_cookie_impersonation_can_recover_admin_with_csrf_for_effective_overlay(
     parent_cookies = {auth.SESSION_COOKIE_NAME: context.admin_token}
     parent_csrf = request(app, "GET", "/api/auth/csrf", cookies=parent_cookies)[2]["csrf_token"]
     code, _, child = request(app, "POST", "/api/auth/impersonation", cookies=parent_cookies,
-                             headers={"X-CSRF-Token": parent_csrf}, body={"nim": NIM})
+                             headers={"X-CSRF-Token": parent_csrf},
+                             body={"nim": NIM, "impersonation_password": IMPERSONATION_TEST_PASSWORD})
     assert code == 200
     overlay = child["token"]
     if overlay_state == "expired":
@@ -46,9 +47,20 @@ def test_cookie_impersonation_can_recover_admin_with_csrf_for_effective_overlay(
 def test_csrf_token_never_replaces_original_admin_authentication(context):
     context.app.add_middleware(CsrfMiddleware, secret_key=auth._jwt_secret_key,
                               session_cookie=auth.SESSION_COOKIE_NAME, impersonation_cookie=auth.IMPERSONATION_COOKIE_NAME)
-    code, _, child = request(context.app, "POST", "/api/auth/impersonation", authorization=f"Bearer {context.admin_token}", body={"nim": NIM})
+    code, _, child = request(context.app, "POST", "/api/auth/impersonation", authorization=f"Bearer {context.admin_token}",
+                             body={"nim": NIM, "impersonation_password": IMPERSONATION_TEST_PASSWORD})
     assert code == 200
     cookies = {auth.IMPERSONATION_COOKIE_NAME: child["token"]}
     code, _, _ = request(context.app, "POST", "/api/auth/impersonation/stop", cookies=cookies,
                          headers={"X-CSRF-Token": child["csrf_token"]}, body={"session_id": child["impersonation"]["session_id"]})
     assert code == 401
+
+
+def test_shared_password_cannot_bypass_cookie_csrf_protection(context):
+    context.app.add_middleware(CsrfMiddleware, secret_key=auth._jwt_secret_key,
+                              session_cookie=auth.SESSION_COOKIE_NAME, impersonation_cookie=auth.IMPERSONATION_COOKIE_NAME)
+    code, _, body = request(context.app, "POST", "/api/auth/impersonation", cookie=context.admin_token,
+                            body={"nim": NIM, "impersonation_password": IMPERSONATION_TEST_PASSWORD})
+    assert code == 403
+    assert body["error_code"] == "csrf_token_invalid"
+    assert not context.opener.courses.requests

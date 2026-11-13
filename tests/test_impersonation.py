@@ -8,18 +8,26 @@ from urllib.error import HTTPError, URLError
 
 import jwt
 import pytest
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.schemas import Document, ImpersonationSession, PlagiarismCheck, User, utc_now
 from app.routes import auth, documents, plagiarism
+from app.services.error_service import sanitized_validation_error
 from test_auth_session import request
 from test_sads_auth import NIM, PRIVATE_VALUE, environment
+
+
+IMPERSONATION_TEST_PASSWORD = "synthetic-impersonation-password"
+IMPERSONATION_TEST_HASH = auth.password_hash.hash(IMPERSONATION_TEST_PASSWORD)
 
 
 @pytest.fixture
 def context(environment, monkeypatch):
     app, db, opener = environment
     monkeypatch.setattr(auth, "IMPERSONATION_EXPIRE_MINUTES", 15)
+    monkeypatch.setenv("IMPERSONATION_PASSWORD_HASH", IMPERSONATION_TEST_HASH)
+    app.add_exception_handler(RequestValidationError, sanitized_validation_error)
     app.include_router(documents.router, prefix="/api/documents")
     app.include_router(plagiarism.router, prefix="/api/plagiarism")
     admin = User(identifier="admin-support", password="unused-admin-hash", role="admin")
@@ -42,10 +50,13 @@ def context(environment, monkeypatch):
     )
 
 
-def start(context, nim=NIM, *, token=None, cookies=None):
+def start(context, nim=NIM, *, token=None, cookies=None, password=IMPERSONATION_TEST_PASSWORD):
+    body = {"nim": nim}
+    if password is not None:
+        body["impersonation_password"] = password
     return request(
         context.app, "POST", "/api/auth/impersonation",
-        authorization=f"Bearer {token or context.admin_token}", cookies=cookies, body={"nim": nim},
+        authorization=f"Bearer {token or context.admin_token}", cookies=cookies, body=body,
     )
 
 
@@ -83,6 +94,7 @@ def test_start_is_a_separate_audited_student_session_without_kicking_the_owner(c
     assert row.ended_at is None
     assert 0 < (row.expires_at - row.created_at).total_seconds() <= 900
     assert PRIVATE_VALUE not in json.dumps(body)
+    assert IMPERSONATION_TEST_PASSWORD not in json.dumps(body)
     assert context.student.password not in json.dumps(body)
     claims = jwt.decode(body["token"], auth.JWT_SECRET_KEY, algorithms=[auth.JWT_ALGORITHM])
     assert claims["sub"] == str(context.student.id)
