@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -186,6 +187,7 @@ async def _store_uploaded_document(
     stored_filename = f"{uuid4().hex}_{original_filename}"
     file_path = UPLOAD_DIR / stored_filename
     total_bytes = 0
+    content_digest = hashlib.sha256()
 
     try:
         with file_path.open("wb") as buffer:
@@ -197,6 +199,7 @@ async def _store_uploaded_document(
                         detail=f"Ukuran file melebihi batas {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
                     )
                 buffer.write(chunk)
+                content_digest.update(chunk)
 
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="File PDF tidak boleh kosong.")
@@ -228,6 +231,7 @@ async def _store_uploaded_document(
             title=original_filename,
             document_type=clean_type,
             file_path=str(file_path),
+            content_sha256=content_digest.hexdigest(),
             source_origin="alumni" if is_alumni_import else "student",
             repository_status=repository_status,
             repository_published_at=(

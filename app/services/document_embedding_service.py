@@ -76,6 +76,7 @@ class DocumentEmbeddingService:
         db: Session,
         refresh_chunks: bool = False,
         refresh_embeddings: bool = False,
+        retry_failed: bool = False,
     ) -> Dict[str, Any]:
         if not self.embedding_service.is_configured():
             return {
@@ -91,6 +92,7 @@ class DocumentEmbeddingService:
             not refresh_embeddings
             and summary["total_pending_chunks"] == 0
             and summary["total_failed_chunks"] > 0
+            and not retry_failed
         ):
             return {
                 **summary,
@@ -99,7 +101,7 @@ class DocumentEmbeddingService:
                 "index_result": None,
             }
 
-        if not refresh_embeddings and summary["total_pending_chunks"] == 0:
+        if not refresh_embeddings and summary["total_pending_chunks"] == 0 and summary["total_failed_chunks"] == 0:
             return {
                 **summary,
                 "status": "skipped",
@@ -112,6 +114,7 @@ class DocumentEmbeddingService:
             db=db,
             refresh_chunks=refresh_chunks,
             refresh_embeddings=refresh_embeddings,
+            retry_failed=retry_failed,
         )
         # Include earlier failures and remaining batches, not just this attempt.
         summary = self.summarize_document_embeddings(document, db)
@@ -135,6 +138,7 @@ class DocumentEmbeddingService:
         db: Session,
         refresh_chunks: bool = False,
         refresh_embeddings: bool = False,
+        retry_failed: bool = False,
     ) -> Dict[str, Any]:
         self.document_chunk_service.get_or_build_sentence_chunks(
             document,
@@ -156,16 +160,18 @@ class DocumentEmbeddingService:
             if chunk.cleaned_text.strip()
             and (
                 refresh_embeddings
+                or (retry_failed and chunk.embedding_error)
                 or chunk.embedding_model != self.embedding_service.model
                 or chunk.embedding_generated_at is None
             )
-            and (refresh_embeddings or not chunk.embedding_error)
+            and (refresh_embeddings or retry_failed or not chunk.embedding_error)
         ]
         skipped_failed_chunks = [
             chunk for chunk in chunks
             if chunk.cleaned_text.strip()
             and chunk.embedding_error
             and not refresh_embeddings
+            and not retry_failed
         ]
 
         indexed = 0

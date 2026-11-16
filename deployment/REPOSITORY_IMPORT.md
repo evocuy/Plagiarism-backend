@@ -1,0 +1,166 @@
+# Impor massal PDF alumni dan embedding
+
+Importer ini adalah command backend untuk pengelola server. Tidak ada endpoint
+atau halaman frontend baru. Pengembangan/tes dilakukan lokal; pemasangan di VM
+menunggu pengguna push dan meminta deployment.
+
+## Input dan hasil
+
+Siapkan folder khusus berisi **dokumen alumni**:
+
+```text
+repository-inbox/
+├── proposal/
+│   ├── dokumen-a.pdf
+│   └── prodi/angkatan/dokumen-b.pdf
+└── skripsi/
+    └── dokumen-c.pdf
+```
+
+Nama folder jenis tidak peka huruf besar/kecil. PDF di luar kedua jenis tersebut
+ditandai gagal, kecuali `--document-type` diberikan untuk seluruh folder.
+Folder yang namanya sendiri proposal/skripsi juga dapat menjadi `--root`.
+PDF diproses dalam urutan nama; file non-PDF dan symlink dilewati. Folder input
+harus terpisah dari uploads. Sumber disalin, tidak dipindah atau dihapus.
+
+Validasi ukuran, PDF berbasis teks, batas halaman/teks/chunks, dan struktur BAB
+mengikuti backend sekarang: proposal BAB I–III; skripsi BAB I–V. Tidak ada OCR
+atau pengecualian batas validasi untuk impor. Filename hanya menjadi judul;
+path penyimpanan memakai checksum sehingga karakter filename tidak menjadi kode/path.
+
+Setiap dokumen baru dibuat ownerless (`user_id=null`), `source_origin=alumni`,
+awalnya draft. Setelah teks dan chunks berhasil dibuat, dokumen diterbitkan
+sebagai pembanding. Kegagalan embedding tidak menghapus PDF/teks/chunks;
+TF-IDF tetap bisa memakai dokumen alumni yang sudah siap. Hasil import dan
+status embedding dilaporkan terpisah agar kegagalan indexing tidak dianggap sukses.
+Dokumen mahasiswa tidak dipakai sebagai target dedup/publikasi. Proposal tetap
+dibandingkan dengan proposal, skripsi dengan skripsi.
+
+## Menjalankan di lokal
+
+Dari folder backend, dengan `.venv` aktif dan konfigurasi privat backend tersedia:
+
+```powershell
+python -m app.workers.import_repository --root "C:\data\repository-inbox" --dry-run --limit 10
+```
+
+Preview memvalidasi PDF dan mendeteksi byte identik di antara input, tanpa
+menghubungkan database, menulis salinan/report, atau memanggil embedding API.
+Preview **belum memeriksa duplikat terhadap database**. `--with-embeddings` pada
+preview tetap tidak mengirim teks ke provider. Seluruh hasil tampil di terminal.
+
+Jika sudah sesuai, impor 10 dokumen pertama sekaligus indexing:
+
+```powershell
+python -m app.workers.import_repository --root "C:\data\repository-inbox" --limit 10 --with-embeddings
+```
+
+Hilangkan `--limit` untuk seluruh input. Untuk folder satu jenis tanpa struktur
+proposal/skripsi, tambahkan `--document-type proposal` atau skripsi.
+
+Impor tanpa embedding cukup tanpa flag `--with-embeddings`. Setelah itu command
+yang sama dengan flag tersebut akan mengindeks dokumen yang sudah ada.
+Impor sungguhan memerlukan PostgreSQL, schema backend terbaru, dan akun admin
+aktif `cihuy` (atau `--admin IDENTIFIER`). Identitas admin dicatat di checkpoint;
+ini bukan login publik atau bypass autentikasi, melainkan alat operator server
+yang sudah memiliki akses privat ke database/storage.
+
+`--with-embeddings` juga memerlukan EMBED_URL/EMBED_API_KEY/EMBED_MODEL yang sudah
+dipakai backend serta kolom pgvector. Konfigurasi/storage yang belum siap ditolak
+sebelum pemrosesan dan sebelum request provider. Tidak ada model Torch baru
+atau layanan embedding yang dijalankan lokal. Ukuran batch default 32 chunks,
+dapat diatur `--embedding-batch-size 1` sampai 128.
+
+## Menjalankan di VM setelah deployment diminta
+
+Contoh di bawah memakai service Compose/volume yang sudah ada. API dan worker
+tetap memakai project dan database yang sama; jangan membuat database/volume baru.
+Jalankan backend versi ini sekali agar migrasi kolom checksum sudah diterapkan.
+
+Buat staging folder yang bisa diisi lewat SFTP dan dibaca UID/GID 10001 container:
+
+```bash
+sudo install -d -o evopuki -g 10001 -m 2750 /home/evopuki/repository-inbox
+sudo install -d -o evopuki -g 10001 -m 2750 /home/evopuki/repository-inbox/proposal
+sudo install -d -o evopuki -g 10001 -m 2750 /home/evopuki/repository-inbox/skripsi
+```
+
+Salin PDF ke folder sesuai jenisnya. Pastikan file/subfolder yang diunggah
+tetap dapat dibaca group 10001; periksa izin staging jika mendapat file_unreadable.
+Tidak perlu mengubah pemilik kode, `.env`, atau data PostgreSQL.
+
+Preview memakai container terpisah tanpa membuka port API tambahan:
+
+```bash
+cd /home/evopuki/backend
+sudo docker compose run --rm --no-deps -T \
+  --volume /home/evopuki/repository-inbox:/import:ro \
+  backend python -m app.workers.import_repository --root /import --dry-run --limit 10
+```
+
+Kemudian impor sekaligus embedding:
+
+```bash
+sudo docker compose run --rm --no-deps -T \
+  --volume /home/evopuki/repository-inbox:/import:ro \
+  backend python -m app.workers.import_repository --root /import --with-embeddings
+```
+
+Container menjalankan UID/GID yang sama dengan API/worker agar file yang dibuat
+dapat dibaca aplikasi. Input di-mount read-only, uploads tetap memakai bind mount
+existing. Tidak perlu menyalin seluruh staging folder ke dalam image atau uploads.
+Biarkan terminal tetap tersambung selama proses berjalan.
+
+## Resume, checksum, dan data lama
+
+Jalankan ulang command yang sama setelah terputus/gagal. Tidak perlu memberikan
+report lama: checkpoint tersimpan di metadata dokumen dan pencocokan memakai
+`content_sha256` + jenis dokumen. Satu proses impor memakai advisory lock PostgreSQL
+yang tetap bertahan selama commit tiap dokumen; proses impor kedua ditolak.
+
+- PDF identik dengan nama berbeda dalam input dilewati.
+- Dokumen alumni yang sudah ada dipakai kembali; ID dan hasil cek sebelumnya tetap.
+- Dokumen yang sudah soft delete dilewati, tidak diaktifkan kembali.
+- Tahap teks/chunks yang sudah tersimpan memakai cache versi saat ini.
+- Embedding yang sudah berhasil tidak dihitung ulang. Chunks gagal/pending atau
+  yang memakai model berbeda dicoba saat menjalankan kembali --with-embeddings.
+- File yang berubah selama penyalinan ditolak. Salinan memakai file sementara
+  dan atomic replace; salinan selesai yang tertinggal sebelum commit bisa dipakai
+  kembali. Ctrl+C membersihkan file sementara milik operasi yang sedang berjalan.
+
+Migrasi hanya menambah nullable `documents.content_sha256` beserta index biasa.
+Upload web baru ikut menyimpan checksum. Checksum dokumen alumni lama dihitung
+sekali dari file yang masih tersedia saat impor. Tidak ada constraint unik yang
+menghapus/menggabungkan duplikat historis. File lama yang hilang/di luar managed
+storage dilaporkan melalui historical_files_unavailable, tanpa menghapus metadata.
+Dedup merupakan byte identik, bukan pencarian kemiripan isi atau parafrase.
+
+Simpan staging sampai seluruh import dan embedding yang diinginkan selesai.
+Jika input dipindah/hilang, command folder tidak dapat mencoba file tersebut lagi.
+Hindari upload/reindex manual bersamaan agar sumber dan indexing stabil selama
+impor besar. Jalankan benchmark setelah seluruh korpus selesai dimasukkan.
+
+## Progres, report, dan ruang disk
+
+Terminal mengeluarkan JSON per tahap/file dan summary. Report live disimpan di
+`uploads/import-reports/import-TIMESTAMP-ID.jsonl`. Lokasi baru dapat dipilih lewat
+`--report PATH.jsonl`; file existing tidak ditimpa. Preview tidak membuat report.
+Report mencakup nama relatif input, ID, checksum, action, status, status embedding,
+jumlah chunks, dan error aman/ID referensi. Tidak berisi teks PDF, token, key, atau URL
+provider. Perlakukan report sebagai data administratif privat.
+
+Action umum: imported, resumed, existing, duplicate_in_input, soft_deleted.
+Summary membedakan imported, completed/skipped/failed, embedding_completed,
+embedding_failed, processed, dan not_attempted. `imported=10, failed=2` bisa berarti
+10 PDF tersimpan, tetapi dua di antaranya belum selesai embedding; periksa row file.
+
+Satu file diproses tiap waktu. Checkpoint/commit per tahap mempertahankan hasil
+yang sudah berhasil saat proses berhenti. Default menyisakan setidaknya 512 MiB
+sebelum copy/indexing; dapat diatur `--min-free-mb`. Ruang rendah menghentikan
+sisa antrean, bukan menghapus dokumen lama. Estimasi ini hanya cadangan ruang,
+bukan jaminan ukuran akhir database embedding. Staging, salinan PDF, chunks/vector,
+highlight, dan backup tetap perlu kapasitas disk yang cukup.
+
+Exit code: 0 selesai/preview valid; 1 ada file atau embedding gagal/proses berhenti
+karena disk; 2 input/config/database belum siap; 130 dihentikan Ctrl+C.
+Kegagalan satu PDF biasanya tidak menghalangi file lain.

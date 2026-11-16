@@ -187,6 +187,8 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS text_extracted_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS text_extraction_error TEXT"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_content_sha256 ON documents(content_sha256)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_deleted_at ON documents(deleted_at)"))
         # Comparison corpus lifecycle: uploads stay out of the repository
         # until explicitly published. Server defaults also protect direct SQL

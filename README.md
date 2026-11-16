@@ -16,6 +16,9 @@ Penggabungan profil mahasiswa ke `users` dan migrasi PostgreSQL:
 CSRF untuk sesi cookie, kesiapan PDF highlight, dan error tanpa detail internal:
 [deployment/COOKIE_PDF_ERROR_HARDENING.md](deployment/COOKIE_PDF_ERROR_HARDENING.md).
 
+Impor folder PDF alumni sekaligus embedding, preview, dedup, dan resume:
+[deployment/REPOSITORY_IMPORT.md](deployment/REPOSITORY_IMPORT.md).
+
 ---
 
 ## 📁 Struktur Direktori Backend

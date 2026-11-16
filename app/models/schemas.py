@@ -88,6 +88,8 @@ class Document(Base):
     title = Column(String, nullable=False)
     document_type = Column(String, default="skripsi")
     file_path = Column(String, nullable=False)
+    # Byte identity for resumable alumni imports; old rows are filled lazily.
+    content_sha256 = Column(String(64), nullable=True, index=True)
     extracted_text = Column(Text, nullable=True)
     cleaned_text = Column(Text, nullable=True)
     extraction_metadata = Column(JSON, nullable=True)
