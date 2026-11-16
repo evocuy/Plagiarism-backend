@@ -17,7 +17,8 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import Session
 
-from app.models.schemas import PlagiarismCheck, utc_now
+from app.models.schemas import PlagiarismCheck, User, utc_now
+from app.services.account_mode_service import can_choose_login_mode
 
 
 PENDING_STATUS = "pending"
@@ -132,7 +133,9 @@ class CheckQueueService:
             .scalar()
             or 0
         )
-        if submitted_today >= self.settings.daily_limit:
+        # Read the real DB account, never a client-supplied role/unlimited flag.
+        unlimited_daily = can_choose_login_mode(db.get(User, user_id))
+        if not unlimited_daily and submitted_today >= self.settings.daily_limit:
             retry_after = max(1, int((next_day - now).total_seconds()))
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,

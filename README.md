@@ -19,6 +19,9 @@ CSRF untuk sesi cookie, kesiapan PDF highlight, dan error tanpa detail internal:
 Impor folder PDF alumni sekaligus embedding, preview, dedup, dan resume:
 [deployment/REPOSITORY_IMPORT.md](deployment/REPOSITORY_IMPORT.md).
 
+Pilihan mode admin/mahasiswa dan pengecualian kuota harian akun uji cihuy:
+[deployment/CIHUY_LOGIN_MODE.md](deployment/CIHUY_LOGIN_MODE.md).
+
 ---
 
 ## 📁 Struktur Direktori Backend

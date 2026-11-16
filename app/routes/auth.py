@@ -19,6 +19,7 @@ from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, S
 from app.services.sads_course_service import SadsActiveCoursesService
 from app.services import impersonation_service
 from app.services.csrf_service import create_csrf_token
+from app.services.account_mode_service import StudentModeUser, account_user, can_choose_login_mode, student_mode_user
 
 router = APIRouter()
 
@@ -152,6 +153,11 @@ def _clear_session_cookie(response: Response, *, cookie_name: str = SESSION_COOK
 class LoginRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=256)
+    login_as: Optional[Literal["admin", "mahasiswa"]] = None
+
+
+class LoginModeRequest(BaseModel):
+    login_as: Literal["admin", "mahasiswa"]
 
 
 class ImpersonationRequest(BaseModel):
@@ -184,6 +190,8 @@ class UserResponse(BaseModel):
     name: Optional[str] = None
     program_studi: Optional[str] = None
     fakultas: Optional[str] = None
+    available_login_modes: List[Literal["admin", "mahasiswa"]] = Field(default_factory=list)
+    unlimited_daily_checks: bool = False
 
     class Config:
         from_attributes = True
@@ -196,6 +204,9 @@ def _build_user_response(user: User) -> dict:
         "role": user.role,
         "nama_lengkap": user.name,
         "name": user.name,
+        "available_login_modes": (["admin", "mahasiswa"] if can_choose_login_mode(user)
+                                  else ["admin"] if user.role in ("admin", "super_admin") else ["mahasiswa"]),
+        "unlimited_daily_checks": can_choose_login_mode(user),
     }
     if user.role == "mahasiswa":
         res["program_studi"] = user.program_studi
@@ -248,19 +259,31 @@ class UpdateUserRequest(BaseModel):
 def create_access_token(
     user: User, *, sads_courses_verified: bool = False,
     impersonation_id: str | None = None, expires_at: datetime | None = None,
+    session_mode: str | None = None,
 ) -> str:
+    if isinstance(user, StudentModeUser):
+        if session_mode not in (None, "mahasiswa"):
+            raise ValueError("A student session cannot mint an administrator session")
+        session_mode = "mahasiswa"
+        user = account_user(user)
+    if session_mode is not None and (
+        session_mode not in ("admin", "mahasiswa") or not can_choose_login_mode(user) or impersonation_id is not None
+    ):
+        raise ValueError("Login mode is unavailable for this account/session")
     secret = _jwt_secret_key()
     expires_at = expires_at or datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),
         "identifier": user.identifier,
-        "role": user.role,
+        "role": "mahasiswa" if session_mode == "mahasiswa" else user.role,
         "sv": user.session_version,
         "sads_courses_verified": sads_courses_verified,
         "exp": expires_at,
     }
     if impersonation_id is not None:
         payload["impersonation_id"] = impersonation_id
+    if session_mode is not None:
+        payload["session_mode"] = session_mode
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
@@ -282,10 +305,11 @@ class AccessTokenClaims:
     sads_courses_verified: bool
     expires_at: datetime
     impersonation_id: str | None = None
+    session_mode: str | None = None
 
     @property
     def session_identity(self) -> tuple:
-        return self.user_id, self.session_version, self.sads_courses_verified, self.impersonation_id
+        return self.user_id, self.session_version, self.sads_courses_verified, self.impersonation_id, self.session_mode
 
 
 def _decode_access_token(token: str) -> AccessTokenClaims:
@@ -314,17 +338,26 @@ def _decode_access_token(token: str) -> AccessTokenClaims:
         or any(character not in "0123456789abcdef" for character in impersonation_id)
     ):
         raise _auth_exception("Token impersonasi tidak valid.")
+    session_mode = payload.get("session_mode")
+    if "session_mode" in payload and (
+        not isinstance(session_mode, str) or session_mode not in ("admin", "mahasiswa")
+        or impersonation_id is not None
+        or (session_mode == "mahasiswa" and payload.get("role") != "mahasiswa")
+        or (session_mode == "admin" and payload.get("role") not in ("admin", "super_admin"))
+    ):
+        raise _auth_exception("Mode sesi tidak valid.")
     try:
         expires_at = datetime.fromtimestamp(int(payload["exp"]), timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         raise _auth_exception("Token autentikasi tidak valid.") from None
     return AccessTokenClaims(
-        user_id, session_version, payload.get("sads_courses_verified") is True, expires_at, impersonation_id,
+        user_id, session_version, payload.get("sads_courses_verified") is True, expires_at, impersonation_id, session_mode,
     )
 
 
 def _rotate_session_version(db: Session, user: User) -> None:
     """Invalidate every token minted before this point for one account."""
+    user = account_user(user)
     db.execute(
         update(User)
         .where(User.id == user.id)
@@ -367,6 +400,8 @@ def get_current_user(
 
     if user.session_version != claims.session_version:
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
+    if claims.session_mode is not None and not can_choose_login_mode(user):
+        raise _auth_exception("Mode sesi sudah tidak berlaku. Silakan login kembali.")
 
     impersonation = None
     if claims.impersonation_id is not None:
@@ -385,7 +420,7 @@ def get_current_user(
         http_request.state.access_claims = claims
         http_request.state.access_token = bearer_token or effective_cookie
         http_request.state.impersonation = impersonation
-    return user
+    return student_mode_user(user) if claims.session_mode == "mahasiswa" else user
 
 
 def get_optional_current_user(
@@ -518,18 +553,44 @@ def login(
             raise
         user = SadsAuthService.provision_student(db, sads_profile, password_hash.hash)
 
+    if request.login_as is not None:
+        expected_mode = "admin" if user.role in ("admin", "super_admin") else "mahasiswa"
+        if request.login_as != expected_mode and not can_choose_login_mode(user):
+            raise _auth_exception("Pilihan mode login tidak tersedia untuk akun ini.", status_code=403)
+    session_mode = (request.login_as or "admin") if can_choose_login_mode(user) else None
+
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
     _rotate_session_version(db, user)
-    token = create_access_token(user, sads_courses_verified=sads_profile is not None)
+    token = create_access_token(user, sads_courses_verified=sads_profile is not None, session_mode=session_mode)
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _set_session_cookie(response, token)
 
     return {
         "token": token,
-        "user": _build_user_response(user),
+        "user": _build_user_response(student_mode_user(user) if session_mode == "mahasiswa" else user),
         "csrf_token": create_csrf_token(token, _jwt_secret_key()),
     }
+
+
+@router.post("/session-mode", response_model=LoginResponse)
+def select_login_mode(
+    request: LoginModeRequest, http_request: Request, response: Response,
+    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+):
+    """Choose a mode after admin login; returning from student mode requires login again."""
+    _set_no_store(response)
+    if not can_choose_login_mode(admin):
+        raise _auth_exception("Pilihan mode login hanya tersedia untuk akun admin cihuy.", status_code=403)
+    expires_at = http_request.state.access_claims.expires_at
+    _rotate_session_version(db, admin)
+    token = create_access_token(admin, session_mode=request.login_as, expires_at=expires_at)
+    remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+    _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
+    _set_session_cookie(response, token, max_age=remaining)
+    effective = student_mode_user(admin) if request.login_as == "mahasiswa" else admin
+    return {"token": token, "user": _build_user_response(effective),
+            "csrf_token": create_csrf_token(token, _jwt_secret_key())}
 
 
 @router.post("/impersonation")

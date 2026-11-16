@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.schemas import SupportMessage, SupportTicket, User, utc_now
+from app.services.account_mode_service import preserve_effective_user
 
 TICKET_LIMIT = 3
 TICKET_WINDOW = timedelta(hours=24)
@@ -82,7 +83,7 @@ def _lock_user(db: Session, user: User) -> User:
     )
     if locked is None:
         raise HTTPException(status_code=401, detail="Pengguna tidak ditemukan. Silakan masuk kembali.")
-    return locked
+    return preserve_effective_user(locked, user)
 
 
 def _visible_ticket(db: Session, user: User, ticket_id: int, *, lock: bool = False) -> SupportTicket:
