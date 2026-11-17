@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi import HTTPException
 
 from app.routes import documents as document_routes
@@ -139,7 +140,14 @@ def test_chapter_detector_accepts_common_heading_punctuation_and_finds_overflow(
     assert result["warning_type"] == "PROPOSAL_CHAPTER_OVERFLOW"
 
 
-def test_invalid_upload_is_deleted_before_a_document_row_is_created(monkeypatch):
+@pytest.mark.parametrize("error_code, status_code", [
+    ("INVALID_CHAPTER_STRUCTURE", 422),
+    ("PDF_VALIDATION_BUSY", 429),
+    ("PDF_VALIDATION_FAILED", 503),
+    ("PDF_VALIDATION_UNAVAILABLE", 503),
+    ("PDF_VALIDATION_INVALID_RESPONSE", 503),
+])
+def test_invalid_upload_is_deleted_before_a_document_row_is_created(monkeypatch, error_code, status_code):
     class FakeUpload:
         filename = "proposal.pdf"
         content_type = "application/pdf"
@@ -162,7 +170,7 @@ def test_invalid_upload_is_deleted_before_a_document_row_is_created(monkeypatch)
             self.seen_file_path = Path(file_path)
             return {
                 "is_valid": False,
-                "error_code": "INVALID_CHAPTER_STRUCTURE",
+                "error_code": error_code,
                 "message": "Struktur Proposal tidak sesuai.",
             }
 
@@ -194,8 +202,10 @@ def test_invalid_upload_is_deleted_before_a_document_row_is_created(monkeypatch)
             )
         )
     except HTTPException as exc:
-        assert exc.status_code == 422
+        assert exc.status_code == status_code
         assert exc.detail == "Struktur Proposal tidak sesuai."
+        if status_code in {429, 503}:
+            assert exc.headers == {"Retry-After": "5"}
     else:
         raise AssertionError("Expected invalid structure upload to be rejected")
 

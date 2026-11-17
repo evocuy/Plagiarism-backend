@@ -6,7 +6,7 @@ import pymupdf
 from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / 'uploads'
-PDF_EXTRACTION_VERSION = 2
+PDF_EXTRACTION_VERSION = 3
 
 class PDFService:
     # Only whole structural lines are ignored. These words inside ordinary
@@ -133,26 +133,39 @@ class PDFService:
     def _is_chapter_heading(self, page_text: str, chapter_roman: str, chapter_arabic: str) -> bool:
         """
         Mendeteksi apakah halaman ini memuat permulaan resmi bab terkait.
-        Abaikan jika halaman tersebut adalah daftar isi atau bagian sistematika penulisan (di mana banyak bab disebut sekaligus).
+        Bedakan judul BAB dari rujukan di dalam kalimat sistematika penulisan.
         """
         if self._is_table_of_contents_page(page_text):
             return False
 
         lines = [line.strip() for line in page_text.split('\n') if line.strip()]
-        # Jika di halaman ini muncul lebih dari 1 penyebutan BAB (misalnya pada bagian sistematika penulisan 1.6 / 1.5),
-        # maka ini BUKAN halaman awal bab sesungguhnya.
-        bab_lines = [l for l in lines if re.match(r'^BAB\s+[IVX0-9]+', l, re.IGNORECASE)]
-        if len(bab_lines) > 1:
-            return False
-
-        chapter_pattern = re.compile(
-            rf'^BAB\s+(?:{re.escape(chapter_roman)}|{re.escape(chapter_arabic)})(?=\s|[.:)\-]|$)',
+        heading_pattern = re.compile(
+            r'^BAB\s+([IVX]+|\d+)(?=\s|[.:)\-]|$)\s*[.:)\-]?\s*(.*)$',
             re.IGNORECASE,
         )
+        headings = []
         for line in lines:
-            if chapter_pattern.match(line.strip()):
-                return True
-        return False
+            match = heading_pattern.fullmatch(line)
+            if not match:
+                continue
+            title = match.group(2).strip().rstrip(':')
+            if title:
+                # A BAB reference can start a body line after PDF wrapping.
+                # Accept short heading titles, not "BAB III menjelaskan ...".
+                # Known titles may be lowercase; other titles must use capitals
+                # or title case, with ordinary connecting words allowed.
+                words = title.split()
+                connectors = {"dan", "atau", "dari", "pada", "untuk", "dengan", "yang", "di", "ke"}
+                if len(title) > 120 or len(words) > 12 or re.search(r'[.!?;]', title):
+                    continue
+                if (title.casefold() not in self._COMMON_HEADINGS
+                        and not all(word[0].isupper() or word.casefold() in connectors for word in words)):
+                    continue
+            headings.append(match.group(1).upper())
+
+        # Multiple actual BAB declarations usually belong to a contents/outline
+        # page. Body references no longer hide a genuine heading on that page.
+        return len(headings) == 1 and headings[0] in {chapter_roman.upper(), chapter_arabic}
 
     def detect_content_pages(self, doc: pymupdf.Document, document_type: str = "skripsi", page_texts: Optional[List[str]] = None) -> tuple[int, int]:
         """

@@ -209,6 +209,14 @@ async def _store_uploaded_document(
             clean_type,
         )
         if not structure_validation["is_valid"]:
+            error_code = structure_validation["error_code"]
+            status_code = 422
+            if error_code == "PDF_VALIDATION_BUSY":
+                status_code = 429
+            elif error_code in {
+                "PDF_VALIDATION_FAILED", "PDF_VALIDATION_UNAVAILABLE", "PDF_VALIDATION_INVALID_RESPONSE",
+            }:
+                status_code = 503
             logger.info(
                 "Menolak upload %s karena struktur %s: %s",
                 original_filename,
@@ -216,9 +224,9 @@ async def _store_uploaded_document(
                 structure_validation["message"],
             )
             raise HTTPException(
-                status_code=429 if structure_validation["error_code"] == "PDF_VALIDATION_BUSY" else 422,
+                status_code=status_code,
                 detail=structure_validation["message"],
-                headers={"Retry-After": "5"} if structure_validation["error_code"] == "PDF_VALIDATION_BUSY" else None,
+                headers={"Retry-After": "5"} if status_code in {429, 503} else None,
             )
 
         # A student-owned upload can never become a comparison source, even

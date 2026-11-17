@@ -22,7 +22,7 @@ from app.services.repository_policy_service import is_comparison_source
 from test_document_embedding_service import ControlledEmbeddingService, MetadataDocumentEmbeddingService
 
 
-def make_pdf(path, kind="proposal", marker="akademik"):
+def make_pdf(path, kind="proposal", marker="akademik", *, recoverable_error=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     with pymupdf.open() as pdf:
         for chapter in range(1, 4 if kind == "proposal" else 6):
@@ -31,6 +31,9 @@ def make_pdf(path, kind="proposal", marker="akademik"):
             page.insert_text((72, 72), f"BAB {roman}\n"
                              f"Sistem informasi {marker} membantu mahasiswa mengelola jadwal kuliah.\n"
                              "Penelitian perpustakaan menggunakan metode pengujian aplikasi kampus.")
+        if recoverable_error:
+            stream = pdf[0].get_contents()[0]
+            pdf.update_stream(stream, pdf.xref_stream(stream) + b"\n/AbsentResource Do\n")
         pdf.save(path)
     return path
 

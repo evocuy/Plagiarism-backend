@@ -78,12 +78,13 @@ def test_checksum_migration_is_nullable_indexed_and_preserves_history(postgres, 
         assert db.get(PlagiarismCheck, check_id).overall_similarity == .42
 
 
-def test_real_cli_imports_and_resumes_on_postgresql(postgres, tmp_path):
+@pytest.mark.parametrize("recoverable_error", [False, True])
+def test_real_cli_imports_and_resumes_on_postgresql(postgres, tmp_path, recoverable_error):
     with sessionmaker(bind=postgres)() as db:
         db.add(User(identifier="cihuy", password="unused", role="admin"))
         db.commit()
     root = tmp_path / "inbox"
-    make_pdf(root / "proposal" / "real.pdf")
+    make_pdf(root / "proposal" / "real.pdf", recoverable_error=recoverable_error)
     environment = {**os.environ, "DATABASE_URL": postgres.url.render_as_string(hide_password=False),
                    "PYTHONDONTWRITEBYTECODE": "1"}
     # Patch only the CLI's storage root and dotenv loading, not its importer/DB/parser.
@@ -97,6 +98,8 @@ def test_real_cli_imports_and_resumes_on_postgresql(postgres, tmp_path):
                                 env=environment, cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=90)
         assert result.returncode == 0, result.stdout + result.stderr
         events = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+        assert [json.loads(line) for line in result.stdout.splitlines()] == events
+        assert "AbsentResource" not in result.stdout + result.stderr
         summaries.append(events[-1])
     assert summaries[0]["imported"] == 1 and summaries[1]["existing"] == 1
     with sessionmaker(bind=postgres)() as db:

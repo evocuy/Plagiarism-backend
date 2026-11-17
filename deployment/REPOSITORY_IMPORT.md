@@ -58,6 +58,12 @@ python -m app.workers.import_repository --root "C:\data\repository-inbox" --limi
 Hilangkan `--limit` untuk seluruh input. Untuk folder satu jenis tanpa struktur
 proposal/skripsi, tambahkan `--document-type proposal` atau skripsi.
 
+Contoh validasi semua 100 PDF (50 proposal dan 50 skripsi), tanpa batas 10 file:
+
+```powershell
+python -m app.workers.import_repository --root "C:\data\repository-inbox" --dry-run
+```
+
 Impor tanpa embedding cukup tanpa flag `--with-embeddings`. Setelah itu command
 yang sama dengan flag tersebut akan mengindeks dokumen yang sudah ada.
 Impor sungguhan memerlukan PostgreSQL, schema backend terbaru, dan akun admin
@@ -89,13 +95,14 @@ Salin PDF ke folder sesuai jenisnya. Pastikan file/subfolder yang diunggah
 tetap dapat dibaca group 10001; periksa izin staging jika mendapat file_unreadable.
 Tidak perlu mengubah pemilik kode, `.env`, atau data PostgreSQL.
 
-Preview memakai container terpisah tanpa membuka port API tambahan:
+Preview semua PDF memakai container terpisah tanpa membuka port API tambahan
+(tambahkan `--limit 10` hanya bila ingin membatasi uji awal):
 
 ```bash
 cd /home/evopuki/backend
 sudo docker compose run --rm --no-deps -T \
   --volume /home/evopuki/repository-inbox:/import:ro \
-  backend python -m app.workers.import_repository --root /import --dry-run --limit 10
+  backend python -m app.workers.import_repository --root /import --dry-run
 ```
 
 Kemudian impor sekaligus embedding:
@@ -164,3 +171,33 @@ highlight, dan backup tetap perlu kapasitas disk yang cukup.
 Exit code: 0 selesai/preview valid; 1 ada file atau embedding gagal/proses berhenti
 karena disk; 2 input/config/database belum siap; 130 dihentikan Ctrl+C.
 Kegagalan satu PDF biasanya tidak menghalangi file lain.
+
+## Jika validasi gagal
+
+PDF yang dapat ditampilkan viewer belum tentu memiliki teks atau struktur BAB
+yang dapat dibaca parser. Namun pesan native MuPDF tentang gambar/font yang
+masih dapat dipulihkan tidak boleh merusak respons JSON validator. Worker
+dan importer menyembunyikan diagnostik native tersebut dan tetap menilai hasil
+ekstraksi; output terminal tetap berupa JSON, termasuk saat impor sungguhan.
+
+- `PDF_UNREADABLE`: parser tidak berhasil membaca PDF.
+- `PDF_TEXT_NOT_EXTRACTABLE`: PDF tidak memiliki teks yang dapat diekstrak; OCR belum tersedia.
+- `PDF_PROCESSING_LIMIT` / `PDF_VALIDATION_TIMEOUT`: batas pemrosesan dokumen terlampaui.
+- `PDF_VALIDATION_FAILED`: proses validator terhenti; kode keluar ditampilkan,
+  tanpa isi PDF atau output native. Kode keluar saja belum memastikan penyebabnya.
+- `PDF_VALIDATION_UNAVAILABLE` / `PDF_VALIDATION_INVALID_RESPONSE`: proses validator
+  tidak dapat dijalankan atau memberikan respons yang tidak sesuai.
+- `INVALID_CHAPTER_STRUCTURE`: periksa BAB hilang/tambahan dan urutan yang
+  dilaporkan. Detektor membedakan deklarasi judul BAB dari kalimat seperti
+  "BAB III menjelaskan metode penelitian". Daftar isi tidak menggantikan BAB isi.
+
+Pesan urutan menampilkan urutan yang benar-benar terbaca, karena daftar BAB
+terdeteksi yang diurutkan berdasarkan nomor saja tidak menjelaskan penolakan.
+Jangan mematikan validasi atau menganggap PDF rusak hanya dari masalah proses
+validator. Untuk diagnosis, cukup bagikan error code dan pesan aman tanpa nama
+file, naskah, NIM, `.env`, atau log parser mentah.
+
+Setelah perbaikan dipasang, jalankan ulang `--dry-run` pada folder yang sama.
+Preview tidak mengimpor dokumen dan tidak memanggil embedding API. Versi cache
+ekstraksi dinaikkan ketika deteksi BAB berubah, sehingga ekstraksi/chunks lama
+dibangun ulang saat diperlukan. Riwayat dan skor pengecekan lama tidak diubah.

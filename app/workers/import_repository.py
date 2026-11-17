@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import pymupdf
 from dotenv import load_dotenv
 
 from app.services.document_structure_service import DocumentStructureService
@@ -123,6 +125,10 @@ def execute(args) -> int:
 
 
 def main(argv=None) -> int:
+    # Live extraction also runs in this CLI after isolated validation. Keep
+    # recoverable native messages (which may contain PDF data) out of JSONL.
+    pymupdf.set_messages(path=os.devnull)
+    pymupdf.set_log(path=os.devnull)
     command = parser()
     args = command.parse_args(argv)
     if args.limit is not None and args.limit < 1:

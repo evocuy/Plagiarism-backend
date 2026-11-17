@@ -69,18 +69,36 @@ class DocumentStructureService:
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 cwd=str(Path(__file__).resolve().parents[2]),
             )
-            return json.loads(result.stdout)
+            validation = json.loads(result.stdout)
+            if not isinstance(validation, dict) or type(validation.get("is_valid")) is not bool:
+                raise ValueError("Invalid PDF validation response")
+            return validation
         except subprocess.TimeoutExpired:
             return {
                 "is_valid": False,
                 "error_code": "PDF_VALIDATION_TIMEOUT",
                 "message": "PDF melewati batas waktu pemrosesan. Coba sederhanakan dokumen.",
             }
-        except (subprocess.SubprocessError, OSError, ValueError):
+        except subprocess.CalledProcessError as exc:
             return {
                 "is_valid": False,
-                "error_code": "PDF_UNREADABLE",
-                "message": "PDF tidak dapat diproses. Unggah file PDF yang valid.",
+                "error_code": "PDF_VALIDATION_FAILED",
+                "message": (
+                    "Proses validasi PDF terhenti "
+                    f"(kode keluar {exc.returncode}). Coba ulangi atau periksa kapasitas server."
+                ),
+            }
+        except OSError:
+            return {
+                "is_valid": False,
+                "error_code": "PDF_VALIDATION_UNAVAILABLE",
+                "message": "Proses validasi PDF tidak dapat dijalankan. Coba lagi beberapa saat lagi.",
+            }
+        except (subprocess.SubprocessError, ValueError):
+            return {
+                "is_valid": False,
+                "error_code": "PDF_VALIDATION_INVALID_RESPONSE",
+                "message": "Respons proses validasi PDF tidak valid. Coba ulangi atau hubungi admin.",
             }
         finally:
             self._validation_slots.release()
@@ -192,6 +210,7 @@ class DocumentStructureService:
                 missing=missing,
                 unexpected=unexpected,
                 in_expected_order=in_expected_order,
+                document_order=ordered_detected,
             ),
         }
         return result
@@ -237,6 +256,7 @@ class DocumentStructureService:
         missing: List[int],
         unexpected: List[int],
         in_expected_order: bool,
+        document_order: List[int],
     ) -> str:
         detected_text = self._format_chapters(detected)
 
@@ -252,7 +272,9 @@ class DocumentStructureService:
                     f"tidak boleh memuat {self._format_chapters(unexpected)}"
                 )
             if not in_expected_order and not missing:
-                details.append("urutan BAB tidak sesuai")
+                details.append(
+                    f"urutan BAB tidak sesuai (terbaca: {self._format_chapters(document_order)})"
+                )
             detail_text = "; ".join(details)
             return (
                 "Struktur Proposal tidak sesuai. Dokumen harus memuat tepat BAB 1, "
@@ -266,7 +288,10 @@ class DocumentStructureService:
         if missing:
             details.append(f"belum ditemukan {self._format_chapters(missing)}")
         if not in_expected_order and not missing:
-            details.append("urutan BAB 1 sampai BAB 5 tidak sesuai")
+            details.append(
+                "urutan BAB 1 sampai BAB 5 tidak sesuai "
+                f"(terbaca: {self._format_chapters(document_order)})"
+            )
         detail_text = "; ".join(details)
         return (
             "Struktur Skripsi belum lengkap. Dokumen harus memuat minimal BAB 1 sampai "
