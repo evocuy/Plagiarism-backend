@@ -6,6 +6,7 @@ from typing import Annotated, Literal, Optional, List
 
 import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Header, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
@@ -13,13 +14,14 @@ from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
-from app.models.schemas import User, SUPPORTED_USER_ROLES
+from app.models.schemas import User, AuthRefreshSession, SUPPORTED_USER_ROLES, utc_now
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, StudentAuthSettings
 from app.services.sads_course_service import SadsActiveCoursesService
 from app.services import impersonation_service
 from app.services.csrf_service import create_csrf_token
 from app.services.account_mode_service import StudentModeUser, account_user, can_choose_login_mode, student_mode_user
+from app.services import refresh_token_service as refresh_tokens
 
 router = APIRouter()
 
@@ -30,6 +32,8 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "plagiarism_session")
 IMPERSONATION_COOKIE_NAME = SESSION_COOKIE_NAME + "_impersonation"
+REFRESH_COOKIE_NAME = SESSION_COOKIE_NAME + "_refresh"
+REFRESH_COOKIE_PATH = "/api/auth"
 AUTH_NO_STORE_VALUE = "no-store"
 
 
@@ -59,6 +63,10 @@ def _read_boolean_setting(name: str, default: bool) -> bool:
 
 
 JWT_EXPIRE_MINUTES = _read_positive_int_setting("JWT_EXPIRE_MINUTES", 1440)
+REMEMBER_ACCESS_EXPIRE_MINUTES = _read_positive_int_setting("REMEMBER_ACCESS_EXPIRE_MINUTES", 15)
+REFRESH_TOKEN_EXPIRE_DAYS = _read_positive_int_setting("REFRESH_TOKEN_EXPIRE_DAYS", 30)
+if REMEMBER_ACCESS_EXPIRE_MINUTES > 60 or REFRESH_TOKEN_EXPIRE_DAYS > 30:
+    raise RuntimeError("Remember me maksimal 30 hari, dengan access token maksimal 60 menit.")
 IMPERSONATION_EXPIRE_MINUTES = _read_positive_int_setting("IMPERSONATION_EXPIRE_MINUTES", 15)
 if IMPERSONATION_EXPIRE_MINUTES > 60:
     raise RuntimeError("IMPERSONATION_EXPIRE_MINUTES maksimal 60 menit.")
@@ -149,11 +157,59 @@ def _clear_session_cookie(response: Response, *, cookie_name: str = SESSION_COOK
         samesite=SESSION_COOKIE_SAMESITE,
     )
 
+
+def _set_refresh_cookie(response: Response, raw: str, session: AuthRefreshSession) -> None:
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME, value=raw, httponly=True, secure=SESSION_COOKIE_SECURE,
+        samesite=SESSION_COOKIE_SAMESITE, domain=SESSION_COOKIE_DOMAIN, path=REFRESH_COOKIE_PATH,
+        max_age=max(0, int((session.expires_at - utc_now()).total_seconds())),
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=REFRESH_COOKIE_NAME, path=REFRESH_COOKIE_PATH, domain=SESSION_COOKIE_DOMAIN,
+        secure=SESSION_COOKIE_SECURE, httponly=True, samesite=SESSION_COOKIE_SAMESITE,
+    )
+
+
+def _remember_access_expiry(session: AuthRefreshSession) -> datetime:
+    return min(
+        datetime.now(timezone.utc) + timedelta(minutes=min(JWT_EXPIRE_MINUTES, REMEMBER_ACCESS_EXPIRE_MINUTES)),
+        session.expires_at.replace(tzinfo=timezone.utc),
+    )
+
+
+def _auth_response(user, token: str, expires_at: datetime, *, session=None, refresh_raw=None) -> dict:
+    return {
+        "token": token, "user": _build_user_response(user),
+        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
+        "expires_in": max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds())),
+        "remember_me": session is not None,
+        "refresh_expires_at": session.expires_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z") if session is not None else None,
+        "refresh_csrf_token": create_csrf_token(refresh_raw, _jwt_secret_key()) if refresh_raw else None,
+    }
+
+
+def _refresh_error_response(error: refresh_tokens.RefreshTokenError) -> JSONResponse:
+    response = JSONResponse({"detail": error.detail, "error_code": error.code}, status_code=error.status_code)
+    _set_no_store(response)
+    if error.status_code == 401:
+        response.headers["WWW-Authenticate"] = "Bearer"
+    if error.retry_after is not None:
+        response.headers["Retry-After"] = str(error.retry_after)
+    if error.status_code in (401, 403):
+        _clear_refresh_cookie(response)
+        _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
+        _clear_session_cookie(response)
+    return response
+
 # Pydantic Schemas
 class LoginRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=256)
     login_as: Optional[Literal["admin", "mahasiswa"]] = None
+    remember_me: bool = Field(default=False, strict=True)
 
 
 class LoginModeRequest(BaseModel):
@@ -217,6 +273,10 @@ class LoginResponse(BaseModel):
     token: str
     user: UserResponse
     csrf_token: str
+    expires_in: int | None = None
+    remember_me: bool = False
+    refresh_expires_at: datetime | None = None
+    refresh_csrf_token: str | None = None
 
 class CreateUserRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
@@ -260,6 +320,7 @@ def create_access_token(
     user: User, *, sads_courses_verified: bool = False,
     impersonation_id: str | None = None, expires_at: datetime | None = None,
     session_mode: str | None = None,
+    refresh_session_id: str | None = None,
 ) -> str:
     if isinstance(user, StudentModeUser):
         if session_mode not in (None, "mahasiswa"):
@@ -279,11 +340,15 @@ def create_access_token(
         "sv": user.session_version,
         "sads_courses_verified": sads_courses_verified,
         "exp": expires_at,
+        "token_type": "access",
+        "jti": secrets.token_hex(16),
     }
     if impersonation_id is not None:
         payload["impersonation_id"] = impersonation_id
     if session_mode is not None:
         payload["session_mode"] = session_mode
+    if refresh_session_id is not None:
+        payload["refresh_session_id"] = refresh_session_id
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
@@ -306,24 +371,27 @@ class AccessTokenClaims:
     expires_at: datetime
     impersonation_id: str | None = None
     session_mode: str | None = None
+    refresh_session_id: str | None = None
 
     @property
     def session_identity(self) -> tuple:
-        return self.user_id, self.session_version, self.sads_courses_verified, self.impersonation_id, self.session_mode
+        return self.user_id, self.session_version, self.sads_courses_verified, self.impersonation_id, self.session_mode, self.refresh_session_id
 
 
-def _decode_access_token(token: str) -> AccessTokenClaims:
+def _decode_access_token(token: str, *, allow_expired: bool = False) -> AccessTokenClaims:
     try:
         payload = jwt.decode(
             token,
             _jwt_secret_key(),
             algorithms=[JWT_ALGORITHM],
-            options={"require": ["exp", "sub", "sv"]},
+            options={"require": ["exp", "sub", "sv"], "verify_exp": not allow_expired},
         )
     except jwt.PyJWTError as exc:
         raise _auth_exception("Token autentikasi tidak valid atau telah kedaluwarsa.") from exc
 
     subject = payload.get("sub")
+    if payload.get("token_type", "access") != "access":
+        raise _auth_exception("Jenis token autentikasi tidak valid.")
     session_version = payload.get("sv")
     try:
         user_id = int(subject)
@@ -339,6 +407,13 @@ def _decode_access_token(token: str) -> AccessTokenClaims:
     ):
         raise _auth_exception("Token impersonasi tidak valid.")
     session_mode = payload.get("session_mode")
+    refresh_session_id = payload.get("refresh_session_id")
+    if "refresh_session_id" in payload and (
+        not isinstance(refresh_session_id, str) or len(refresh_session_id) != 32
+        or any(c not in "0123456789abcdef" for c in refresh_session_id)
+        or impersonation_id is not None
+    ):
+        raise _auth_exception("Sesi tersimpan tidak valid.")
     if "session_mode" in payload and (
         not isinstance(session_mode, str) or session_mode not in ("admin", "mahasiswa")
         or impersonation_id is not None
@@ -351,11 +426,11 @@ def _decode_access_token(token: str) -> AccessTokenClaims:
     except (TypeError, ValueError, OverflowError, OSError):
         raise _auth_exception("Token autentikasi tidak valid.") from None
     return AccessTokenClaims(
-        user_id, session_version, payload.get("sads_courses_verified") is True, expires_at, impersonation_id, session_mode,
+        user_id, session_version, payload.get("sads_courses_verified") is True, expires_at, impersonation_id, session_mode, refresh_session_id,
     )
 
 
-def _rotate_session_version(db: Session, user: User) -> None:
+def _rotate_session_version(db: Session, user: User, *, commit: bool = True) -> None:
     """Invalidate every token minted before this point for one account."""
     user = account_user(user)
     db.execute(
@@ -363,8 +438,11 @@ def _rotate_session_version(db: Session, user: User) -> None:
         .where(User.id == user.id)
         .values(session_version=func.coalesce(User.session_version, 0) + 1)
     )
-    db.commit()
+    refresh_tokens.revoke_user_sessions(db, user.id, "session_changed")
+    db.flush()
     db.refresh(user)
+    if commit:
+        db.commit()
 
 
 def get_current_user(
@@ -400,6 +478,13 @@ def get_current_user(
 
     if user.session_version != claims.session_version:
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
+    if claims.refresh_session_id is not None:
+        remembered = db.get(AuthRefreshSession, claims.refresh_session_id)
+        if (remembered is None or remembered.revoked_at is not None or remembered.expires_at <= utc_now()
+                or remembered.user_id != user.id or remembered.session_version != user.session_version
+                or remembered.session_mode != claims.session_mode
+                or remembered.auth_context_hash != refresh_tokens.auth_context_hash(user)):
+            raise _auth_exception("Sesi tersimpan tidak berlaku. Silakan login kembali.")
     if claims.session_mode is not None and not can_choose_login_mode(user):
         raise _auth_exception("Mode sesi sudah tidak berlaku. Silakan login kembali.")
 
@@ -459,13 +544,109 @@ def require_original_admin(
     db: Session = Depends(get_db),
 ) -> User:
     """Recovery requires the parent credential, never the student's overlay."""
-    user = get_current_user(
-        authorization=authorization, plagiarism_session=plagiarism_session, db=db,
-        impersonation_session=None, http_request=http_request,
-    )
+    try:
+        user = get_current_user(
+            authorization=authorization, plagiarism_session=plagiarism_session, db=db,
+            impersonation_session=None, http_request=http_request,
+        )
+    except HTTPException as error:
+        # Explicit stop can recover a remembered parent after access expiry.
+        # A malformed/stale Bearer must never select a different credential.
+        if error.status_code != 401 or authorization is not None:
+            raise
+        try:
+            grant = refresh_tokens.resolve_grant(db, http_request.cookies.get(REFRESH_COOKIE_NAME))
+            _check_refresh_access_cookie(http_request, grant)
+        except refresh_tokens.RefreshTokenError as refresh_error:
+            raise _auth_exception(refresh_error.detail) from None
+        if (grant.user.role not in ("admin", "super_admin") or grant.session.session_mode == "mahasiswa"
+                or grant.session.impersonation_session_id is None):
+            raise _auth_exception("Sesi admin asli diperlukan untuk kembali dari impersonasi.", status_code=403)
+        http_request.state.refresh_recovery_grant = grant
+        http_request.state.access_claims = AccessTokenClaims(
+            grant.user.id, grant.user.session_version, grant.session.sads_courses_verified,
+            _remember_access_expiry(grant.session), session_mode=grant.session.session_mode,
+            refresh_session_id=grant.session.id,
+        )
+        http_request.state.access_token = None
+        user = grant.user
     if user.role not in ("admin", "super_admin") or http_request.state.access_claims.impersonation_id:
         raise _auth_exception("Sesi admin asli diperlukan untuk kembali dari impersonasi.", status_code=403)
     return user
+
+
+def _check_refresh_access_cookie(http_request: Request, grant: refresh_tokens.RefreshGrant) -> None:
+    """An expired parent cookie is fine; a different principal/mode is not."""
+    cookie = http_request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie is None:
+        return
+    try:
+        claims = _decode_access_token(cookie, allow_expired=True)
+    except HTTPException:
+        raise refresh_tokens.RefreshTokenError() from None
+    if (claims.user_id != grant.user.id or claims.session_version != grant.session.session_version
+            or claims.refresh_session_id != grant.session.id or claims.session_mode != grant.session.session_mode
+            or claims.impersonation_id is not None):
+        raise refresh_tokens.RefreshTokenError()
+
+
+def _check_refresh_eligibility(db: Session, grant: refresh_tokens.RefreshGrant) -> None:
+    user, session = grant.user, grant.session
+    if session.session_mode is not None and not can_choose_login_mode(user):
+        refresh_tokens.revoke_grant(db, grant, "mode_unavailable")
+        raise refresh_tokens.RefreshTokenError()
+    if user.role != "mahasiswa":
+        return
+    settings = StudentAuthSettings.from_environment()
+    if settings.provider == "sads" or user.auth_provider == "sads":
+        if settings.provider != "sads" or user.auth_provider != "sads" or not session.sads_courses_verified:
+            refresh_tokens.revoke_grant(db, grant, "provider_changed")
+            raise refresh_tokens.RefreshTokenError()
+        try:
+            SadsActiveCoursesService().require_eligible_student(user.identifier)
+        except HTTPException as error:
+            if error.status_code == 403:
+                refresh_tokens.revoke_grant(db, grant, "courses_ineligible")
+                raise refresh_tokens.RefreshTokenError("refresh_access_denied", error.detail, status_code=403) from None
+            # Temporary SADS errors do not consume/revoke the current token.
+            raise
+
+
+@router.post("/refresh", response_model=LoginResponse)
+def refresh_session(http_request: Request, response: Response, db: Session = Depends(get_db)):
+    """Renew a remembered login using its HttpOnly cookie and rotate once."""
+    _set_no_store(response)
+    if http_request.headers.get("Authorization") is not None:
+        raise _auth_exception("Refresh memakai cookie sesi tersimpan; jangan sertakan header Authorization.")
+    try:
+        grant = refresh_tokens.resolve_grant(db, http_request.cookies.get(REFRESH_COOKIE_NAME))
+        _check_refresh_access_cookie(http_request, grant)
+        if (IMPERSONATION_COOKIE_NAME in http_request.cookies or grant.session.impersonation_session_id is not None):
+            db.rollback()
+            return JSONResponse({"detail": "Akhiri impersonasi secara eksplisit sebelum memperbarui sesi admin.",
+                                 "error_code": "impersonation_active"}, status_code=403,
+                                headers={"Cache-Control": AUTH_NO_STORE_VALUE, "Pragma": "no-cache"})
+        interval = min(60, min(JWT_EXPIRE_MINUTES, REMEMBER_ACCESS_EXPIRE_MINUTES) * 30)
+        refresh_tokens.enforce_rotation_interval(grant, interval)
+        _check_refresh_eligibility(db, grant)
+        raw = refresh_tokens.rotate_grant(db, grant, minimum_interval_seconds=interval)
+        expires_at = _remember_access_expiry(grant.session)
+        token = create_access_token(
+            grant.user, session_mode=grant.session.session_mode,
+            sads_courses_verified=grant.session.sads_courses_verified,
+            refresh_session_id=grant.session.id, expires_at=expires_at,
+        )
+        db.commit()
+        _set_refresh_cookie(response, raw, grant.session)
+        _set_session_cookie(response, token, max_age=max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds())))
+        effective = student_mode_user(grant.user) if grant.session.session_mode == "mahasiswa" else grant.user
+        return _auth_response(effective, token, expires_at, session=grant.session, refresh_raw=raw)
+    except refresh_tokens.RefreshTokenError as error:
+        db.rollback()
+        return _refresh_error_response(error)
+    except HTTPException:
+        db.rollback()
+        raise
 
 
 def seed_initial_users(db: Session) -> None:
@@ -561,16 +742,29 @@ def login(
 
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
-    _rotate_session_version(db, user)
-    token = create_access_token(user, sads_courses_verified=sads_profile is not None, session_mode=session_mode)
+    if request.remember_me:
+        refresh_tokens.purge_expired_sessions(db)
+    _rotate_session_version(db, user, commit=False)
+    remembered, raw = None, None
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    if request.remember_me:
+        remembered, raw = refresh_tokens.issue_session(
+            db, user, expires_at=utc_now() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+            session_mode=session_mode, sads_courses_verified=sads_profile is not None,
+        )
+        expires_at = _remember_access_expiry(remembered)
+    token = create_access_token(user, sads_courses_verified=sads_profile is not None, session_mode=session_mode,
+                                expires_at=expires_at, refresh_session_id=remembered.id if remembered else None)
+    db.commit()
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
-    _set_session_cookie(response, token)
+    if remembered:
+        _set_refresh_cookie(response, raw, remembered)
+    else:
+        _clear_refresh_cookie(response)
+    _set_session_cookie(response, token, max_age=max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds())))
 
-    return {
-        "token": token,
-        "user": _build_user_response(student_mode_user(user) if session_mode == "mahasiswa" else user),
-        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
-    }
+    effective = student_mode_user(user) if session_mode == "mahasiswa" else user
+    return _auth_response(effective, token, expires_at, session=remembered, refresh_raw=raw)
 
 
 @router.post("/session-mode", response_model=LoginResponse)
@@ -583,14 +777,25 @@ def select_login_mode(
     if not can_choose_login_mode(admin):
         raise _auth_exception("Pilihan mode login hanya tersedia untuk akun admin cihuy.", status_code=403)
     expires_at = http_request.state.access_claims.expires_at
-    _rotate_session_version(db, admin)
-    token = create_access_token(admin, session_mode=request.login_as, expires_at=expires_at)
+    previous = db.get(AuthRefreshSession, http_request.state.access_claims.refresh_session_id) if http_request.state.access_claims.refresh_session_id else None
+    remembered_expiry = previous.expires_at if previous is not None else None
+    _rotate_session_version(db, admin, commit=False)
+    remembered, raw = None, None
+    if remembered_expiry is not None:
+        remembered, raw = refresh_tokens.issue_session(db, admin, expires_at=remembered_expiry,
+                                                      session_mode=request.login_as, sads_courses_verified=False)
+    token = create_access_token(admin, session_mode=request.login_as, expires_at=expires_at,
+                                refresh_session_id=remembered.id if remembered else None)
+    db.commit()
     remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
+    if remembered:
+        _set_refresh_cookie(response, raw, remembered)
+    else:
+        _clear_refresh_cookie(response)
     _set_session_cookie(response, token, max_age=remaining)
     effective = student_mode_user(admin) if request.login_as == "mahasiswa" else admin
-    return {"token": token, "user": _build_user_response(effective),
-            "csrf_token": create_csrf_token(token, _jwt_secret_key())}
+    return _auth_response(effective, token, expires_at, session=remembered, refresh_raw=raw)
 
 
 @router.post("/impersonation")
@@ -648,18 +853,31 @@ def stop_admin_impersonation(
 ):
     _set_no_store(response)
     claims = http_request.state.access_claims
+    recovery = getattr(http_request.state, "refresh_recovery_grant", None)
+    remembered = db.get(AuthRefreshSession, claims.refresh_session_id) if claims.refresh_session_id else None
+    if (remembered is not None and remembered.impersonation_session_id is not None
+            and remembered.impersonation_session_id != request.session_id):
+        raise _auth_exception("Akhiri sesi impersonasi yang sedang aktif.", status_code=403)
     impersonation_service.stop_impersonation(
         db, admin, request.session_id, session_version=claims.session_version,
+        commit=recovery is None,
     )
-    # Return the existing credential without extending the admin session.
     token = http_request.state.access_token
-    remaining = max(0, int((claims.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    expires_at = claims.expires_at
+    raw = http_request.cookies.get(REFRESH_COOKIE_NAME)
+    if recovery is not None:
+        raw = refresh_tokens.rotate_grant(db, recovery)
+        expires_at = _remember_access_expiry(recovery.session)
+        token = create_access_token(admin, session_mode=recovery.session.session_mode,
+                                    refresh_session_id=recovery.session.id, expires_at=expires_at)
+        db.commit()
+        _set_refresh_cookie(response, raw, recovery.session)
+    # Legacy parent sessions are returned without extending their expiry.
+    remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _set_session_cookie(response, token, max_age=remaining)
-    return {
-        "token": token, "user": _build_user_response(admin), "impersonation": {"active": False},
-        "csrf_token": create_csrf_token(token, _jwt_secret_key()),
-    }
+    return {**_auth_response(admin, token, expires_at, session=remembered, refresh_raw=raw if remembered else None),
+            "impersonation": {"active": False}}
 
 
 @router.get("/csrf")
@@ -674,7 +892,11 @@ def get_csrf_token(http_request: Request, response: Response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     cookies = http_request.cookies
     token = cookies.get(IMPERSONATION_COOKIE_NAME) if IMPERSONATION_COOKIE_NAME in cookies else cookies.get(SESSION_COOKIE_NAME)
-    return {"csrf_token": create_csrf_token(token, _jwt_secret_key()) if token is not None else None}
+    result = {"csrf_token": create_csrf_token(token, _jwt_secret_key()) if token is not None else None}
+    refresh = cookies.get(REFRESH_COOKIE_NAME)
+    if refresh is not None:
+        result["refresh_csrf_token"] = create_csrf_token(refresh, _jwt_secret_key())
+    return result
 
 
 @router.get("/me", response_model=UserResponse)
@@ -687,16 +909,34 @@ def get_me(response: Response, current_user: User = Depends(get_current_user)):
 def logout(
     response: Response,
     http_request: Request,
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _set_no_store(response)
-    session = http_request.state.impersonation
+    try:
+        current_user = get_current_user(
+            authorization=http_request.headers.get("Authorization"),
+            plagiarism_session=http_request.cookies.get(SESSION_COOKIE_NAME), db=db,
+            impersonation_session=http_request.cookies.get(IMPERSONATION_COOKIE_NAME), http_request=http_request,
+        )
+    except HTTPException as error:
+        if error.status_code != 401 or http_request.headers.get("Authorization") is not None:
+            raise
+        if REFRESH_COOKIE_NAME not in http_request.cookies:
+            raise
+        try:
+            grant = refresh_tokens.resolve_grant(db, http_request.cookies[REFRESH_COOKIE_NAME], allow_used=True)
+            _check_refresh_access_cookie(http_request, grant)
+            current_user = grant.user
+        except refresh_tokens.RefreshTokenError as refresh_error:
+            db.rollback()
+            return _refresh_error_response(refresh_error)
+    session = getattr(http_request.state, "impersonation", None)
     if session is not None:
         impersonation_service.end_impersonation(db, session.id, "logout")
         _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
         return {"message": "Sesi impersonasi dihentikan."}
     _rotate_session_version(db, current_user)
+    _clear_refresh_cookie(response)
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
     _clear_session_cookie(response)
     return {"message": "Berhasil keluar dari sesi."}
@@ -796,6 +1036,7 @@ def update_user(
             .where(User.id == target_user.id)
             .values(session_version=func.coalesce(User.session_version, 0) + 1)
         )
+        refresh_tokens.revoke_user_sessions(db, target_user.id, "password_changed")
     db.commit()
     db.refresh(target_user)
     return _build_user_response(target_user)

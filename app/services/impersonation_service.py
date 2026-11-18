@@ -11,6 +11,7 @@ from app.models.schemas import ImpersonationSession, User, utc_now
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, auth_error
 from app.services.sads_course_service import SadsActiveCoursesService
+from app.services import refresh_token_service as refresh_tokens
 
 
 ADMIN_ROLES = ("admin", "super_admin")
@@ -84,6 +85,7 @@ def start_impersonation(db: Session, admin: User, nim: str, *, actor_claims, min
         expires_at=min(now + timedelta(minutes=minutes), parent_expiry),
     )
     db.add(session)
+    refresh_tokens.bind_impersonation(db, actor.id, actor.session_version, session.id)
     _commit(db)
     return target, session
 
@@ -104,7 +106,7 @@ def resolve_impersonation(db: Session, session_id: str, target: User) -> Imperso
     return session
 
 
-def stop_impersonation(db: Session, admin: User, session_id: str, *, session_version: int):
+def stop_impersonation(db: Session, admin: User, session_id: str, *, session_version: int, commit: bool = True):
     actor = _lock_actor(db, admin.id, session_version)
     session = db.query(ImpersonationSession).filter(
         ImpersonationSession.id == session_id,
@@ -116,6 +118,8 @@ def stop_impersonation(db: Session, admin: User, session_id: str, *, session_ver
     if session.ended_at is None:
         session.ended_at = utc_now()
         session.end_reason = "expired" if session.expires_at <= session.ended_at else "stopped"
+    refresh_tokens.bind_impersonation(db, actor.id, session_version, None, previous_id=session_id)
+    if commit:
         _commit(db)
     return session
 
@@ -125,6 +129,7 @@ def end_impersonation(db: Session, session_id: str, reason: str) -> None:
     if session is not None and session.ended_at is None:
         session.ended_at = utc_now()
         session.end_reason = reason
+        refresh_tokens.bind_impersonation(db, session.actor_user_id, session.actor_session_version, None, previous_id=session_id)
         _commit(db)
 
 

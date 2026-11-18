@@ -64,6 +64,37 @@ class LoginThrottle(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
 
 
+class AuthRefreshSession(Base):
+    """One revocable, fixed-duration remembered login; no campus credentials."""
+    __tablename__ = "auth_refresh_sessions"
+
+    id = Column(String(32), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_version = Column(Integer, nullable=False)
+    auth_context_hash = Column(String(64), nullable=False)
+    session_mode = Column(String(20), nullable=True)
+    sads_courses_verified = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revocation_reason = Column(String(40), nullable=True)
+    last_rotated_at = Column(DateTime, nullable=True)
+    # Kept even after overlay expiry: refresh must never silently restore admin.
+    impersonation_session_id = Column(String(32), nullable=True)
+    tokens = relationship("AuthRefreshToken", cascade="all, delete-orphan", passive_deletes=True)
+
+
+class AuthRefreshToken(Base):
+    """Single-use token digests retained until their remembered login expires."""
+    __tablename__ = "auth_refresh_tokens"
+
+    token_hash = Column(String(64), primary_key=True)
+    session_id = Column(String(32), ForeignKey("auth_refresh_sessions.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    used_at = Column(DateTime, nullable=True)
+
+
 class ImpersonationSession(Base):
     """Revocable support sessions and their audit trail; never store JWTs."""
     __tablename__ = "impersonation_sessions"

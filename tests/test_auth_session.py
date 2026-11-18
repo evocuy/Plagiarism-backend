@@ -17,7 +17,7 @@ from app.routes import auth
 TEST_JWT_SECRET = "auth-session-test-secret-that-is-long-enough-1234567890"
 
 
-def request(app, method, path, *, authorization=None, cookie=None, cookies=None, body=None, headers=None, raw_body=None):
+def request(app, method, path, *, authorization=None, cookie=None, cookies=None, body=None, headers=None, raw_body=None, raw_response=False):
     body_bytes = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else b"")
     request_headers = [(b"content-type", b"application/json")]
     if authorization is not None:
@@ -63,6 +63,8 @@ def request(app, method, path, *, authorization=None, cookie=None, cookies=None,
     content = b"".join(event.get("body", b"") for event in events if event["type"] == "http.response.body")
     response_headers = {key.decode().lower(): value.decode() for key, value in start["headers"]}
     response_headers["set-cookie-all"] = [value.decode() for key, value in start["headers"] if key == b"set-cookie"]
+    if raw_response:
+        return start["status"], response_headers, content
     try:
         parsed_content = json.loads(content)
     except json.JSONDecodeError:

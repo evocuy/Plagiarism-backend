@@ -16,6 +16,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 CSRF_HEADER = "X-CSRF-Token"
 CSRF_BOOTSTRAP_PATH = "/api/auth/csrf"
 LOGIN_PATH = "/api/auth/login"
+REFRESH_PATH = "/api/auth/refresh"
+RECOVERY_PATHS = frozenset({"/api/auth/logout", "/api/auth/impersonation/stop"})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
@@ -61,6 +63,7 @@ class CsrfMiddleware:
         self.secret_key = secret_key
         self.session_cookie = session_cookie
         self.impersonation_cookie = impersonation_cookie
+        self.refresh_cookie = session_cookie + "_refresh"
         self.trusted_origins = frozenset(normalize_origin(value) for value in trusted_origins)
 
     @staticmethod
@@ -105,13 +108,20 @@ class CsrfMiddleware:
             return
         cookies = request.cookies
         session = cookies.get(self.impersonation_cookie) if self.impersonation_cookie in cookies else cookies.get(self.session_cookie)
+        refresh = cookies.get(self.refresh_cookie)
+        candidates = [session] if session is not None else []
+        if path == REFRESH_PATH:
+            candidates = [refresh] if refresh is not None else []
+        elif path in RECOVERY_PATHS and refresh is not None:
+            # Logout/explicit return to admin must work after access expiry.
+            candidates.append(refresh)
         # Login authenticates explicit credentials and replaces stale cookies.
         # Bearer-only callers have no ambient browser credentials to protect.
-        if unsafe and path != LOGIN_PATH and session is not None:
+        if unsafe and path != LOGIN_PATH and candidates:
             tokens = request.headers.getlist(CSRF_HEADER)
             if (
                 len(tokens) != 1 or not re.fullmatch(r"[0-9a-f]{64}", tokens[0])
-                or not hmac.compare_digest(tokens[0], create_csrf_token(session, self.secret_key()))
+                or not any(hmac.compare_digest(tokens[0], create_csrf_token(value, self.secret_key())) for value in candidates)
             ):
                 await self._reject(send, "csrf_token_invalid")
                 return

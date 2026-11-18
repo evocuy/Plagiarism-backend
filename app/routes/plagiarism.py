@@ -599,6 +599,7 @@ def get_comparison_source_pdf(
     )
 
 
+@router.get("/check/{check_id}/highlighted-pdf", include_in_schema=False)
 @router.get("/check/{check_id}/download-highlighted")
 def download_highlighted_pdf(
     check_id: int,

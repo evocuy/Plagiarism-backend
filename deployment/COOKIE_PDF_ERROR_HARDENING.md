@@ -82,6 +82,19 @@ GET `/api/plagiarism/check/{id}/download-highlighted` hanya melayani artefak yan
 sudah ada ketika status check adalah completed. GET tidak membuat atau menulis
 PDF/metadata baru.
 
+Alias kompatibilitas `GET /api/plagiarism/check/{id}/highlighted-pdf` menjalankan
+handler, autentikasi, pemeriksaan pemilik, dan aturan kesiapan file yang sama.
+URL kanonis pada field `highlighted_pdf_url` tetap `/download-highlighted`.
+Gunakan ID pengecekan (`check_id` atau `id` pada riwayat check), bukan ID dokumen.
+Pesan generik `Not Found` dapat berarti path/proxy tidak cocok sebelum handler
+dijalankan; bedakan dari pesan handler tentang check atau artefak yang hilang.
+
+Pembukaan di tab/iframe memerlukan cookie sesi yang terkirim. Untuk klien
+Bearer-only, ambil PDF melalui fetch berautentikasi lalu buka Blob URL; link
+biasa tidak mengirim Authorization. Dengan Remember me, fetch PDF juga perlu
+mengikuti pemulihan access token sebelum mengulang request 401, seperti di
+[panduan refresh](REFRESH_TOKENS.md). Token tidak boleh dimasukkan ke URL.
+
 | Kondisi | Respons |
 | --- | --- |
 | Pending/processing | 409, Retry-After: 5 |
