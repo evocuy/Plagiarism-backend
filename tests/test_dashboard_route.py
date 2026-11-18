@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database.session import Base
-from app.models.schemas import Document, PlagiarismCheck, User
+from app.models.schemas import Document, PlagiarismCheck, User, utc_now
 from app.routes.dashboard import get_dashboard_summary
 
 
@@ -45,13 +45,53 @@ def test_dashboard_summary_scopes_counts_by_role_without_review_fields():
     assert student_summary["latest_check_count"] == 1
     assert student_summary["average_similarity"] == .18
     assert student_summary["processing_check_count"] == 1
-    assert admin_summary["document_count"] == 2
+    assert admin_summary["document_count"] == 0  # Only private student uploads exist.
     assert admin_summary["total_check_count"] == 3
     assert admin_summary["latest_check_count"] == 2
     assert admin_summary["average_similarity"] == .3
     assert admin_summary["processing_check_count"] == 1
     assert not {"approved_count", "pending_review_count", "revision_count", "supervised_student_count"} & admin_summary.keys()
     assert "approval_status" not in admin_summary["latest_check"]
+
+
+@pytest.mark.parametrize("role", ["admin", "super_admin"])
+def test_admin_document_card_counts_only_current_comparison_sources(role):
+    db = _make_session()
+    admin, student = _seed_dashboard_data(db)
+    admin.role = role
+    proposal = Document(title="alumni-proposal.pdf", file_path="proposal.pdf", document_type="proposal",
+                        source_origin="alumni", repository_status="published")
+    skripsi = Document(title="alumni-skripsi.pdf", file_path="skripsi.pdf", document_type="skripsi",
+                       source_origin="alumni", repository_status="published")
+    draft = Document(title="alumni-draft.pdf", file_path="draft.pdf", source_origin="alumni",
+                     repository_status="draft")
+    db.add_all([
+        proposal, skripsi, draft,
+        Document(title="deleted-alumni.pdf", file_path="deleted.pdf", source_origin="alumni",
+                 repository_status="published", deleted_at=utc_now()),
+        Document(title="student-published.pdf", file_path="student-published.pdf", source_origin="student",
+                 repository_status="published"),
+        Document(title="owned-alumni.pdf", file_path="owned.pdf", user_id=student.id,
+                 source_origin="alumni", repository_status="published"),
+    ])
+    db.commit()
+
+    summary = get_dashboard_summary(current_user=admin, db=db)
+    assert summary["document_count"] == 2
+    # Check cards still report student checks, independently of repository count.
+    assert summary["total_check_count"] == 3
+    assert summary["latest_check_count"] == 2
+    assert summary["processing_check_count"] == 1
+    assert get_dashboard_summary(current_user=student, db=db)["document_count"] == 2
+
+    proposal.deleted_at = utc_now()
+    db.commit()
+    assert get_dashboard_summary(current_user=admin, db=db)["document_count"] == 1
+
+    draft.repository_status = "published"
+    db.commit()
+    assert get_dashboard_summary(current_user=admin, db=db)["document_count"] == 2
+    db.close()
 
 
 @pytest.mark.parametrize("role", ["dosen", "unsupported"])

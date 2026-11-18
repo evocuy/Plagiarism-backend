@@ -79,6 +79,22 @@ def test_default_login_is_admin_and_exposes_both_choices(context):
     assert call(context, body, "GET", "/api/auth/users")[0] == 200
 
 
+def test_admin_dashboard_document_count_uses_repository_sources(context):
+    context.db.add_all([
+        Document(title="alumni.pdf", file_path="alumni.pdf", source_origin="alumni", repository_status="published"),
+        Document(title="private.pdf", file_path="private.pdf", user_id=context.cihuy.id),
+        Document(title="draft.pdf", file_path="draft.pdf", source_origin="alumni", repository_status="draft"),
+    ])
+    context.db.commit()
+    _, _, body = login(context)
+
+    code, _, summary = call(context, body, "GET", "/api/dashboard/summary")
+
+    assert code == 200
+    assert summary["role"] == "admin"
+    assert summary["document_count"] == 1
+
+
 def test_direct_student_login_uses_same_account_without_changing_role(context):
     code, _, body = login(context, mode="mahasiswa")
     assert code == 200 and body["user"]["role"] == "mahasiswa"
@@ -134,7 +150,9 @@ def test_student_mode_only_sees_own_documents_history_and_dashboard(context):
     owner = context.db.query(User).filter_by(identifier="student").one()
     own = Document(user_id=context.cihuy.id, title="own.pdf", file_path="own.pdf")
     other = Document(user_id=owner.id, title="other.pdf", file_path="other.pdf")
-    context.db.add_all([own, other])
+    repository = Document(title="alumni.pdf", file_path="alumni.pdf", source_origin="alumni",
+                          repository_status="published")
+    context.db.add_all([own, other, repository])
     context.db.flush()
     context.db.add_all([PlagiarismCheck(document_id=own.id, user_id=context.cihuy.id, overall_similarity=.1),
                         PlagiarismCheck(document_id=other.id, user_id=owner.id, overall_similarity=.2)])

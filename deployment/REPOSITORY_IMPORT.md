@@ -91,8 +91,22 @@ sudo install -d -o evopuki -g 10001 -m 2750 /home/evopuki/repository-inbox/propo
 sudo install -d -o evopuki -g 10001 -m 2750 /home/evopuki/repository-inbox/skripsi
 ```
 
-Salin PDF ke folder sesuai jenisnya. Pastikan file/subfolder yang diunggah
-tetap dapat dibaca group 10001; periksa izin staging jika mendapat file_unreadable.
+Salin PDF ke folder sesuai jenisnya. Setelah transfer, pastikan seluruh folder
+input dapat ditelusuri dan PDF dapat dibaca group 10001. Transfer SFTP/SCP bisa
+membawa izin folder yang berbeda. Jalankan di terminal VM:
+
+```bash
+sudo find -P /home/evopuki/repository-inbox -type d \
+  -exec chgrp 10001 {} + -exec chmod 2750 {} +
+sudo find -P /home/evopuki/repository-inbox -type f -iname '*.pdf' \
+  -exec chgrp 10001 {} + -exec chmod 640 {} +
+```
+
+Perintah tersebut hanya mengatur group/izin pada staging, tanpa membaca naskah
+atau menghapus PDF. Symlink tidak diikuti. Folder memerlukan izin baca dan
+telusur (`r-x`), bukan hanya izin baca file. `sudo docker compose` tetap memakai
+UID/GID 10001 di dalam container. `input_unreadable` berarti traversal folder
+gagal sebelum validasi PDF; membetulkan izin file saja belum mencukupi.
 Tidak perlu mengubah pemilik kode, `.env`, atau data PostgreSQL.
 
 Preview semua PDF memakai container terpisah tanpa membuka port API tambahan

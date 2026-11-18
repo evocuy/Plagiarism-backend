@@ -159,6 +159,14 @@ dan belum dihapus. Dokumen mahasiswa selalu `source_origin=student` dan draft,
 termasuk dokumen lama yang pernah disetujui. Pemeriksaan tetap membandingkan
 proposal dengan proposal dan skripsi dengan skripsi.
 
+Pada `GET /api/dashboard/summary`, field `document_count` untuk admin/super_admin
+menghitung dokumen repositori yang memenuhi syarat pembanding tersebut, meliputi
+proposal dan skripsi. Unggahan mahasiswa, draft alumni, dan soft delete tidak
+dihitung. Untuk sesi mahasiswa (termasuk mode mahasiswa cihuy), field ini tetap
+menghitung unggahan aktif milik akun sendiri. Counter hasil pengecekan memakai
+cakupannya sendiri. Frontend dapat tetap memakai endpoint dan nama field yang
+sama untuk scorecard dokumen repositori admin.
+
 Jika sumber sejenis belum tersedia, proses selesai dengan
 `comparison_status=no_comparison_sources`, skor/teks persentase pada API bernilai
 null, dan pesan bahwa kemiripan belum dapat ditentukan. `available` berarti

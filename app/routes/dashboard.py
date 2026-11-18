@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.models.schemas import Document, PlagiarismCheck, User
 from app.routes.auth import get_current_user
+from app.services.repository_policy_service import comparison_source_filters
 
 router = APIRouter()
 
@@ -22,7 +23,9 @@ def _visible_documents_query(current_user: User, db: Session):
     query = db.query(Document).filter(Document.deleted_at.is_(None))
 
     if current_user.role in ("admin", "super_admin"):
-        return query
+        # The admin document card represents the comparison repository. Reuse
+        # the same eligibility rules as repository retrieval and checking.
+        return query.filter(*comparison_source_filters())
 
     if current_user.role == "mahasiswa":
         return query.filter(Document.user_id == current_user.id)
