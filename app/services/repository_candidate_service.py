@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import bindparam, text
@@ -9,6 +10,9 @@ from app.services.embedding_service import EmbeddingService
 from app.services.tfidf_service import TfidfService
 from app.services.pdf_service import PDF_EXTRACTION_VERSION
 from app.services.error_service import EMBEDDING_ERROR, report_error
+from app.services.candidate_index_service import (
+    MAX_HNSW_DIMENSIONS, embedding_predicate, hnsw_index_name, hnsw_index_state,
+)
 
 
 class RepositoryCandidateService:
@@ -29,6 +33,9 @@ class RepositoryCandidateService:
         self.semantic_min_coverage = semantic_min_coverage
         self.semantic_highlight_threshold = semantic_highlight_threshold
         self.semantic_highlight_matches_per_chunk = semantic_highlight_matches_per_chunk
+        self.hnsw_ef_search = int(os.getenv("CANDIDATE_HNSW_EF_SEARCH", "160"))
+        if not 0 <= self.hnsw_ef_search <= 1000:
+            raise ValueError("CANDIDATE_HNSW_EF_SEARCH harus berada antara 0 dan 1000.")
 
     def find_candidates(
         self,
@@ -257,9 +264,12 @@ class RepositoryCandidateService:
                     "total_target_embedding_chunks": len(target_embeddings),
                 }
 
+            target_dimensions = {target["embedding"].count(",") + 1 for target in target_embeddings}
+            if len(target_dimensions) != 1:
+                return {**empty_result, "reason": "target_embedding_dimensions_inconsistent"}
+            dimensions = target_dimensions.pop()
             total_repository_embedding_chunks = self._count_repository_embedding_chunks(
-                repository_document_ids,
-                db,
+                repository_document_ids, db, dimensions,
             )
             total_repository_chunks = self._count_repository_chunks(
                 repository_document_ids,
@@ -287,6 +297,7 @@ class RepositoryCandidateService:
 
             stats: Dict[int, Dict[str, Any]] = {}
             query_limit = max(top_k, self.semantic_matches_per_chunk)
+            use_hnsw = self._prepare_hnsw_search(db, dimensions, query_limit)
             for target in target_embeddings:
                 rows = self._query_semantic_matches(
                     document_ids=repository_document_ids,
@@ -294,6 +305,7 @@ class RepositoryCandidateService:
                     db=db,
                     limit=query_limit,
                     chapter=target.get("chapter"),
+                    use_hnsw=use_hnsw,
                 )
                 if not rows and target.get("chapter"):
                     rows = self._query_semantic_matches(
@@ -301,6 +313,7 @@ class RepositoryCandidateService:
                         query_embedding=target["embedding"],
                         db=db,
                         limit=query_limit,
+                        use_hnsw=use_hnsw,
                     )
                 self._accumulate_semantic_stats(
                     stats=stats,
@@ -352,6 +365,8 @@ class RepositoryCandidateService:
                   AND chunk_type = 'sentence'
                   AND embedding IS NOT NULL
                   AND embedding_model = :embedding_model
+                  AND embedding_error IS NULL
+                  AND vector_norm(embedding) > 0
                   AND NULLIF(BTRIM(cleaned_text), '') IS NOT NULL
                 ORDER BY chunk_index ASC
             """),
@@ -459,14 +474,13 @@ class RepositoryCandidateService:
         self,
         document_ids: Sequence[int],
         db: Session,
+        dimensions: int,
     ) -> int:
-        statement = text("""
+        statement = text(f"""
             SELECT COUNT(*)
             FROM document_chunks
             WHERE document_id IN :document_ids
-              AND chunk_type = 'sentence'
-              AND embedding IS NOT NULL
-              AND embedding_model = :embedding_model
+              AND {embedding_predicate(dimensions)}
         """).bindparams(bindparam("document_ids", expanding=True))
         return int(db.execute(
             statement,
@@ -492,6 +506,19 @@ class RepositoryCandidateService:
             {"document_ids": list(document_ids)},
         ).scalar() or 0)
 
+    def _prepare_hnsw_search(self, db: Session, dimensions: int, limit: int) -> bool:
+        if not self.hnsw_ef_search or dimensions > MAX_HNSW_DIMENSIONS:
+            return False
+        state = hnsw_index_state(db, hnsw_index_name(self.embedding_service.model, dimensions))
+        if not state or not state["valid"]:
+            return False
+        # Settings apply once to this transaction and never leak to pooled clients.
+        db.execute(text("""
+            SELECT set_config('hnsw.ef_search', :ef_search, true),
+                   set_config('hnsw.iterative_scan', 'strict_order', true)
+        """), {"ef_search": str(max(self.hnsw_ef_search, limit))})
+        return True
+
     def _query_semantic_matches(
         self,
         document_ids: Sequence[int],
@@ -499,8 +526,16 @@ class RepositoryCandidateService:
         db: Session,
         limit: int,
         chapter: Optional[str] = None,
+        use_hnsw: bool = False,
     ) -> List[Dict[str, Any]]:
         chapter_filter = "AND chapter = :chapter" if chapter else ""
+        dimensions = query_embedding.count(",") + 1
+        predicate = embedding_predicate(dimensions)
+        vector = f"CAST(embedding AS vector({dimensions}))" if use_hnsw else "embedding"
+        distance = f"({vector} <=> CAST(:query_embedding AS vector))"
+        # Exact mode also works when a managed index exists. The cast for HNSW
+        # matches its indexed expression and preserves ascending cosine distance.
+        order_by = distance if use_hnsw else f"{distance} + 0.0"
         statement = text(f"""
             SELECT
                 document_id,
@@ -509,15 +544,12 @@ class RepositoryCandidateService:
                 chunk_index,
                 raw_text,
                 cleaned_text,
-                1 - (embedding <=> CAST(:query_embedding AS vector)) AS score
+                1 - {distance} AS score
             FROM document_chunks
             WHERE document_id IN :document_ids
-              AND chunk_type = 'sentence'
-              AND embedding IS NOT NULL
-              AND embedding_model = :embedding_model
-              AND NULLIF(BTRIM(cleaned_text), '') IS NOT NULL
+              AND {predicate}
               {chapter_filter}
-            ORDER BY embedding <=> CAST(:query_embedding AS vector)
+            ORDER BY {order_by}
             LIMIT :limit
         """).bindparams(bindparam("document_ids", expanding=True))
         params = {
@@ -529,6 +561,10 @@ class RepositoryCandidateService:
         if chapter:
             params["chapter"] = chapter
         rows = db.execute(statement, params).mappings().all()
+        if use_hnsw and len(rows) < limit:
+            # Restrictive BAB/document filters can exhaust an approximate scan.
+            # Verify the same scope exactly before relaxing the chapter filter.
+            return self._query_semantic_matches(document_ids, query_embedding, db, limit, chapter)
         return [dict(row) for row in rows]
 
     def _accumulate_semantic_stats(

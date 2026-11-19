@@ -161,6 +161,32 @@ Jika input dipindah/hilang, command folder tidak dapat mencoba file tersebut lag
 Hindari upload/reindex manual bersamaan agar sumber dan indexing stabil selama
 impor besar. Jalankan benchmark setelah seluruh korpus selesai dimasukkan.
 
+## Indeks HNSW untuk pemilihan kandidat
+
+Setelah embedding repositori siap dan backend versi ini sudah berjalan, bangun
+indeks di PostgreSQL dengan pgvector 0.8 atau lebih baru:
+
+```bash
+sudo docker compose exec -T backend python -m app.workers.build_candidate_index
+```
+
+Perintah memakai `EMBED_MODEL` dari konfigurasi yang sudah ada dan mendeteksi
+dimensi dari embedding alumni aktif. Jika dimensi perlu dipilih secara eksplisit,
+tambahkan `--dimensions 384` untuk model yang benar-benar menghasilkan 384 dimensi.
+Status `created` atau `already_exists` berarti indeks siap. Jalankan perintah
+lagi setelah berpindah model atau dimensi. Pembuatan indeks berjalan secara
+concurrent di luar startup dan tidak memanggil layanan embedding.
+
+Backend memakai `CANDIDATE_HNSW_EF_SEARCH=160` secara default. PostgreSQL bisa
+memilih pencarian eksak untuk cakupan yang kecil. Bila hasil aproksimasi kurang
+dari limit, backend memeriksa cakupan yang sama secara eksak. Tanpa indeks yang
+cocok atau saat pengaturan bernilai `0`, pencarian pgvector berjalan eksak.
+Ketersediaan embedding tetap menentukan kapan alur beralih ke TF-IDF.
+
+Ukur durasi pencarian dan kemunculan sumber yang diketahui di top 20 setelah
+migrasi korpus kampus. Ukur juga ruang indeks dan waktu pembangunan karena
+jumlah embedding potongan teks menentukan biaya bersama spesifikasi VM.
+
 ## Progres, report, dan ruang disk
 
 Terminal mengeluarkan JSON per tahap/file dan summary. Report live disimpan di

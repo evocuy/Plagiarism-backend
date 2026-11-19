@@ -246,7 +246,7 @@ def test_find_candidates_uses_pgvector_semantic_candidates_when_embeddings_exist
             "embedding": "[1,0]",
         }
     ]
-    service._count_repository_embedding_chunks = lambda document_ids, db: 2
+    service._count_repository_embedding_chunks = lambda document_ids, db, dimensions: 2
     service._count_repository_chunks = lambda document_ids, db: 2
 
     def fake_query_semantic_matches(**kwargs):
@@ -264,6 +264,7 @@ def test_find_candidates_uses_pgvector_semantic_candidates_when_embeddings_exist
             },
         ]
 
+    service._prepare_hnsw_search = lambda db, dimensions, limit: True
     service._query_semantic_matches = fake_query_semantic_matches
 
     result = service.find_candidates(
@@ -413,7 +414,7 @@ def test_find_candidates_falls_back_when_repository_embedding_coverage_is_low():
             "embedding": "[1,0]",
         }
     ]
-    service._count_repository_embedding_chunks = lambda document_ids, db: 1
+    service._count_repository_embedding_chunks = lambda document_ids, db, dimensions: 1
     service._count_repository_chunks = lambda document_ids, db: 2
 
     result = service.find_candidates(
