@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models.schemas import ImpersonationSession, User, utc_now
+from app.services.account_mode_service import can_choose_login_mode
 from app.services.login_throttle_service import LoginThrottleService
 from app.services.sads_auth_service import SadsAuthService, auth_error
 from app.services.sads_course_service import SadsActiveCoursesService
@@ -39,11 +40,13 @@ def _student_is_available(user: User | None) -> None:
         raise auth_error(403, "Impersonasi hanya tersedia untuk akun mahasiswa aktif.")
 
 
-def _lock_actor(db: Session, actor_id: int, session_version: int) -> User:
+def _lock_actor(db: Session, actor_id: int, session_version: int, session_mode: str | None) -> User:
     actor = db.query(User).populate_existing().filter(User.id == actor_id).with_for_update().first()
     if (
-        actor is None or not actor.is_active or actor.role not in ADMIN_ROLES
+        actor is None or not actor.is_active
         or actor.session_version != session_version
+        or session_mode == "mahasiswa"
+        or (actor.role not in ADMIN_ROLES and (session_mode != "admin" or not can_choose_login_mode(actor)))
     ):
         raise auth_error(401, "Sesi admin sudah tidak berlaku. Silakan login kembali.")
     return actor
@@ -63,7 +66,7 @@ def start_impersonation(db: Session, admin: User, nim: str, *, actor_claims, min
     # The admin supplies no student password. Campus identity and eligibility
     # come from the active-courses API, even for an existing local account.
     profile = SadsActiveCoursesService().get_eligible_student_profile(nim)
-    actor = _lock_actor(db, admin.id, actor_claims.session_version)
+    actor = _lock_actor(db, admin.id, actor_claims.session_version, actor_claims.session_mode)
     now = utc_now()
     parent_expiry = actor_claims.expires_at.astimezone(timezone.utc).replace(tzinfo=None)
     if parent_expiry <= now:
@@ -99,15 +102,19 @@ def resolve_impersonation(db: Session, session_id: str, target: User) -> Imperso
         raise auth_error(401, "Sesi impersonasi sudah tidak berlaku. Kembali ke akun admin.")
     actor = db.get(User, session.actor_user_id) if session.actor_user_id is not None else None
     if (
-        actor is None or not actor.is_active or actor.role not in ADMIN_ROLES
+        actor is None or not actor.is_active
+        or (actor.role not in ADMIN_ROLES and not can_choose_login_mode(actor))
         or actor.session_version != session.actor_session_version
     ):
         raise auth_error(401, "Sesi admin pemilik impersonasi sudah tidak berlaku.")
     return session
 
 
-def stop_impersonation(db: Session, admin: User, session_id: str, *, session_version: int, commit: bool = True):
-    actor = _lock_actor(db, admin.id, session_version)
+def stop_impersonation(
+    db: Session, admin: User, session_id: str, *, session_version: int,
+    session_mode: str | None = None, commit: bool = True,
+):
+    actor = _lock_actor(db, admin.id, session_version, session_mode)
     session = db.query(ImpersonationSession).filter(
         ImpersonationSession.id == session_id,
         ImpersonationSession.actor_user_id == actor.id,

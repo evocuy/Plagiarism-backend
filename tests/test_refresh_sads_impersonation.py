@@ -21,7 +21,7 @@ def protect(app):
 
 def campus_login(app):
     code, headers, body = request(app, "POST", "/api/auth/login", body={
-        "identifier": NIM, "password": PASSWORD, "remember_me": True,
+        "identifier": NIM, "password": PASSWORD,
     })
     assert code == 200, body
     return apply_cookies(headers), body
@@ -39,6 +39,29 @@ def test_campus_refresh_rechecks_active_courses_without_resending_password(envir
     assert len(opener.courses.requests) == 2
     assert renewed["user"]["identifier"] == NIM
     assert PASSWORD not in json.dumps(renewed) and PRIVATE_VALUE not in json.dumps(renewed)
+
+
+def test_sads_tester_can_switch_and_refresh_mode_until_removed(environment, monkeypatch):
+    app, db, opener = environment
+    monkeypatch.setenv("SADS_TESTER_NIMS", NIM)
+    protect(app)
+    cookies, parent = campus_login(app)
+    assert parent["user"]["role"] == "admin"
+
+    code, headers, child = request(app, "POST", "/api/auth/session-mode", cookies=cookies,
+        headers={"X-CSRF-Token": parent["csrf_token"]}, body={"login_as": "mahasiswa"})
+    assert code == 200, child
+    assert child["user"]["role"] == "mahasiswa"
+    assert request(app, "GET", "/api/auth/me", authorization="Bearer " + parent["token"])[0] == 401
+    cookies = apply_cookies(headers, cookies)
+    code, _, renewed = refresh(app, expired_access(cookies))
+    assert code == 200, renewed
+    assert renewed["user"]["role"] == "mahasiswa"
+    assert len(opener.requests) == 1
+    assert not opener.courses.requests
+
+    monkeypatch.delenv("SADS_TESTER_NIMS")
+    assert request(app, "GET", "/api/auth/me", authorization="Bearer " + renewed["token"])[0] == 401
 
 
 def test_campus_loss_of_eligibility_revokes_refresh_and_previous_access(environment):
@@ -72,7 +95,7 @@ def remembered_admin(context):
     context.db.commit()
     protect(context.app)
     code, headers, body = request(context.app, "POST", "/api/auth/login", body={
-        "identifier": context.admin.identifier, "password": "admin-remember-test-password", "remember_me": True,
+        "identifier": context.admin.identifier, "password": "admin-remember-test-password",
     })
     assert code == 200
     cookies = apply_cookies(headers)

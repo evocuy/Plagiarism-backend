@@ -18,8 +18,7 @@ def create_grant(engine):
         user = User(identifier="remember-student", password="synthetic-unused-hash", role="mahasiswa", session_version=7)
         db.add(user)
         db.flush()
-        session, raw = tokens.issue_session(db, user, expires_at=utc_now() + timedelta(days=30),
-                                             session_mode=None, sads_courses_verified=False)
+        session, raw = tokens.issue_session(db, user, session_mode=None, sads_courses_verified=False)
         db.commit()
         return user.id, session.id, raw, session.expires_at
 
@@ -113,6 +112,43 @@ def test_runtime_migration_adds_refresh_tables_and_preserves_existing_history(po
         assert db.get(PlagiarismCheck, identities[2]).overall_similarity == .31
 
 
+def test_runtime_migration_caps_existing_logins_from_the_first_grant(postgres, monkeypatch):
+    now = utc_now()
+    first_login_at = now - timedelta(days=4)
+    later_login_at = now - timedelta(days=1)
+    old_deadline = first_login_at + timedelta(days=30)
+    shorter_deadline = now + timedelta(days=1)
+    with sessionmaker(bind=postgres)() as db:
+        tester = User(identifier="legacy-tester", password="unused-hash", role="admin")
+        other = User(identifier="legacy-student", password="unused-hash", role="mahasiswa")
+        db.add_all([tester, other])
+        db.flush()
+        legacy_grants = [
+            (tester, "admin", first_login_at, old_deadline, first_login_at + timedelta(days=3)),
+            (tester, "mahasiswa", later_login_at, old_deadline, first_login_at + timedelta(days=3)),
+            (other, None, later_login_at, old_deadline, later_login_at + timedelta(days=3)),
+            (tester, "admin", later_login_at, shorter_deadline, shorter_deadline),
+        ]
+        expected = {}
+        for user, mode, created_at, previous_expiry, capped_expiry in legacy_grants:
+            session, _ = tokens.issue_session(db, user, session_mode=mode, sads_courses_verified=False)
+            session.created_at = created_at
+            session.expires_at = previous_expiry
+            if created_at == first_login_at:
+                session.revoked_at = later_login_at
+                session.revocation_reason = "session_changed"
+            expected[session.id] = capped_expiry
+        db.commit()
+
+    monkeypatch.setattr(migrations, "engine", postgres)
+    migrations.ensure_runtime_columns()
+    migrations.ensure_runtime_columns()
+
+    with sessionmaker(bind=postgres)() as db:
+        assert {session.id: session.expires_at for session in db.query(AuthRefreshSession)} == expected
+        assert db.query(AuthRefreshToken).count() == len(expected)
+
+
 def test_postgresql_expiry_cleanup_and_user_deletion_cascade_token_history(postgres):
     user_id, session_id, raw, _ = create_grant(postgres)
     with sessionmaker(bind=postgres)() as db:
@@ -122,12 +158,17 @@ def test_postgresql_expiry_cleanup_and_user_deletion_cascade_token_history(postg
         assert db.query(AuthRefreshToken).count() == 2
         grant.session.expires_at = utc_now() - timedelta(seconds=1)
         db.commit()
+        db.query(AuthRefreshSession).filter_by(id=session_id).with_for_update().one()
+        with sessionmaker(bind=postgres)() as cleanup:
+            cleanup.execute(text("SET LOCAL lock_timeout = '1s'"))
+            tokens.purge_expired_sessions(cleanup)
+            assert cleanup.query(AuthRefreshSession).count() == 1
+        db.rollback()
         tokens.purge_expired_sessions(db)
         assert db.query(AuthRefreshToken).count() == 0
         assert db.query(AuthRefreshSession).count() == 0
         user = db.get(User, user_id)
-        tokens.issue_session(db, user, expires_at=utc_now() + timedelta(days=30),
-                             session_mode=None, sads_courses_verified=False)
+        tokens.issue_session(db, user, session_mode=None, sads_courses_verified=False)
         db.commit()
         db.delete(user)
         db.commit()

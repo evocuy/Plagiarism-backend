@@ -91,8 +91,8 @@ dijalankan; bedakan dari pesan handler tentang check atau artefak yang hilang.
 
 Pembukaan di tab/iframe memerlukan cookie sesi yang terkirim. Untuk klien
 Bearer-only, ambil PDF melalui fetch berautentikasi lalu buka Blob URL; link
-biasa tidak mengirim Authorization. Dengan Remember me, fetch PDF juga perlu
-mengikuti pemulihan access token sebelum mengulang request 401, seperti di
+biasa tidak mengirim Authorization. Terapkan pemulihan access token sebelum
+mengulang request PDF yang mendapat 401, seperti di
 [panduan refresh](REFRESH_TOKENS.md). Token tidak boleh dimasukkan ke URL.
 
 | Kondisi | Respons |

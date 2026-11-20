@@ -90,13 +90,13 @@ memblokir login baru dan tidak dianggap salah password. Raw response, URL,
 header `secret`, daftar dosen, dan jadwal kuliah tidak disimpan atau diteruskan
 ke frontend.
 
-JWT memuat penanda boolean verifikasi mata kuliah. Token mahasiswa SADS lama
-tanpa penanda ini ditolak dengan 401 dan harus login ulang. Verifikasi dilakukan
-setiap login, bukan pada setiap polling hasil. Izin mengikuti masa sesi JWT
-(`JWT_EXPIRE_MINUTES`, contoh konfigurasi 60 menit); perubahan KRS baru diperiksa
-saat login berikutnya. Jika pemeriksaan login berikutnya memastikan mahasiswa
-sudah tidak memenuhi syarat, sesi sebelumnya ikut dicabut. Kegagalan password
-atau gangguan API tidak mencabut sesi yang sebelumnya sudah terverifikasi.
+JWT mahasiswa SADS memuat penanda verifikasi mata kuliah. Untuk mahasiswa
+reguler, backend memeriksa mata kuliah aktif saat login dan refresh. Jika
+pemeriksaan memastikan mahasiswa sudah tidak memenuhi syarat, backend
+mencabut sesinya.
+Gangguan API sementara membiarkan sesi yang sebelumnya terverifikasi tersedia
+untuk percobaan berikutnya. Tenggat login dan alur refresh dijelaskan di
+[panduan refresh token](REFRESH_TOKENS.md).
 
 Adapter mengikuti contoh respons yang diberikan: object top-level dengan
 `id1`, `id2`, `nama`, `role.name`, dan `jurusan`. Role aktif harus `Mahasiswa`;

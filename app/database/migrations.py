@@ -153,8 +153,25 @@ def ensure_runtime_columns() -> None:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(20) NOT NULL DEFAULT 'local'"))
         # Additive auth tables; existing users, documents and scores are preserved.
         from app.models.schemas import AuthRefreshSession, AuthRefreshToken
+        from app.services.refresh_token_service import REFRESH_SESSION_DAYS
         AuthRefreshSession.__table__.create(bind=conn, checkfirst=True)
         AuthRefreshToken.__table__.create(bind=conn, checkfirst=True)
+        # A mode switch replaced the grant but retained its original expiry.
+        # Use the first grant's creation time for each existing login.
+        conn.execute(text("""
+            WITH deadlines AS (
+                SELECT user_id, expires_at,
+                    MIN(created_at) + make_interval(days => :days) AS capped_at
+                FROM auth_refresh_sessions
+                GROUP BY user_id, expires_at
+            )
+            UPDATE auth_refresh_sessions AS sessions
+            SET expires_at = deadlines.capped_at
+            FROM deadlines
+            WHERE sessions.user_id = deadlines.user_id
+              AND sessions.expires_at = deadlines.expires_at
+              AND deadlines.capped_at < sessions.expires_at
+        """), {"days": REFRESH_SESSION_DAYS})
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(64)"))
         conn.execute(text("ALTER TABLE plagiarism_checks ADD COLUMN IF NOT EXISTS processing_message TEXT"))

@@ -17,7 +17,6 @@ from test_auth_session import environment, request
 def context(environment, monkeypatch):
     monkeypatch.setenv("STUDENT_AUTH_PROVIDER", "local")
     monkeypatch.setattr(auth, "REMEMBER_ACCESS_EXPIRE_MINUTES", 15)
-    monkeypatch.setattr(auth, "REFRESH_TOKEN_EXPIRE_DAYS", 30)
     app, db = environment
     app.add_middleware(CsrfMiddleware, secret_key=auth._jwt_secret_key,
                        session_cookie=auth.SESSION_COOKIE_NAME, impersonation_cookie=auth.IMPERSONATION_COOKIE_NAME)
@@ -37,8 +36,10 @@ def apply_cookies(headers, previous=None):
     return cookies
 
 
-def login_remember(app, *, identifier="student", remember=True, login_as=None):
-    payload = {"identifier": identifier, "password": "password123", "remember_me": remember}
+def login_remember(app, *, identifier="student", remember=None, login_as=None):
+    payload = {"identifier": identifier, "password": "password123"}
+    if remember is not None:
+        payload["remember_me"] = remember
     if login_as is not None:
         payload["login_as"] = login_as
     code, headers, body = request(app, "POST", "/api/auth/login", body=payload)
@@ -61,30 +62,27 @@ def expired_access(cookies):
     return cookies
 
 
-def test_remember_issues_short_access_and_persistent_private_refresh_cookie(context):
+@pytest.mark.parametrize("remember", [None, False, True])
+def test_every_login_issues_short_access_and_a_three_day_refresh_cookie(context, remember):
     app, db = context
-    cookies, body, headers = login_remember(app)
+    cookies, body, headers = login_remember(app, remember=remember)
     raw = cookies[auth.REFRESH_COOKIE_NAME]
     assert body["remember_me"] is True
     assert 895 <= body["expires_in"] <= 900
     session = db.query(AuthRefreshSession).one()
-    assert 2591995 <= (session.expires_at - session.created_at).total_seconds() <= 2592001
+    assert session.expires_at - session.created_at == timedelta(days=3)
+    assert datetime.fromisoformat(body["refresh_expires_at"]) == session.expires_at.replace(tzinfo=timezone.utc)
     assert db.query(AuthRefreshToken).one().token_hash == hashlib.sha256(raw.encode()).hexdigest()
     assert raw not in json.dumps(body)
     header = next(h for h in headers["set-cookie-all"] if h.startswith(auth.REFRESH_COOKIE_NAME + "="))
     assert "HttpOnly" in header and "Secure" in header and "SameSite=none" in header
     assert "Path=/api/auth" in header and "Domain=.example.test" in header
+    parsed = SimpleCookie()
+    parsed.load(header)
+    max_age = int(parsed[auth.REFRESH_COOKIE_NAME]["max-age"])
+    assert 259195 <= max_age <= 259200
     assert headers["cache-control"] == "no-store"
     assert body["refresh_csrf_token"] != body["csrf_token"]
-
-
-def test_login_without_remember_keeps_existing_duration_and_no_refresh_grant(context):
-    app, db = context
-    cookies, body, _ = login_remember(app, remember=False)
-    assert auth.REFRESH_COOKIE_NAME not in cookies
-    assert body["remember_me"] is False and body["refresh_expires_at"] is None
-    assert 3595 <= body["expires_in"] <= 3600
-    assert db.query(AuthRefreshSession).count() == 0
 
 
 @pytest.mark.parametrize("missing_access", [False, True])
@@ -199,10 +197,10 @@ def test_refresh_refuses_bearer_and_cross_account_cookie_without_consuming_token
     app, db = context
     cookies, body, _ = login_remember(app)
     assert refresh(app, cookies, authorization="Bearer " + body["token"])[0] == 401
-    other, _, _ = login_remember(app, identifier="admin", remember=False)
+    other, _, _ = login_remember(app, identifier="admin")
     mixed = {**cookies, auth.SESSION_COOKIE_NAME: other[auth.SESSION_COOKIE_NAME]}
     assert refresh(app, mixed)[0] == 401
-    assert db.query(AuthRefreshToken).one().used_at is None
+    assert db.query(AuthRefreshToken).filter(AuthRefreshToken.used_at.is_not(None)).count() == 0
     assert refresh(app, cookies)[0] == 200
 
 
@@ -243,14 +241,15 @@ def test_mode_switch_preserves_deadline_and_refresh_cannot_upgrade_student_mode(
     assert db.query(User).filter_by(identifier="cihuy").one().role == "admin"
 
 
-def test_disabling_remember_on_a_new_login_revokes_old_refresh(context):
+def test_new_login_with_old_remember_flag_still_replaces_refresh(context):
     app, _ = context
     old, _, _ = login_remember(app)
     current, body, _ = login_remember(app, remember=False)
-    assert body["remember_me"] is False
-    assert auth.REFRESH_COOKIE_NAME not in current
+    assert body["remember_me"] is True
+    assert current[auth.REFRESH_COOKIE_NAME] != old[auth.REFRESH_COOKIE_NAME]
     assert refresh(app, old)[0] == 401
     assert request(app, "GET", "/api/auth/me", cookies=current)[0] == 200
+    assert refresh(app, current)[0] == 200
 
 
 @pytest.mark.parametrize("value", ["true", "false", 1, None])

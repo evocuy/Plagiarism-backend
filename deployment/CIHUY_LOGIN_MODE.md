@@ -1,4 +1,4 @@
-# Pilihan login admin/mahasiswa untuk akun cihuy
+# Pilihan login admin dan mahasiswa untuk akun uji
 
 Fitur backend ini dikembangkan dan diuji lokal. Deployment menunggu pengguna
 push dan meminta pull/restart VM. Tidak ada perubahan file frontend lokal.
@@ -7,12 +7,26 @@ Akun lokal `cihuy` yang aktif dan role database-nya admin/super_admin bisa memil
 mode admin atau mahasiswa. Mode mahasiswa tetap menggunakan ID/identifier
 `cihuy`; tidak memakai NIM mahasiswa lain dan tidak mengubah role akun di database.
 Password login, profil, dan dokumen lama tetap disimpan seperti sebelumnya.
-Tidak ada migrasi schema atau tambahan konfigurasi `.env` untuk fitur ini.
+Mode akun lokal ini tersedia tanpa migrasi schema atau konfigurasi tambahan.
 
-Mode mahasiswa akun uji ini tidak memanggil SADS login/mata kuliah. Pengecualian
-hanya berlaku untuk identitas admin lokal cihuy yang diverifikasi server. Login
-mahasiswa kampus dan persyaratan Seminar/Skripsi/Tugas Akhir tetap berlaku.
+Kedua mode akun lokal `cihuy` memakai kata sandi lokal.
 Fitur ini terpisah dari impersonasi NIM, yang tetap memerlukan password khusus.
+
+## Tester dengan akun SADS
+
+Di lingkungan uji yang memakai `STUDENT_AUTH_PROVIDER=sads`, isi
+`SADS_TESTER_NIMS` dengan NIM yang disetujui, dipisahkan koma. Nilai default
+kosong. Setelah `.env` berubah, buat ulang container API dan worker agar daftar
+izin terbaca di kedua layanan.
+
+Tester login dengan NIM dan kata sandi SADS. Setelah SADS menerima login,
+tester bisa memilih mode admin atau mahasiswa tanpa verifikasi mata kuliah
+aktif. Role di tabel `users` tetap `mahasiswa`, dengan hak akses ditentukan
+oleh mode sesi. Mode admin memberikan akses admin pada lingkungan itu.
+Mahasiswa lain tetap mengikuti syarat mata kuliah aktif.
+
+Kosongkan daftar atau hapus NIM yang sudah selesai menguji, lalu buat ulang
+container API dan worker. Sesi mode uji untuk NIM yang dikeluarkan akan ditolak.
 
 ## Pilihan setelah login berhasil
 
@@ -76,13 +90,15 @@ Frontend juga dapat mengirim pilihan langsung pada satu request login:
 `login_as` opsional: jika tidak diberikan, cihuy tetap masuk sebagai admin agar
 klien lama bekerja. Isi admin untuk memilih admin secara eksplisit.
 Mahasiswa/admin biasa boleh mengirim mode yang sesuai role-nya, tetapi tidak
-bisa mengganti role melalui field ini. Pilihan yang tidak berwenang menghasilkan
+bisa mengganti role melalui field ini, kecuali tester SADS yang terdaftar.
+Pilihan yang tidak berwenang menghasilkan
 403; nilai di luar admin/mahasiswa menghasilkan 422. Identitas tetap diverifikasi
 dengan password dan pembatasan login yang sudah ada.
 
 ## Upload tanpa kuota harian
 
-Kuota harian pemeriksaan dikecualikan untuk akun admin lokal cihuy. Backend
+Kuota harian pemeriksaan dikecualikan untuk akun lokal `cihuy` dan tester SADS
+yang terdaftar. Backend
 memeriksa identitas asli di database ketika menerima antrean, bukan flag dari
 request. Mahasiswa biasa tetap mengikuti CHECK_DAILY_LIMIT (default 3 per hari).
 Pengecualian melekat pada akun uji ini, termasuk bila memakai endpoint pengecekan

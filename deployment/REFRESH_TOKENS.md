@@ -1,17 +1,14 @@
-# Remember me 30 hari dan refresh token
+# Sesi login otomatis 3 hari dan refresh token
 
 Fitur ini dikerjakan lokal. Pengguna push dahulu, lalu meminta pull/restart VM.
 Frontend dikerjakan terpisah; file frontend lokal tidak diubah.
 
 ## Perilaku
 
-- `POST /api/auth/login` menerima `remember_me` boolean, default `false`.
-- `false`/tidak dikirim: login mengikuti `JWT_EXPIRE_MINUTES` yang sudah ada.
-  Backend tidak menerbitkan refresh token dan membersihkan cookie refresh lama.
-- `true`: access JWT berlaku paling lama 15 menit secara default (atau durasi
-  JWT yang lebih pendek). Refresh token disimpan sebagai cookie HttpOnly selama
-  maksimal 30 hari sejak login awal.
-- Refresh selalu merotasi token sekali pakai, tanpa menggeser tenggat 30 hari.
+- Setiap login berhasil menerbitkan access JWT dan cookie refresh HttpOnly.
+  Access JWT berlaku maksimal 15 menit secara default. Cookie refresh berlaku
+  sampai 3 hari sejak login awal.
+- Refresh merotasi token sekali pakai dengan tenggat yang sama.
   Reuse token yang telah dipakai mencabut sesi beserta access JWT terkait.
 - Login ulang, logout, reset password lokal, perubahan identitas/provider/role,
   penonaktifan atau penghapusan akun membatalkan grant lama. Sesuai perilaku
@@ -34,18 +31,19 @@ dengan prinsip penyimpanan cookie dari
 
 ## Kontrak untuk frontend
 
-Login tetap memakai endpoint lama, dengan tambahan checkbox Remember me:
+Kirim kredensial ke `POST /api/auth/login`.
 
 ```json
 {
   "identifier": "USERNAME",
-  "password": "PASSWORD_DARI_FORM",
-  "remember_me": true
+  "password": "PASSWORD_DARI_FORM"
 }
 ```
 
-`login_as` milik akun cihuy masih dapat disertakan seperti sebelumnya.
-Request login dan request berikutnya memakai `credentials: "include"`.
+`login_as` dapat disertakan oleh akun yang punya pilihan mode. Field boolean
+`remember_me` boleh dikirim oleh klien lama dan diabaikan saat login. Jalankan
+alur refresh untuk semua sesi. Request login dan request berikutnya memakai
+`credentials: "include"`.
 
 Respons login/refresh/session-mode mempertahankan `token`, `user`, `csrf_token`,
 dan menambah:
@@ -54,14 +52,14 @@ dan menambah:
 {
   "expires_in": 899,
   "remember_me": true,
-  "refresh_expires_at": "2099-01-31T12:00:00Z",
+  "refresh_expires_at": "2099-01-04T12:00:00Z",
   "refresh_csrf_token": "HMAC_UNTUK_REFRESH"
 }
 ```
 
-Nilai di atas hanya contoh. `refresh_expires_at` adalah waktu UTC absolut;
-`expires_in` adalah sisa detik access JWT. Tanpa Remember me, field refresh
-bernilai `null` dan `remember_me=false`.
+Contoh tersebut menggambarkan login pada 1 Januari 2099 pukul 12.00 UTC.
+`refresh_expires_at` adalah tenggat UTC absolut, `expires_in` adalah sisa detik
+access JWT, dan `remember_me: true` menandakan sesi punya cookie refresh.
 
 Refresh token mentah **tidak dikembalikan dalam JSON** dan tidak boleh disimpan
 di localStorage. Browser menyimpan cookie `<SESSION_COOKIE_NAME>_refresh`
@@ -87,7 +85,7 @@ GET /api/auth/csrf
 ```
 
 Dengan cookie yang disertakan, respons menambah `refresh_csrf_token` jika
-cookie Remember me tersedia, termasuk ketika access cookie sudah hilang atau
+cookie refresh tersedia, termasuk ketika access cookie sudah hilang atau
 JWT-nya kedaluwarsa. Endpoint ini hanya menghasilkan CSRF, bukan login/refresh.
 `csrf_token` tetap mewakili access/overlay cookie untuk operasi lain.
 
@@ -108,7 +106,7 @@ Alur client yang disarankan:
 
 Jika Next.js bertindak sebagai proxy/BFF, teruskan cookie request dan **semua**
 header `Set-Cookie` respons sebagai header terpisah. Login/refresh kini dapat
-mengirim beberapa cookie; meneruskan hanya cookie access menghilangkan Remember me.
+mengirim beberapa cookie. Browser memerlukan cookie refresh untuk memulihkan sesi.
 Respons auth/CSRF menggunakan `Cache-Control: no-store`.
 
 ## Logout, mode mahasiswa, dan impersonasi
@@ -117,13 +115,13 @@ Respons auth/CSRF menggunakan `Cache-Control: no-store`.
 sudah habis. Untuk alur ini gunakan cookie tanpa Authorization kedaluwarsa.
 Logout sesi utama mencabut refresh beserta access JWT dan menghapus cookie.
 
-Pergantian cihuy admin ke mode mahasiswa mempertahankan tenggat Remember me
+Pergantian admin ke mode mahasiswa mempertahankan tenggat sesi
 awal dan menerbitkan grant baru yang terkunci ke mode mahasiswa. Refresh tidak
 bisa menaikkan kembali ke admin dengan menambahkan `login_as`/role ke request.
 Kembali ke admin dari mode mahasiswa tetap memerlukan login seperti sebelumnya.
 
-Impersonasi tetap memiliki durasi pendek dan **tidak memperoleh refresh token
-mahasiswa 30 hari**. Cookie parent admin disimpan terpisah. Selama impersonasi
+Impersonasi memakai JWT berumur pendek. Grant refresh berasal dari sesi admin
+yang memakai cookie terpisah. Selama impersonasi
 belum diakhiri, refresh memberi 403 dengan `error_code=impersonation_active`,
 termasuk jika overlay cookie sudah kedaluwarsa/hilang. Jangan otomatis berpindah
 role atau logout hanya karena error ini; tampilkan aksi kembali ke admin.
@@ -140,16 +138,17 @@ Jika seluruh access token telah habis, logout melalui refresh menutup sesi utama
 
 ## Konfigurasi dan database
 
-Tidak ada secret baru. Dua pengaturan opsional sudah memiliki default:
+`REMEMBER_ACCESS_EXPIRE_MINUTES` mengatur batas access JWT pada login dan
+refresh.
 
 ```env
 REMEMBER_ACCESS_EXPIRE_MINUTES=15
-REFRESH_TOKEN_EXPIRE_DAYS=30
 ```
 
-Durasi Remember me maksimal 30 hari, dan cap access Remember me maksimal 60
-menit. `JWT_EXPIRE_MINUTES` tetap membatasi access jika nilainya lebih pendek.
-Pengaturan cookie dan kunci JWT tetap memakai konfigurasi yang sudah ada.
+Nilai maksimum pengaturan access ini 60 menit. `JWT_EXPIRE_MINUTES` menjadi
+batas tambahan jika nilainya lebih pendek. Durasi refresh ditetapkan backend
+ke 3 hari. Deployment dengan `REFRESH_TOKEN_EXPIRE_DAYS=30` di konfigurasi
+lama tetap dapat dimulai dan memakai tenggat baru.
 
 Startup menambahkan dua tabel PostgreSQL:
 
@@ -159,11 +158,14 @@ Startup menambahkan dua tabel PostgreSQL:
 - `auth_refresh_tokens`: hash SHA-256 token acak 256 bit, referensi grant,
   waktu dibuat/dipakai. Token mentah tidak masuk database.
 
-Row lock akun menyerialisasi login/logout/rotasi. Token yang sudah dipakai
-disimpan sampai grant kedaluwarsa untuk mendeteksi replay. Grant kedaluwarsa
-dibersihkan bertahap saat login Remember me baru. User yang dihapus menghapus
-grant/token lewat foreign key cascade. Migrasi bersifat penambahan; dokumen,
-embedding, skor, dan riwayat pengecekan tidak diubah.
+Startup memendekkan tenggat sesi lama menjadi maksimal 3 hari sejak login
+awal, termasuk grant pengganti setelah pergantian mode. Sesi lama yang sudah
+melewati tenggat meminta login ulang.
+
+Row lock akun menyerialisasi login, logout, dan rotasi. Token yang sudah
+dipakai disimpan sampai grant kedaluwarsa untuk mendeteksi replay. Grant
+kedaluwarsa dibersihkan bertahap saat login. Penghapusan akun membersihkan
+grant dan token terkait lewat foreign key cascade.
 
 Refresh sukses dibatasi maksimal sekali per 60 detik (lebih pendek jika access
 JWT diatur sangat singkat). Respons 429 tidak mengonsumsi token atau menghapus

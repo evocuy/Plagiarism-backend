@@ -130,6 +130,19 @@ def test_first_time_nim_is_provisioned_from_verified_campus_identity(context):
     assert not context.opener.requests
 
 
+def test_sads_tester_can_start_and_stop_impersonation_only_in_admin_mode(context, monkeypatch):
+    monkeypatch.setenv("SADS_TESTER_NIMS", NIM)
+    admin_token = auth.create_access_token(context.student, session_mode="admin")
+    student_token = auth.create_access_token(context.student, session_mode="mahasiswa")
+
+    assert start(context, context.other.identifier, token=student_token)[0] == 403
+    code, _, body = start(context, context.other.identifier, token=admin_token)
+    assert code == 200, body
+    assert me(context, body["token"])[2]["role"] == "mahasiswa"
+    assert stop(context, body, token=admin_token)[2]["user"]["role"] == "admin"
+    assert me(context, body["token"])[0] == 401
+
+
 @pytest.mark.parametrize("name", ["Seminar", "Skripsi", "  SKRIPSI  ", "Tugas Akhir", "  TUGAS   AKHIR  "])
 def test_course_requirement_is_also_enforced_for_admin_impersonation(context, name):
     context.opener.courses.payload["jadwal_matakuliah"] = [{"matkul": name}]

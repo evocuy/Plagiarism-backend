@@ -20,7 +20,13 @@ from app.services.sads_auth_service import SadsAuthService, SadsLoginSettings, S
 from app.services.sads_course_service import SadsActiveCoursesService
 from app.services import impersonation_service
 from app.services.csrf_service import create_csrf_token
-from app.services.account_mode_service import StudentModeUser, account_user, can_choose_login_mode, student_mode_user
+from app.services.account_mode_service import (
+    LoginModeUser,
+    account_user,
+    can_choose_login_mode,
+    is_sads_tester,
+    user_for_login_mode,
+)
 from app.services import refresh_token_service as refresh_tokens
 
 router = APIRouter()
@@ -64,9 +70,8 @@ def _read_boolean_setting(name: str, default: bool) -> bool:
 
 JWT_EXPIRE_MINUTES = _read_positive_int_setting("JWT_EXPIRE_MINUTES", 1440)
 REMEMBER_ACCESS_EXPIRE_MINUTES = _read_positive_int_setting("REMEMBER_ACCESS_EXPIRE_MINUTES", 15)
-REFRESH_TOKEN_EXPIRE_DAYS = _read_positive_int_setting("REFRESH_TOKEN_EXPIRE_DAYS", 30)
-if REMEMBER_ACCESS_EXPIRE_MINUTES > 60 or REFRESH_TOKEN_EXPIRE_DAYS > 30:
-    raise RuntimeError("Remember me maksimal 30 hari, dengan access token maksimal 60 menit.")
+if REMEMBER_ACCESS_EXPIRE_MINUTES > 60:
+    raise RuntimeError("REMEMBER_ACCESS_EXPIRE_MINUTES maksimal 60 menit.")
 IMPERSONATION_EXPIRE_MINUTES = _read_positive_int_setting("IMPERSONATION_EXPIRE_MINUTES", 15)
 if IMPERSONATION_EXPIRE_MINUTES > 60:
     raise RuntimeError("IMPERSONATION_EXPIRE_MINUTES maksimal 60 menit.")
@@ -209,7 +214,10 @@ class LoginRequest(BaseModel):
     identifier: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=256)
     login_as: Optional[Literal["admin", "mahasiswa"]] = None
-    remember_me: bool = Field(default=False, strict=True)
+    remember_me: bool = Field(
+        default=True, strict=True, deprecated=True,
+        description="Kompatibilitas klien lama. Setiap login berhasil menerbitkan sesi refresh.",
+    )
 
 
 class LoginModeRequest(BaseModel):
@@ -254,15 +262,16 @@ class UserResponse(BaseModel):
 
 def _build_user_response(user: User) -> dict:
     """Helper: konversi ORM User ke dictionary flat tanpa nested null."""
+    can_choose_mode = can_choose_login_mode(user)
     res = {
         "id": user.id,
         "identifier": user.identifier,
         "role": user.role,
         "nama_lengkap": user.name,
         "name": user.name,
-        "available_login_modes": (["admin", "mahasiswa"] if can_choose_login_mode(user)
+        "available_login_modes": (["admin", "mahasiswa"] if can_choose_mode
                                   else ["admin"] if user.role in ("admin", "super_admin") else ["mahasiswa"]),
-        "unlimited_daily_checks": can_choose_login_mode(user),
+        "unlimited_daily_checks": can_choose_mode,
     }
     if user.role == "mahasiswa":
         res["program_studi"] = user.program_studi
@@ -322,10 +331,10 @@ def create_access_token(
     session_mode: str | None = None,
     refresh_session_id: str | None = None,
 ) -> str:
-    if isinstance(user, StudentModeUser):
-        if session_mode not in (None, "mahasiswa"):
+    if isinstance(user, LoginModeUser):
+        if user.session_mode == "mahasiswa" and session_mode == "admin":
             raise ValueError("A student session cannot mint an administrator session")
-        session_mode = "mahasiswa"
+        session_mode = session_mode or user.session_mode
         user = account_user(user)
     if session_mode is not None and (
         session_mode not in ("admin", "mahasiswa") or not can_choose_login_mode(user) or impersonation_id is not None
@@ -336,7 +345,7 @@ def create_access_token(
     payload = {
         "sub": str(user.id),
         "identifier": user.identifier,
-        "role": "mahasiswa" if session_mode == "mahasiswa" else user.role,
+        "role": user_for_login_mode(user, session_mode).role,
         "sv": user.session_version,
         "sads_courses_verified": sads_courses_verified,
         "exp": expires_at,
@@ -493,7 +502,7 @@ def get_current_user(
         if not claims.sads_courses_verified:
             raise _auth_exception("Sesi belum memverifikasi mata kuliah aktif.")
         impersonation = impersonation_service.resolve_impersonation(db, claims.impersonation_id, user)
-    elif user.role == "mahasiswa":
+    elif user.role == "mahasiswa" and claims.session_mode is None:
         student_auth = StudentAuthSettings.from_environment()
         if student_auth.provider == "sads" or user.auth_provider == "sads":
             if student_auth.provider != "sads" or user.auth_provider != "sads":
@@ -505,7 +514,7 @@ def get_current_user(
         http_request.state.access_claims = claims
         http_request.state.access_token = bearer_token or effective_cookie
         http_request.state.impersonation = impersonation
-    return student_mode_user(user) if claims.session_mode == "mahasiswa" else user
+    return user_for_login_mode(user, claims.session_mode)
 
 
 def get_optional_current_user(
@@ -559,8 +568,8 @@ def require_original_admin(
             _check_refresh_access_cookie(http_request, grant)
         except refresh_tokens.RefreshTokenError as refresh_error:
             raise _auth_exception(refresh_error.detail) from None
-        if (grant.user.role not in ("admin", "super_admin") or grant.session.session_mode == "mahasiswa"
-                or grant.session.impersonation_session_id is None):
+        user = user_for_login_mode(grant.user, grant.session.session_mode)
+        if user.role not in ("admin", "super_admin") or grant.session.impersonation_session_id is None:
             raise _auth_exception("Sesi admin asli diperlukan untuk kembali dari impersonasi.", status_code=403)
         http_request.state.refresh_recovery_grant = grant
         http_request.state.access_claims = AccessTokenClaims(
@@ -569,7 +578,6 @@ def require_original_admin(
             refresh_session_id=grant.session.id,
         )
         http_request.state.access_token = None
-        user = grant.user
     if user.role not in ("admin", "super_admin") or http_request.state.access_claims.impersonation_id:
         raise _auth_exception("Sesi admin asli diperlukan untuk kembali dari impersonasi.", status_code=403)
     return user
@@ -592,9 +600,11 @@ def _check_refresh_access_cookie(http_request: Request, grant: refresh_tokens.Re
 
 def _check_refresh_eligibility(db: Session, grant: refresh_tokens.RefreshGrant) -> None:
     user, session = grant.user, grant.session
-    if session.session_mode is not None and not can_choose_login_mode(user):
-        refresh_tokens.revoke_grant(db, grant, "mode_unavailable")
-        raise refresh_tokens.RefreshTokenError()
+    if session.session_mode is not None:
+        if not can_choose_login_mode(user):
+            refresh_tokens.revoke_grant(db, grant, "mode_unavailable")
+            raise refresh_tokens.RefreshTokenError()
+        return
     if user.role != "mahasiswa":
         return
     settings = StudentAuthSettings.from_environment()
@@ -639,7 +649,7 @@ def refresh_session(http_request: Request, response: Response, db: Session = Dep
         db.commit()
         _set_refresh_cookie(response, raw, grant.session)
         _set_session_cookie(response, token, max_age=max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds())))
-        effective = student_mode_user(grant.user) if grant.session.session_mode == "mahasiswa" else grant.user
+        effective = user_for_login_mode(grant.user, grant.session.session_mode)
         return _auth_response(effective, token, expires_at, session=grant.session, refresh_raw=raw)
     except refresh_tokens.RefreshTokenError as error:
         db.rollback()
@@ -722,16 +732,20 @@ def login(
             )
         raise _auth_exception("Identifier atau kata sandi tidak valid.")
 
+    refresh_tokens.purge_expired_sessions(db)
+    sads_courses_verified = False
     if sads_profile is not None:
         # Enrollment is an authorization check, separate from password failures.
         # Verify before provisioning a profile or issuing/rotating a session.
-        try:
-            SadsActiveCoursesService().require_eligible_student(sads_profile.username)
-        except HTTPException as error:
-            if error.status_code == 403 and user is not None and user.auth_provider == "sads":
-                # A definitive loss of eligibility also revokes a previous grant.
-                _rotate_session_version(db, user)
-            raise
+        if not is_sads_tester(sads_profile.username):
+            try:
+                SadsActiveCoursesService().require_eligible_student(sads_profile.username)
+            except HTTPException as error:
+                if error.status_code == 403 and user is not None and user.auth_provider == "sads":
+                    # A definitive loss of eligibility also revokes a previous grant.
+                    _rotate_session_version(db, user)
+                raise
+            sads_courses_verified = True
         user = SadsAuthService.provision_student(db, sads_profile, password_hash.hash)
 
     if request.login_as is not None:
@@ -742,28 +756,19 @@ def login(
 
     # Login is a session boundary: revoke all old Bearer and cookie JWTs for
     # this account before minting the new pair.
-    if request.remember_me:
-        refresh_tokens.purge_expired_sessions(db)
     _rotate_session_version(db, user, commit=False)
-    remembered, raw = None, None
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
-    if request.remember_me:
-        remembered, raw = refresh_tokens.issue_session(
-            db, user, expires_at=utc_now() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-            session_mode=session_mode, sads_courses_verified=sads_profile is not None,
-        )
-        expires_at = _remember_access_expiry(remembered)
-    token = create_access_token(user, sads_courses_verified=sads_profile is not None, session_mode=session_mode,
-                                expires_at=expires_at, refresh_session_id=remembered.id if remembered else None)
+    remembered, raw = refresh_tokens.issue_session(
+        db, user, session_mode=session_mode, sads_courses_verified=sads_courses_verified,
+    )
+    expires_at = _remember_access_expiry(remembered)
+    token = create_access_token(user, sads_courses_verified=sads_courses_verified, session_mode=session_mode,
+                                expires_at=expires_at, refresh_session_id=remembered.id)
     db.commit()
     _clear_session_cookie(response, cookie_name=IMPERSONATION_COOKIE_NAME)
-    if remembered:
-        _set_refresh_cookie(response, raw, remembered)
-    else:
-        _clear_refresh_cookie(response)
+    _set_refresh_cookie(response, raw, remembered)
     _set_session_cookie(response, token, max_age=max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds())))
 
-    effective = student_mode_user(user) if session_mode == "mahasiswa" else user
+    effective = user_for_login_mode(user, session_mode)
     return _auth_response(effective, token, expires_at, session=remembered, refresh_raw=raw)
 
 
@@ -775,15 +780,15 @@ def select_login_mode(
     """Choose a mode after admin login; returning from student mode requires login again."""
     _set_no_store(response)
     if not can_choose_login_mode(admin):
-        raise _auth_exception("Pilihan mode login hanya tersedia untuk akun admin cihuy.", status_code=403)
+        raise _auth_exception("Pilihan mode login tidak tersedia untuk akun ini.", status_code=403)
     expires_at = http_request.state.access_claims.expires_at
     previous = db.get(AuthRefreshSession, http_request.state.access_claims.refresh_session_id) if http_request.state.access_claims.refresh_session_id else None
-    remembered_expiry = previous.expires_at if previous is not None else None
     _rotate_session_version(db, admin, commit=False)
     remembered, raw = None, None
-    if remembered_expiry is not None:
-        remembered, raw = refresh_tokens.issue_session(db, admin, expires_at=remembered_expiry,
+    if previous is not None:
+        remembered, raw = refresh_tokens.issue_session(db, account_user(admin), expires_at=previous.expires_at,
                                                       session_mode=request.login_as, sads_courses_verified=False)
+        expires_at = min(expires_at, remembered.expires_at.replace(tzinfo=timezone.utc))
     token = create_access_token(admin, session_mode=request.login_as, expires_at=expires_at,
                                 refresh_session_id=remembered.id if remembered else None)
     db.commit()
@@ -794,7 +799,7 @@ def select_login_mode(
     else:
         _clear_refresh_cookie(response)
     _set_session_cookie(response, token, max_age=remaining)
-    effective = student_mode_user(admin) if request.login_as == "mahasiswa" else admin
+    effective = user_for_login_mode(admin, request.login_as)
     return _auth_response(effective, token, expires_at, session=remembered, refresh_raw=raw)
 
 
@@ -859,7 +864,7 @@ def stop_admin_impersonation(
             and remembered.impersonation_session_id != request.session_id):
         raise _auth_exception("Akhiri sesi impersonasi yang sedang aktif.", status_code=403)
     impersonation_service.stop_impersonation(
-        db, admin, request.session_id, session_version=claims.session_version,
+        db, admin, request.session_id, session_version=claims.session_version, session_mode=claims.session_mode,
         commit=recovery is None,
     )
     token = http_request.state.access_token

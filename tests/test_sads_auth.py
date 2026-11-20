@@ -82,6 +82,7 @@ def environment(monkeypatch):
     monkeypatch.setenv("SADS_ACTIVE_COURSES_URL_TEMPLATE", "https://courses.example.invalid/current/{nim}")
     monkeypatch.setenv("SADS_ACTIVE_COURSES_TIMEOUT_SECONDS", "10")
     monkeypatch.setenv("SADS_ACTIVE_COURSES_HEADERS_JSON", json.dumps({"secret": PRIVATE_VALUE}))
+    monkeypatch.delenv("SADS_TESTER_NIMS", raising=False)
     monkeypatch.delenv("SADS_TEST_ALLOWED_USERNAMES", raising=False)
     monkeypatch.delenv("SADS_TEST_ACCESS_EXPIRES_AT", raising=False)
     monkeypatch.setenv("LOGIN_ACCOUNT_MAX_FAILURES", "5")
@@ -110,6 +111,45 @@ def environment(monkeypatch):
 
 def login(app, username=NIM, password=PASSWORD):
     return request(app, "POST", "/api/auth/login", body={"identifier": username, "password": password})
+
+
+@pytest.mark.parametrize(("mode", "admin_status"), [("admin", 200), ("mahasiswa", 403)])
+def test_sads_testers_use_sads_credentials_and_get_only_the_chosen_role(
+    environment, monkeypatch, mode, admin_status,
+):
+    app, db, opener = environment
+    monkeypatch.setenv("SADS_TESTER_NIMS", f"2400000009, {NIM}")
+    opener.courses.payload["jadwal_matakuliah"] = [{"matkul": "Matematika"}]
+    assert login(app, username="2400000008")[0] == 403
+
+    code, _, body = request(app, "POST", "/api/auth/login", body={
+        "identifier": NIM, "password": PASSWORD, "login_as": mode,
+    })
+    assert code == 200, body
+    assert body["user"]["role"] == mode
+    assert body["user"]["available_login_modes"] == ["admin", "mahasiswa"]
+    assert body["user"]["unlimited_daily_checks"] is True
+    account = db.query(User).filter_by(identifier=NIM).one()
+    assert (account.role, account.auth_provider) == ("mahasiswa", "sads")
+    assert len(opener.requests) == 2
+    assert len(opener.courses.requests) == 1
+
+    authorization = f"Bearer {body['token']}"
+    assert request(app, "GET", "/api/auth/me", authorization=authorization)[2]["role"] == mode
+    assert request(app, "GET", "/api/auth/users", authorization=authorization)[0] == admin_status
+
+    monkeypatch.setenv("SADS_TESTER_NIMS", "2400000009")
+    assert request(app, "GET", "/api/auth/me", authorization=authorization)[0] == 401
+
+
+def test_listed_tester_cannot_sign_in_when_sads_rejects_password(environment, monkeypatch):
+    app, db, opener = environment
+    monkeypatch.setenv("SADS_TESTER_NIMS", NIM)
+    opener.error = HTTPError("https://campus.example.invalid", 401, "Unauthorized", {}, None)
+
+    assert login(app)[0] == 401
+    assert not opener.courses.requests
+    assert db.query(User).count() == 0
 
 
 def test_login_uses_post_json_and_local_session_without_sads_secrets(environment):

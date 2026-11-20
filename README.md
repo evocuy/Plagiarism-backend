@@ -131,7 +131,7 @@ impersonasi yang memenuhi syarat; admin juga dapat membuat akun lokal.
   - `POST /api/auth/login` (Mendukung JWT via response body & session cookie)
   - `GET /api/auth/me` (Cek info profil user yang sedang login)
   - `POST /api/auth/logout`
-  - `POST /api/auth/refresh` (Cookie Remember me + refresh CSRF, tanpa Bearer)
+  - `POST /api/auth/refresh` (Cookie refresh + refresh CSRF, tanpa Bearer)
   - `GET /api/auth/users` (Admin only)
   - `POST /api/auth/users` (Admin only)
 - **Dokumen**:
@@ -143,11 +143,10 @@ impersonasi yang memenuhi syarat; admin juga dapat membuat akun lokal.
   - `GET /api/plagiarism/reports/{document_id}` (Detail hasil analisis per dokumen)
   - `GET /api/plagiarism/check/{id}/status` (Status pemrosesan)
 
-Login menerima `remember_me: true` untuk refresh cookie HttpOnly hingga 30 hari
-dengan access token pendek dan rotasi sekali pakai. Kontrak frontend, CSRF,
-logout, SADS, serta pemulihan impersonasi dijelaskan di
-[panduan Remember me](deployment/REFRESH_TOKENS.md). Tanpa pilihan tersebut,
-durasi login mengikuti konfigurasi JWT sebelumnya.
+Setiap login berhasil otomatis menerbitkan cookie refresh HttpOnly dengan
+tenggat 3 hari sejak login. Client memakai cookie itu untuk memperbarui access
+JWT pendek. Detail CSRF, rotasi, logout, SADS, dan pemulihan impersonasi ada di
+[panduan refresh token](deployment/REFRESH_TOKENS.md).
 
 ## Repositori alumni dan penghapusan alur pembimbing
 
