@@ -115,10 +115,11 @@ Respons auth/CSRF menggunakan `Cache-Control: no-store`.
 sudah habis. Untuk alur ini gunakan cookie tanpa Authorization kedaluwarsa.
 Logout sesi utama mencabut refresh beserta access JWT dan menghapus cookie.
 
-Pergantian admin ke mode mahasiswa mempertahankan tenggat sesi
-awal dan menerbitkan grant baru yang terkunci ke mode mahasiswa. Refresh tidak
-bisa menaikkan kembali ke admin dengan menambahkan `login_as`/role ke request.
-Kembali ke admin dari mode mahasiswa tetap memerlukan login seperti sebelumnya.
+Pergantian mode mempertahankan tenggat sesi awal dan menerbitkan grant baru
+untuk mode yang dipilih. Refresh meneruskan mode yang tersimpan di grant.
+Akun yang punya hak Admin dapat kembali dari mode Mahasiswa miliknya lewat
+`POST /api/auth/session-mode` dengan `{"login_as":"admin"}` dan sesi yang
+masih aktif.
 
 Impersonasi memakai JWT berumur pendek. Grant refresh berasal dari sesi admin
 yang memakai cookie terpisah. Selama impersonasi

@@ -60,16 +60,16 @@ X-CSRF-Token: CSRF_SESI_ADMIN
 {"login_as":"mahasiswa"}
 ```
 
-Gunakan credential admin yang baru login. Request cookie memakai credentials
-include dan X-CSRF-Token; klien Bearer-only tetap bisa memakai Authorization
-admin. Akun lain atau sesi mahasiswa tidak boleh memanggil endpoint ini.
-Endpoint juga menerima login_as admin ketika sesi yang sedang dipakai masih admin.
+Gunakan sesi Admin yang aktif. Request cookie memakai `credentials: "include"`
+dan `X-CSRF-Token` dari sesi tersebut. Klien Bearer-only memakai header
+`Authorization`. Endpoint menerima `login_as` admin dari sesi Admin atau dari
+mode Mahasiswa milik akun yang memiliki kedua pilihan mode.
 
 Respons tetap `{token, user, csrf_token}`. Frontend mengganti ketiganya bersama,
 lalu membuka dashboard sesuai `user.role`. Cookie sesi ikut diganti oleh backend.
-Pemilihan mode mencabut semua token lama akun cihuy, membersihkan overlay
-impersonasi, dan mempertahankan batas kedaluwarsa sesi admin sebelumnya.
-JWT mode mahasiswa bertanda role mahasiswa dan tidak memiliki hak endpoint admin.
+Pemilihan mode mencabut token lama akun, menerbitkan token dan CSRF baru, dan
+mempertahankan batas kedaluwarsa sebelumnya. JWT mode mahasiswa membawa hak
+akses mahasiswa.
 
 GET `/api/auth/me` tetap mengembalikan role efektif mahasiswa setelah reload.
 Simpan/pulihkan CSRF melalui alur yang dijelaskan di
@@ -123,9 +123,18 @@ pengelolaan pengguna tetap memerlukan sesi admin.
 
 ## Kembali ke admin
 
-Keluar melalui POST `/api/auth/logout`, bersihkan state token/user/CSRF, lalu login
-kembali dan pilih Admin. Sesi mahasiswa tidak dapat meningkatkan dirinya menjadi
-admin lewat session-mode atau endpoint stop impersonasi. Mode ini tidak membuat
-impersonation_session_id, sehingga jangan memakai alur stop impersonasi untuknya.
-Perubahan role/identifier/provider, penonaktifan akun, login baru, reset password,
-dan logout mencabut/menolak sesi sesuai aturan autentikasi backend.
+Panggil endpoint yang sama dengan sesi Mahasiswa milik akun sendiri yang
+masih aktif dan berhak memilih kedua mode.
+
+```http
+POST /api/auth/session-mode
+Content-Type: application/json
+X-CSRF-Token: CSRF_SESI_MAHASISWA
+
+{"login_as":"admin"}
+```
+
+Setelah HTTP 200, simpan `user`, `token`, `csrf_token`, dan
+`refresh_csrf_token` dari respons yang baru, lalu buka dashboard Admin.
+Untuk sesi impersonasi, gunakan `POST /api/auth/impersonation/stop` dengan
+kredensial admin asli dan ID sesi impersonasi.

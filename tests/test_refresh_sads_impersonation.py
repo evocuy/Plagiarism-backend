@@ -54,14 +54,30 @@ def test_sads_tester_can_switch_and_refresh_mode_until_removed(environment, monk
     assert child["user"]["role"] == "mahasiswa"
     assert request(app, "GET", "/api/auth/me", authorization="Bearer " + parent["token"])[0] == 401
     cookies = apply_cookies(headers, cookies)
-    code, _, renewed = refresh(app, expired_access(cookies))
+    code, headers, renewed = refresh(app, expired_access(cookies))
     assert code == 200, renewed
     assert renewed["user"]["role"] == "mahasiswa"
+    cookies = apply_cookies(headers, cookies)
+    code, _, restored = request(app, "POST", "/api/auth/session-mode", cookies=cookies,
+        headers={"X-CSRF-Token": renewed["csrf_token"]}, body={"login_as": "admin"})
+    assert code == 200 and restored["user"]["role"] == "admin"
+    assert restored["user"]["id"] == parent["user"]["id"]
+    assert restored["refresh_expires_at"] == parent["refresh_expires_at"]
     assert len(opener.requests) == 1
     assert not opener.courses.requests
 
     monkeypatch.delenv("SADS_TESTER_NIMS")
-    assert request(app, "GET", "/api/auth/me", authorization="Bearer " + renewed["token"])[0] == 401
+    assert request(app, "GET", "/api/auth/me", authorization="Bearer " + restored["token"])[0] == 401
+
+
+def test_ordinary_sads_session_cannot_switch_to_admin_when_tester_access_is_added(environment, monkeypatch):
+    app, _, _ = environment
+    protect(app)
+    cookies, student = campus_login(app)
+    monkeypatch.setenv("SADS_TESTER_NIMS", NIM)
+    code, _, _ = request(app, "POST", "/api/auth/session-mode", cookies=cookies,
+        headers={"X-CSRF-Token": student["csrf_token"]}, body={"login_as": "admin"})
+    assert code == 403
 
 
 def test_campus_loss_of_eligibility_revokes_refresh_and_previous_access(environment):

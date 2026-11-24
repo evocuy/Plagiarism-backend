@@ -4,12 +4,15 @@ from datetime import timedelta
 from threading import Barrier
 
 import pytest
+from fastapi import HTTPException, Request, Response
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database import migrations
 from app.models.schemas import AuthRefreshSession, AuthRefreshToken, Document, PlagiarismCheck, User, utc_now
+from app.routes import auth
 from app.services import refresh_token_service as tokens
+from test_auth_session import TEST_JWT_SECRET
 from test_repository_import_postgresql import postgres
 
 
@@ -85,6 +88,41 @@ def test_postgresql_logout_racing_rotation_cannot_leave_a_live_descendant(postgr
         assert db.get(AuthRefreshSession, session_id).revoked_at is not None
         with pytest.raises(tokens.RefreshTokenError):
             tokens.resolve_grant(db, descendant or raw)
+
+
+def test_postgresql_competing_admin_mode_switches_only_replace_the_session_once(postgres, monkeypatch):
+    monkeypatch.setattr(auth, "JWT_SECRET_KEY", TEST_JWT_SECRET)
+    factory = sessionmaker(bind=postgres)
+    with factory() as db:
+        user = User(identifier="cihuy", password="unused", role="admin", session_version=7)
+        db.add(user)
+        db.flush()
+        remembered, _ = tokens.issue_session(db, user, session_mode="mahasiswa", sads_courses_verified=False)
+        token = auth.create_access_token(user, session_mode="mahasiswa", refresh_session_id=remembered.id)
+        db.commit()
+        user_id = user.id
+
+    barrier = Barrier(2)
+
+    def switch():
+        with factory() as db:
+            request = Request({"type": "http", "headers": []})
+            current = auth.get_current_user(authorization="Bearer " + token, plagiarism_session=None,
+                                            http_request=request, db=db)
+            barrier.wait(timeout=10)
+            try:
+                result = auth.select_login_mode(auth.LoginModeRequest(login_as="admin"), request, Response(), current, db)
+                assert result["user"]["role"] == "admin"
+                return 200
+            except HTTPException as error:
+                return error.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.submit(switch), executor.submit(switch)
+        assert sorted([first.result(timeout=20), second.result(timeout=20)]) == [200, 401]
+    with factory() as db:
+        assert db.get(User, user_id).session_version == 8
+        assert db.query(AuthRefreshSession).filter_by(user_id=user_id, revoked_at=None).one().session_mode == "admin"
 
 
 def test_runtime_migration_adds_refresh_tables_and_preserves_existing_history(postgres, monkeypatch):

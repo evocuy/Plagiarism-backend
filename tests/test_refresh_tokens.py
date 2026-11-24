@@ -238,6 +238,15 @@ def test_mode_switch_preserves_deadline_and_refresh_cannot_upgrade_student_mode(
     assert code == 200 and renewed["user"]["role"] == "mahasiswa"
     current = apply_cookies(headers, current)
     assert request(app, "GET", "/api/auth/users", cookies=current)[0] == 403
+
+    code, headers, admin = request(app, "POST", "/api/auth/session-mode", cookies=current,
+        headers={"X-CSRF-Token": renewed["csrf_token"]}, body={"login_as": "admin"})
+    assert code == 200 and admin["user"]["role"] == "admin"
+    assert admin["refresh_expires_at"] == original["refresh_expires_at"]
+    restored = apply_cookies(headers, current)
+    assert restored[auth.REFRESH_COOKIE_NAME] != current[auth.REFRESH_COOKIE_NAME]
+    assert refresh(app, current)[0] == 401
+    assert request(app, "GET", "/api/auth/users", cookies=restored)[0] == 200
     assert db.query(User).filter_by(identifier="cihuy").one().role == "admin"
 
 

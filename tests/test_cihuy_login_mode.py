@@ -120,10 +120,11 @@ def test_choose_student_mode_after_admin_login_revokes_old_token_without_extendi
     assert call(context, child, "GET", "/api/auth/me")[2]["role"] == "mahasiswa"
 
 
-def test_cookie_mode_switch_requires_csrf(context):
-    _, _, parent = login(context)
+@pytest.mark.parametrize("mode,target", [("admin", "mahasiswa"), ("mahasiswa", "admin")])
+def test_cookie_mode_switch_requires_csrf(context, mode, target):
+    _, _, parent = login(context, mode=mode)
     version = context.db.query(User).filter_by(identifier="cihuy").one().session_version
-    code, _, body = request(context.app, "POST", "/api/auth/session-mode", cookie=parent["token"], body={"login_as": "mahasiswa"})
+    code, _, body = request(context.app, "POST", "/api/auth/session-mode", cookie=parent["token"], body={"login_as": target})
     assert code == 403 and body["error_code"] == "csrf_token_invalid"
     assert context.db.query(User).filter_by(identifier="cihuy").one().session_version == version
 
@@ -137,13 +138,21 @@ def test_other_accounts_cannot_choose_another_role_or_receive_unlimited_quota(co
     assert call(context, original, "POST", "/api/auth/session-mode", {"login_as": mode})[0] == 403
 
 
-def test_student_mode_cannot_call_admin_operations_or_restore_admin_without_login(context):
+@pytest.mark.parametrize("cookie", [False, True])
+def test_student_mode_requires_an_explicit_switch_for_admin_operations(context, cookie):
     _, _, body = login(context, mode="mahasiswa")
     assert call(context, body, "GET", "/api/auth/users")[0] == 403
-    assert call(context, body, "POST", "/api/auth/session-mode", {"login_as": "admin"})[0] == 403
+    assert call(context, body, "POST", "/api/auth/session-mode", {"login_as": "mahasiswa"})[0] == 403
     assert call(context, body, "POST", "/api/auth/impersonation", {"nim": "2400000001", "impersonation_password": "synthetic"})[0] == 403
     assert call(context, body, "POST", "/api/documents/reindex", {})[0] == 403
-    assert login(context, mode="admin")[2]["user"]["role"] == "admin"
+
+    code, headers, admin = call(context, body, "POST", "/api/auth/session-mode", {"login_as": "admin"}, cookie=cookie)
+    assert code == 200 and headers["cache-control"] == "no-store"
+    assert admin["user"]["id"] == body["user"]["id"] and admin["user"]["role"] == "admin"
+    assert admin["csrf_token"] != body["csrf_token"]
+    assert auth._decode_access_token(admin["token"]).expires_at == auth._decode_access_token(body["token"]).expires_at
+    assert call(context, body, "GET", "/api/auth/me")[0] == 401
+    assert call(context, admin, "GET", "/api/auth/users", cookie=cookie)[0] == 200
 
 
 def test_student_mode_only_sees_own_documents_history_and_dashboard(context):

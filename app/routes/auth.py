@@ -454,6 +454,18 @@ def _rotate_session_version(db: Session, user: User, *, commit: bool = True) -> 
         db.commit()
 
 
+def _access_refresh_session(db: Session, user: User, claims: AccessTokenClaims) -> AuthRefreshSession | None:
+    if claims.refresh_session_id is None:
+        return None
+    remembered = db.get(AuthRefreshSession, claims.refresh_session_id, populate_existing=True)
+    if (remembered is None or remembered.revoked_at is not None or remembered.expires_at <= utc_now()
+            or remembered.user_id != user.id or remembered.session_version != user.session_version
+            or remembered.session_mode != claims.session_mode
+            or remembered.auth_context_hash != refresh_tokens.auth_context_hash(user)):
+        raise _auth_exception("Sesi tersimpan tidak berlaku. Silakan login kembali.")
+    return remembered
+
+
 def get_current_user(
     authorization: Optional[str] = Header(default=None),
     plagiarism_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
@@ -487,13 +499,7 @@ def get_current_user(
 
     if user.session_version != claims.session_version:
         raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
-    if claims.refresh_session_id is not None:
-        remembered = db.get(AuthRefreshSession, claims.refresh_session_id)
-        if (remembered is None or remembered.revoked_at is not None or remembered.expires_at <= utc_now()
-                or remembered.user_id != user.id or remembered.session_version != user.session_version
-                or remembered.session_mode != claims.session_mode
-                or remembered.auth_context_hash != refresh_tokens.auth_context_hash(user)):
-            raise _auth_exception("Sesi tersimpan tidak berlaku. Silakan login kembali.")
+    _access_refresh_session(db, user, claims)
     if claims.session_mode is not None and not can_choose_login_mode(user):
         raise _auth_exception("Mode sesi sudah tidak berlaku. Silakan login kembali.")
 
@@ -775,21 +781,33 @@ def login(
 @router.post("/session-mode", response_model=LoginResponse)
 def select_login_mode(
     request: LoginModeRequest, http_request: Request, response: Response,
-    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    """Choose a mode after admin login; returning from student mode requires login again."""
+    """Switch the authenticated account's own login mode."""
     _set_no_store(response)
-    if not can_choose_login_mode(admin):
+    claims = http_request.state.access_claims
+    restore_admin = claims.session_mode == "mahasiswa" and request.login_as == "admin"
+    if claims.impersonation_id is not None or (current_user.role not in ("admin", "super_admin") and not restore_admin):
         raise _auth_exception("Pilihan mode login tidak tersedia untuk akun ini.", status_code=403)
-    expires_at = http_request.state.access_claims.expires_at
-    previous = db.get(AuthRefreshSession, http_request.state.access_claims.refresh_session_id) if http_request.state.access_claims.refresh_session_id else None
-    _rotate_session_version(db, admin, commit=False)
+
+    # Recheck under the same account lock used by refresh. Concurrent requests
+    # from the previous session must not mint another grant after rotation.
+    account = db.query(User).populate_existing().filter(
+        User.id == claims.user_id, User.session_version == claims.session_version, User.is_active.is_(True),
+    ).with_for_update().first()
+    expires_at = claims.expires_at
+    if account is None or expires_at <= datetime.now(timezone.utc):
+        raise _auth_exception("Sesi ini sudah tidak berlaku. Silakan login kembali.")
+    if not can_choose_login_mode(account):
+        raise _auth_exception("Pilihan mode login tidak tersedia untuk akun ini.", status_code=403)
+    previous = _access_refresh_session(db, account, claims)
+    _rotate_session_version(db, account, commit=False)
     remembered, raw = None, None
     if previous is not None:
-        remembered, raw = refresh_tokens.issue_session(db, account_user(admin), expires_at=previous.expires_at,
+        remembered, raw = refresh_tokens.issue_session(db, account, expires_at=previous.expires_at,
                                                       session_mode=request.login_as, sads_courses_verified=False)
         expires_at = min(expires_at, remembered.expires_at.replace(tzinfo=timezone.utc))
-    token = create_access_token(admin, session_mode=request.login_as, expires_at=expires_at,
+    token = create_access_token(account, session_mode=request.login_as, expires_at=expires_at,
                                 refresh_session_id=remembered.id if remembered else None)
     db.commit()
     remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
@@ -799,7 +817,7 @@ def select_login_mode(
     else:
         _clear_refresh_cookie(response)
     _set_session_cookie(response, token, max_age=remaining)
-    effective = user_for_login_mode(admin, request.login_as)
+    effective = user_for_login_mode(account, request.login_as)
     return _auth_response(effective, token, expires_at, session=remembered, refresh_raw=raw)
 
 

@@ -291,6 +291,23 @@ def test_another_admin_cannot_stop_or_recover_the_original_actors_session(contex
     assert me(context, body["token"])[0] == 200
 
 
+def test_impersonating_an_eligible_tester_cannot_switch_to_their_admin_mode(context, monkeypatch):
+    monkeypatch.setenv("SADS_TESTER_NIMS", NIM)
+    code, _, overlay = start(context)
+    assert code == 200
+
+    for credentials in (
+        {"authorization": "Bearer " + overlay["token"]},
+        {"cookies": overlay_cookies(context, overlay["token"])},
+    ):
+        code, _, body = request(context.app, "POST", "/api/auth/session-mode", **credentials,
+                               body={"login_as": "admin"})
+        assert code == 403 and "token" not in body
+
+    assert me(context, overlay["token"])[2]["role"] == "mahasiswa"
+    assert context.db.query(ImpersonationSession).one().ended_at is None
+
+
 def test_session_duration_is_capped_by_the_parent_admin_deadline(context):
     parent = auth.create_access_token(context.admin, expires_at=datetime.now(timezone.utc) + timedelta(minutes=3))
     code, _, body = start(context, token=parent)
