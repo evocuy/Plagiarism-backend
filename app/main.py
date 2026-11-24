@@ -14,8 +14,11 @@ from app.database.migrations import ensure_runtime_columns
 from app.services.request_limit_service import RequestLimitMiddleware
 from app.services.csrf_service import CsrfMiddleware, trusted_csrf_origins
 from app.services.error_service import ErrorHandlingMiddleware, sanitized_validation_error
+from app.services import pdf_storage
 
 auth.validate_auth_configuration()
+if pdf_storage.minio_enabled():
+    pdf_storage.get_minio_storage()
 
 # Buat tabel di PostgreSQL secara otomatis jika belum ada
 Base.metadata.create_all(bind=engine)

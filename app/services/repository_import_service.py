@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import shutil
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.schemas import Document, User, utc_now
+from app.services import pdf_storage
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_structure_service import DocumentStructureService
@@ -74,14 +76,12 @@ class RepositoryImportService:
         self.db.commit()
 
     def _managed_path(self, stored: str) -> Path | None:
-        candidate = Path(stored)
-        candidates = [candidate if candidate.is_absolute() else self.upload_dir.parent / candidate,
-                      self.upload_dir / candidate.name]
-        for path in candidates:
-            resolved = path.resolve()
-            if resolved.is_relative_to(self.upload_dir) and resolved.is_file():
-                return resolved
-        return None
+        return pdf_storage.managed_local_pdf(stored, self.upload_dir)
+
+    def _stored_pdf_exists(self, stored: str) -> bool:
+        if pdf_storage.is_minio_reference(stored):
+            return pdf_storage.get_minio_storage().exists(stored)
+        return self._managed_path(stored) is not None
 
     def _load_existing(self) -> None:
         # Lightweight columns only: never load the whole repository's NLP text.
@@ -92,10 +92,13 @@ class RepositoryImportService:
         backfilled, unavailable = 0, 0
         for identifier, stored, digest, kind, deleted_at in rows:
             if not digest:
-                path = self._managed_path(stored)
                 try:
-                    digest = pdf_identity(path, self.max_bytes)[0] if path else None
-                except (OSError, ImportInputError):
+                    source = (pdf_storage.get_minio_storage().materialize(stored)
+                              if pdf_storage.is_minio_reference(stored)
+                              else nullcontext(self._managed_path(stored)))
+                    with source as path:
+                        digest = pdf_identity(path, self.max_bytes)[0] if path else None
+                except (OSError, ImportInputError, pdf_storage.PDFStorageError):
                     digest = None
                 if not digest:
                     unavailable += 1
@@ -116,6 +119,26 @@ class RepositoryImportService:
     def _reserve_space(self, size: int) -> None:
         if shutil.disk_usage(self.upload_dir).free < self.min_free_bytes + size:
             raise ImportInputError("disk_space_low", "Ruang disk tidak mencukupi. Impor dihentikan; dokumen sebelumnya tetap tersimpan.")
+
+    def _store_pdf(self, candidate: ImportFile, digest: str, size: int, previous: str | None = None):
+        previous_is_object = pdf_storage.is_minio_reference(previous)
+        if previous_is_object or pdf_storage.minio_enabled():
+            self._reserve_space(0)
+            storage = pdf_storage.get_minio_storage()
+            reference = (previous if previous_is_object
+                         else storage.reference(f"repository/{candidate.document_type}/{digest}.pdf"))
+            with TemporaryDirectory(prefix="repository-import-") as directory:
+                staged = Path(directory) / "input.pdf"
+                copied = copy_pdf_atomically(candidate.path, staged, digest, self.max_bytes)
+                storage.upload(reference, staged)
+            return reference, copied
+
+        self._reserve_space(size)
+        target = (Path(previous) if previous else
+                  self.upload_dir / "repository" / candidate.document_type / f"{digest}.pdf").resolve()
+        if not target.is_relative_to(self.upload_dir):
+            raise ImportInputError("unsafe_storage_path", "Path dokumen lama perlu diperiksa pengelola.")
+        return str(target), copy_pdf_atomically(candidate.path, target, digest, self.max_bytes)
 
     def _process(self, candidate: ImportFile, *, with_embeddings: bool, position: int, total: int) -> dict:
         row = {"event": "file", "position": position, "total": total, "file": candidate.relative_path,
@@ -148,26 +171,17 @@ class RepositoryImportService:
                     and metadata.get("chunk_extraction_version") == PDF_EXTRACTION_VERSION):
                 validate_pdf(candidate, self.structure)
             if document is None:
-                self._reserve_space(size)
-                target = (self.upload_dir / "repository" / candidate.document_type / f"{digest}.pdf").resolve()
-                if not target.is_relative_to(self.upload_dir):
-                    raise ImportInputError("unsafe_storage_path", "Direktori penyimpanan repositori tidak valid.")
-                row["bytes_stored"] = copy_pdf_atomically(candidate.path, target, digest, self.max_bytes)
+                reference, row["bytes_stored"] = self._store_pdf(candidate, digest, size)
                 document = Document(title=candidate.path.name, document_type=candidate.document_type,
-                                    file_path=str(target), content_sha256=digest, source_origin="alumni",
+                                    file_path=reference, content_sha256=digest, source_origin="alumni",
                                     user_id=None, repository_status="draft")
                 self.db.add(document)
                 self.db.commit()
                 row.update(document_id=document.id, action="imported")
                 self.lookup[key] = (document.id, False)
                 self._checkpoint(document, "stored", input_file=candidate.relative_path)
-            elif self._managed_path(document.file_path) is None:
-                # Restore a missing copy only inside managed storage, with identical bytes.
-                target = Path(document.file_path).resolve()
-                if not target.is_relative_to(self.upload_dir):
-                    raise ImportInputError("unsafe_storage_path", "Path dokumen lama perlu diperiksa pengelola.")
-                self._reserve_space(size)
-                row["bytes_stored"] = copy_pdf_atomically(candidate.path, target, digest, self.max_bytes)
+            elif not self._stored_pdf_exists(document.file_path):
+                document.file_path, row["bytes_stored"] = self._store_pdf(candidate, digest, size, document.file_path)
             self.emit({**row, "event": "progress", "status": "processing", "stage": "extracting_and_chunking"})
             self.texts.get_or_extract_text(document, self.db)
             chunks = self.chunks.get_or_build_sentence_chunks(document, self.db)

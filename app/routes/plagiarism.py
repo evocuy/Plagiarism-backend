@@ -1,8 +1,6 @@
-import os
 from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends, Query, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload, selectinload
 from pydantic import BaseModel
@@ -16,6 +14,8 @@ from app.models.schemas import (
     User,
 )
 from app.services.pdf_service import PDFService
+from app.services.pdf_download import pdf_download
+from app.services.pdf_storage import pdf_available
 from app.services.check_queue_service import CheckQueueService
 from app.services.similarity_result_service import SimilarityResultService
 from app.services.watermark_service import WatermarkService
@@ -205,7 +205,7 @@ def get_check_history(
     for check in checks:
         doc = check.document
         doc_user = doc.user if doc and doc.user else (check.user if check.user else None)
-        has_highlighted = bool(check.status == "completed" and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path))
+        has_highlighted = check.status == "completed" and pdf_available(check.highlighted_file_path)
         results.append({
             "id": check.id,
             "document_id": check.document_id,
@@ -284,7 +284,7 @@ def _get_active_check(check_id: int, db: Session) -> Optional[PlagiarismCheck]:
 def _serialize_check_progress(check: PlagiarismCheck) -> dict:
     is_completed = check.status == "completed"
     has_highlighted_pdf = bool(
-        is_completed and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path)
+        is_completed and pdf_available(check.highlighted_file_path)
     )
     progress = 100 if is_completed else int(check.progress or 0)
     return {
@@ -426,7 +426,7 @@ def _serialize_check_final_result(
         else {}
     )
     highlighted_pdf_available = bool(
-        check.status == "completed" and check.highlighted_file_path and os.path.isfile(check.highlighted_file_path)
+        check.status == "completed" and pdf_available(check.highlighted_file_path)
     )
     is_completed = check.status == "completed"
 
@@ -576,6 +576,7 @@ def get_comparison_source_pdf(
     source_document_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     check = _get_active_check(check_id, db)
     if not check:
@@ -592,10 +593,9 @@ def get_comparison_source_pdf(
     if source_path is None:
         raise HTTPException(404, "PDF pembanding tidak tersedia untuk hasil ini.")
     watermarked_path = watermark_service.get_pdf(source_path)
-    return FileResponse(
-        watermarked_path, media_type="application/pdf",
-        filename=f"pembanding-{source_document_id}-watermark.pdf", content_disposition_type="inline",
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    return pdf_download(
+        watermarked_path, f"pembanding-{source_document_id}-watermark.pdf", request,
+        missing_detail="PDF pembanding tidak tersedia untuk hasil ini.",
     )
 
 
@@ -605,6 +605,7 @@ def download_highlighted_pdf(
     check_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     """
     Mengunduh / membuka langsung PDF hasil pengecekan yang sudah distabilo kuning.
@@ -625,14 +626,9 @@ def download_highlighted_pdf(
         )
 
     file_to_send = check.highlighted_file_path
-    if not file_to_send or not os.path.isfile(file_to_send):
-        raise HTTPException(status_code=404, detail="File PDF hasil tidak tersedia. Silakan ulangi pengecekan.", headers={"Cache-Control": "no-store"})
+    missing_detail = "File PDF hasil tidak tersedia. Silakan ulangi pengecekan."
+    if not pdf_available(file_to_send):
+        raise HTTPException(status_code=404, detail=missing_detail, headers={"Cache-Control": "no-store"})
 
     clean_filename = f"Hasil_Plagiasi_{Path(file_to_send).name}"
-    return FileResponse(
-        path=file_to_send,
-        media_type="application/pdf",
-        filename=clean_filename,
-        content_disposition_type="inline",
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
-    )
+    return pdf_download(file_to_send, clean_filename, request, missing_detail=missing_detail)

@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Optional, List
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from app.models.schemas import (
     utc_now,
 )
 from app.routes.auth import get_current_user, require_admin
+from app.services import pdf_storage
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_index_service import DocumentIndexService
@@ -123,11 +125,14 @@ def _validate_uploaded_filename(filename: Optional[str]) -> str:
 
 
 def _delete_managed_upload_file(file_path: Optional[str]) -> bool:
-    """Delete an artifact only when it belongs to this backend's upload directory."""
+    """Clean up an uncommitted PDF in this backend's storage."""
     if not file_path:
         return False
 
     try:
+        if pdf_storage.is_minio_reference(file_path):
+            pdf_storage.get_minio_storage().delete(file_path)
+            return True
         upload_root = UPLOAD_DIR.resolve()
         candidate = Path(file_path).resolve()
         if not candidate.is_relative_to(upload_root):
@@ -184,8 +189,12 @@ async def _store_uploaded_document(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Tipe dokumen harus berupa Skripsi atau Proposal.") from None
 
-    stored_filename = f"{uuid4().hex}_{original_filename}"
-    file_path = UPLOAD_DIR / stored_filename
+    use_minio = pdf_storage.minio_enabled()
+    upload_id = uuid4().hex
+    staging = TemporaryDirectory(prefix="pdf-upload-") if use_minio else None
+    file_path = Path(staging.name) / "input.pdf" if staging else UPLOAD_DIR / f"{upload_id}_{original_filename}"
+    stored_reference = None if use_minio else str(file_path)
+    db_doc = None
     total_bytes = 0
     content_digest = hashlib.sha256()
 
@@ -234,11 +243,16 @@ async def _store_uploaded_document(
         is_alumni_import = source_origin == "alumni" and user_id is None
         if not is_alumni_import:
             repository_status = REPOSITORY_STATUS_DRAFT
+        if use_minio:
+            storage = pdf_storage.get_minio_storage()
+            prefix = f"repository/{clean_type}" if is_alumni_import else "student-uploads"
+            stored_reference = storage.reference(f"{prefix}/{upload_id}.pdf")
+            await run_in_threadpool(storage.upload, stored_reference, file_path)
         db_doc = Document(
             user_id=user_id,
             title=original_filename,
             document_type=clean_type,
-            file_path=str(file_path),
+            file_path=stored_reference,
             content_sha256=content_digest.hexdigest(),
             source_origin="alumni" if is_alumni_import else "student",
             repository_status=repository_status,
@@ -252,14 +266,22 @@ async def _store_uploaded_document(
         db.commit()
         db.refresh(db_doc)
         return db_doc
-    except Exception:
+    except Exception as exc:
         db.rollback()
         try:
-            if file_path.exists():
-                file_path.unlink()
-        except OSError as cleanup_error:
+            persisted = db_doc is not None and db.query(Document.id).filter(
+                Document.file_path == stored_reference,
+            ).first()
+            if not persisted:
+                await run_in_threadpool(_delete_managed_upload_file, stored_reference)
+        except Exception as cleanup_error:
             report_error(cleanup_error, DELETE_ERROR, operation="cleanup_rejected_upload")
+        if isinstance(exc, pdf_storage.PDFStorageError):
+            raise HTTPException(503, "Penyimpanan PDF sementara tidak dapat diakses.") from None
         raise
+    finally:
+        if staging is not None:
+            staging.cleanup()
 
 @router.post("/upload")
 async def upload_document(
@@ -406,10 +428,11 @@ async def upload_and_check_document(
         db=db,
     )
 
+    document_id, stored_reference = db_doc.id, db_doc.file_path
     try:
         check_record, queue_position = queue_service.enqueue(
             db=db,
-            document_id=db_doc.id,
+            document_id=document_id,
             user_id=effective_user_id,
             candidate_limit=candidate_limit,
             auto_index_embeddings=(
@@ -418,17 +441,11 @@ async def upload_and_check_document(
             auto_index_repository_limit=auto_index_repository_limit,
         )
     except Exception:
-        stored_file_path = Path(db_doc.file_path)
         db.rollback()
-        try:
+        if not db.query(PlagiarismCheck.id).filter(PlagiarismCheck.document_id == document_id).first():
             db.delete(db_doc)
             db.commit()
-        finally:
-            try:
-                if stored_file_path.exists():
-                    stored_file_path.unlink()
-            except OSError as cleanup_error:
-                report_error(cleanup_error, DELETE_ERROR, operation="cleanup_rejected_check")
+            await run_in_threadpool(_delete_managed_upload_file, stored_reference)
         raise
 
     return {

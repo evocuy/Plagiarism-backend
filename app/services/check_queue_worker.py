@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable, Optional
 
 from sqlalchemy import func
@@ -176,14 +177,16 @@ class CheckQueueWorker:
     def _run_isolated_job(self, job: dict) -> None:
         """Enforce a real wall-clock deadline, even for stuck native PDF code."""
         try:
-            subprocess.run(
-                [sys.executable, "-m", "app.workers.check_job", json.dumps(job)],
-                stdin=subprocess.DEVNULL,
-                timeout=self.job_timeout,
-                check=True,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                cwd=str(Path(__file__).resolve().parents[2]),
-            )
+            with TemporaryDirectory(prefix="check-job-") as directory:
+                subprocess.run(
+                    [sys.executable, "-m", "app.workers.check_job", json.dumps(job)],
+                    stdin=subprocess.DEVNULL,
+                    timeout=self.job_timeout,
+                    check=True,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                         "TMPDIR": directory, "TEMP": directory, "TMP": directory},
+                    cwd=str(Path(__file__).resolve().parents[2]),
+                )
             message = "Proses pemeriksaan terhenti sebelum hasil selesai disimpan. Silakan coba lagi."
         except subprocess.TimeoutExpired:
             logger.warning("Check %s dihentikan setelah melewati batas waktu.", job["check_id"])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import threading
 import pymupdf
 from fastapi import HTTPException
 
+from app.services import pdf_storage
 from app.services.pdf_limits import positive_int_setting
 from app.services.pdf_service import PDFService, UPLOAD_DIR
 
@@ -58,7 +60,9 @@ class WatermarkService:
         self.timeout = positive_int_setting("WATERMARK_TIMEOUT_SECONDS", 120)
         self.slots = threading.BoundedSemaphore(positive_int_setting("WATERMARK_MAX_CONCURRENT", 2))
 
-    def resolve_source(self, stored_path: str) -> Path | None:
+    def resolve_source(self, stored_path: str) -> Path | str | None:
+        if pdf_storage.is_minio_reference(stored_path):
+            return stored_path
         candidate = Path(stored_path).resolve()
         if not candidate.is_file():
             candidate = (self.upload_dir / Path(stored_path).name).resolve()
@@ -66,9 +70,21 @@ class WatermarkService:
             return None
         return candidate
 
-    def get_pdf(self, source: Path) -> Path:
+    def get_pdf(self, source: Path | str) -> Path | str:
         if not self.slots.acquire(blocking=False):
             raise HTTPException(503, "Pembuatan PDF sedang penuh. Silakan coba lagi.", headers={"Retry-After": "5"})
+        with ExitStack() as stack:
+            stack.callback(self.slots.release)
+            if pdf_storage.is_minio_reference(source):
+                try:
+                    source = stack.enter_context(pdf_storage.get_minio_storage().materialize(source))
+                except FileNotFoundError:
+                    raise HTTPException(404, "PDF pembanding tidak tersedia untuk hasil ini.") from None
+                except pdf_storage.PDFStorageError:
+                    raise HTTPException(503, "PDF pembanding sementara tidak dapat disiapkan.") from None
+            return self._get_cached_pdf(Path(source))
+
+    def _get_cached_pdf(self, source: Path) -> Path | str:
         temporary_path = None
         try:
             digest = hashlib.sha256(WATERMARK_VERSION)
@@ -76,11 +92,19 @@ class WatermarkService:
             with source.open("rb") as original:
                 for chunk in iter(lambda: original.read(1024 * 1024), b""):
                     digest.update(chunk)
-            directory = self.upload_dir / "watermarked"
-            directory.mkdir(exist_ok=True)
-            output = directory / f"{digest.hexdigest()}.pdf"
-            if output.is_file():
-                return output
+            filename = f"{digest.hexdigest()}.pdf"
+            storage = pdf_storage.get_minio_storage() if pdf_storage.minio_enabled() else None
+            if storage is not None:
+                directory = None
+                output = storage.reference(f"watermark-cache/{filename}")
+                if storage.exists(output):
+                    return output
+            else:
+                directory = self.upload_dir / "watermarked"
+                directory.mkdir(exist_ok=True)
+                output = directory / filename
+                if output.is_file():
+                    return output
             # Unique temporary files + atomic replace prevent serving partial
             # PDFs when two requests first generate the same source at once.
             handle, temporary = tempfile.mkstemp(suffix=".pdf", dir=directory)
@@ -94,13 +118,15 @@ class WatermarkService:
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 cwd=str(Path(__file__).resolve().parents[2]),
             )
-            os.replace(temporary_path, output)
+            if storage is not None:
+                storage.upload(output, temporary_path)
+            else:
+                os.replace(temporary_path, output)
             return output
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "Pembuatan PDF melewati batas waktu. Silakan coba lagi.") from None
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (OSError, subprocess.SubprocessError, ValueError, pdf_storage.PDFStorageError):
             raise HTTPException(503, "PDF pembanding sementara tidak dapat disiapkan.") from None
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-            self.slots.release()

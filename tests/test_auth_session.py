@@ -47,16 +47,20 @@ def request(app, method, path, *, authorization=None, cookie=None, cookies=None,
     }
     events = []
     sent_request = False
+    response_finished = asyncio.Event()
 
     async def receive():
         nonlocal sent_request
         if not sent_request:
             sent_request = True
             return {"type": "http.request", "body": body_bytes, "more_body": False}
+        await response_finished.wait()
         return {"type": "http.disconnect"}
 
     async def send(event):
         events.append(event)
+        if event["type"] == "http.response.body" and not event.get("more_body"):
+            response_finished.set()
 
     asyncio.run(app(scope, receive, send))
     start = next(event for event in events if event["type"] == "http.response.start")

@@ -1,8 +1,12 @@
+import hashlib
 import re
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, Any, List, Optional
 import pymupdf
 
+from app.services import pdf_storage
 from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / 'uploads'
@@ -120,6 +124,18 @@ class PDFService:
         if fallback.exists() and fallback.is_file():
             return fallback
         return p
+
+    @contextmanager
+    def _open_pdf(self, reference: str):
+        if pdf_storage.is_minio_reference(reference):
+            source = pdf_storage.get_minio_storage().materialize(reference)
+        else:
+            source = nullcontext(self._resolve_path(reference))
+        with source as path:
+            if not path.is_file():
+                raise FileNotFoundError(f"File PDF tidak ditemukan: {path}")
+            with pymupdf.open(str(path)) as document:
+                yield document
 
     def _is_table_of_contents_page(self, text: str) -> bool:
         text_upper = text.upper()
@@ -323,11 +339,7 @@ class PDFService:
         return self.detect_content_pages(doc, document_type="skripsi")
 
     def extract_text_from_pdf(self, file_path: str, filter_bab: bool = True, document_type: str = "skripsi") -> Dict[str, Any]:
-        resolved_path = self._resolve_path(file_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
-
-        with pymupdf.open(str(resolved_path)) as doc:
+        with self._open_pdf(file_path) as doc:
             total_pages = len(doc)
             page_texts = self._read_page_texts(doc)
             start_page = 0
@@ -408,15 +420,24 @@ class PDFService:
         return sentences_info
 
     def generate_highlighted_pdf(self, source_pdf_path: str, plagiarized_sentences: list, output_filename: str) -> str:
-        resolved_path = self._resolve_path(source_pdf_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f'File PDF tidak ditemukan: {resolved_path}')
+        if pdf_storage.minio_enabled():
+            storage = pdf_storage.get_minio_storage()
+            digest = hashlib.sha256(output_filename.encode("utf-8")).hexdigest()
+            reference = storage.reference(f"highlights/{digest}.pdf")
+            with TemporaryDirectory(prefix="highlight-pdf-") as directory:
+                output_path = Path(directory) / "highlight.pdf"
+                self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, output_path)
+                storage.upload(reference, output_path)
+            return reference
 
         highlight_dir = UPLOAD_DIR / 'highlighted'
         highlight_dir.mkdir(parents=True, exist_ok=True)
         output_path = highlight_dir / output_filename
+        self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, output_path)
+        return str(output_path)
 
-        with pymupdf.open(str(resolved_path)) as doc:
+    def _write_highlighted_pdf(self, source: str, plagiarized_sentences: list, output_path: Path) -> None:
+        with self._open_pdf(source) as doc:
             self._read_page_texts(doc)
             layouts = {}
             body_chars = 0
@@ -472,8 +493,6 @@ class PDFService:
                 for rect in rectangles_by_line.values():
                     self._add_highlight(page, rect)
             doc.save(str(output_path))
-
-        return str(output_path)
 
     def _add_highlight(self, page, rect) -> None:
         try:
