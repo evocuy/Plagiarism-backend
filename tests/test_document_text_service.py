@@ -27,7 +27,7 @@ class FakeDb:
     def commit(self):
         self.commits += 1
 
-    def refresh(self, _item):
+    def refresh(self, _item, **_options):
         pass
 
 

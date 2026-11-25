@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 from contextlib import contextmanager
 from functools import lru_cache
@@ -10,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from minio import Minio
-from minio.error import MinioException, S3Error
+from minio.error import InvalidResponseError, MinioException, S3Error
 from minio.helpers import check_bucket_name
 from urllib3 import PoolManager, Retry, Timeout
 from urllib3.exceptions import HTTPError
@@ -23,6 +24,32 @@ CHUNK_SIZE = 1024 * 1024
 
 class PDFStorageError(RuntimeError):
     """Storage is unavailable or the object reference is invalid."""
+
+    def __init__(self, message: str, *, operation: str | None = None):
+        super().__init__(message)
+        self.operation = operation
+
+    def diagnostic(self) -> dict[str, str | int]:
+        """Return operator-safe fields for the CLI, without the SDK message."""
+        result: dict[str, str | int] = {}
+        if self.operation is not None:
+            result["storage_operation"] = self.operation
+        cause = self.__context__
+        if cause is None:
+            return result
+
+        result["storage_error_type"] = type(cause).__name__
+        if isinstance(cause, S3Error) and cause.code and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", cause.code):
+            result["s3_code"] = cause.code
+        status = getattr(getattr(cause, "response", None), "status", None)
+        if status is None:
+            # The pinned MinIO SDK stores the non-S3 response's status in _code.
+            status = cause._code if isinstance(cause, InvalidResponseError) else getattr(cause, "status_code", None)
+        if isinstance(status, int) and 100 <= status <= 599:
+            result["http_status"] = status
+        if reason := getattr(cause, "reason", None):
+            result["transport_error_type"] = type(reason).__name__
+        return result
 
 
 class PDFRangeError(PDFStorageError):
@@ -70,7 +97,7 @@ def file_identity(path: Path) -> tuple[int, str]:
 
 
 @contextmanager
-def _storage_errors():
+def _storage_errors(operation: str):
     try:
         yield
     except S3Error as exc:
@@ -78,9 +105,9 @@ def _storage_errors():
             raise FileNotFoundError("PDF tidak ditemukan di penyimpanan.") from None
         if exc.code == "InvalidRange":
             raise PDFRangeError("Rentang byte PDF tidak tersedia.") from None
-        raise PDFStorageError("Penyimpanan PDF sementara tidak dapat diakses.") from None
+        raise PDFStorageError("Penyimpanan PDF sementara tidak dapat diakses.", operation=operation) from None
     except (MinioException, HTTPError, OSError, ValueError):
-        raise PDFStorageError("Penyimpanan PDF sementara tidak dapat diakses.") from None
+        raise PDFStorageError("Penyimpanan PDF sementara tidak dapat diakses.", operation=operation) from None
 
 
 def close_object(response) -> None:
@@ -110,14 +137,14 @@ class MinioPDFStorage:
 
     def upload(self, reference: str, path: Path) -> None:
         key = self.object_key(reference)
-        with _storage_errors():
+        with _storage_errors("put_object"):
             self.client.fput_object(self.bucket, key, str(path), content_type="application/pdf",
                                     num_parallel_uploads=1)
 
     def exists(self, reference: str) -> bool:
         key = self.object_key(reference)
         try:
-            with _storage_errors():
+            with _storage_errors("head_object"):
                 self.client.stat_object(self.bucket, key)
             return True
         except FileNotFoundError:
@@ -125,12 +152,12 @@ class MinioPDFStorage:
 
     def delete(self, reference: str) -> None:
         key = self.object_key(reference)
-        with _storage_errors():
+        with _storage_errors("delete_object"):
             self.client.remove_object(self.bucket, key)
 
     def open(self, reference: str, byte_range: str | None = None):
         key = self.object_key(reference)
-        with _storage_errors():
+        with _storage_errors("get_object"):
             return self.client.get_object(
                 self.bucket, key, request_headers={"Range": byte_range} if byte_range else None,
             )
@@ -139,7 +166,7 @@ class MinioPDFStorage:
     def _read(self, reference: str):
         response = self.open(reference)
         try:
-            with _storage_errors():
+            with _storage_errors("read_object_body"):
                 yield response
         finally:
             close_object(response)

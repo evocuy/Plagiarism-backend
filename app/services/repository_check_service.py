@@ -840,7 +840,9 @@ class RepositoryCheckService:
         plagiarized_sentences: Iterable[Dict[str, Any]],
         db: Session,
     ) -> str:
-        output_filename = f"highlighted_check_{check_record.id}_{Path(target_doc.file_path).stem}.pdf"
+        # A detached attempt must never overwrite a later attempt's PDF.
+        attempt = f"_attempt_{check_record.attempt_count}" if check_record.attempt_count else ""
+        output_filename = f"highlighted_check_{check_record.id}{attempt}_{Path(target_doc.file_path).stem}.pdf"
         highlighted_file = self.pdf_service.generate_highlighted_pdf(
             source_pdf_path=target_doc.file_path,
             plagiarized_sentences=plagiarized_sentences,

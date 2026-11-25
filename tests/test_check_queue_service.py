@@ -1,15 +1,20 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from threading import Event
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.session import Base
 from app.models.schemas import Document, PlagiarismCheck, User, utc_now
+from app.services.check_job_lock import hold_check_job
 from app.services.check_queue_service import CheckQueueService, CheckQueueSettings
 from app.services.check_queue_worker import CheckQueueWorker
+from app.workers import check_job
+from test_repository_import_postgresql import postgres
 
 
 def _make_session_factory():
@@ -392,3 +397,100 @@ def test_worker_deadline_marks_failed_and_allows_next_job(monkeypatch):
     assert [invocation["timeout"] for invocation in invocations] == [30, 30]
     assert worker.process_next() is False
     engine.dispose()
+
+
+def test_postgresql_another_worker_recovers_only_unowned_checks(postgres):
+    factory = sessionmaker(bind=postgres)
+    now = utc_now()
+    with factory() as db:
+        user = User(identifier="queue-student", password="hash", role="mahasiswa")
+        db.add(user)
+        db.flush()
+        first = _add_check(db, _add_document(db, user, "first.pdf"), user, status="pending",
+                           queued_at=now - timedelta(seconds=1))
+        second = _add_check(db, _add_document(db, user, "second.pdf"), user, status="pending", queued_at=now)
+        first_id, second_id = first.id, second.id
+        db.commit()
+
+    claimed, release = Event(), Event()
+
+    def wait_for_second_worker(**job):
+        assert job["check_id"] == first_id
+        claimed.set()
+        assert release.wait(10)
+
+    processed = []
+    first_worker = CheckQueueWorker(session_factory=factory, runner=wait_for_second_worker,
+                                    now_provider=lambda: now - timedelta(hours=1))
+    second_worker = CheckQueueWorker(session_factory=factory, runner=lambda **job: processed.append(job["check_id"]),
+                                     now_provider=lambda: now)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_run = pool.submit(first_worker.process_next)
+        try:
+            assert claimed.wait(10)
+            with factory() as db:
+                assert second_worker.recover_stale_checks(db, force=True) == 0
+                assert second_worker.recover_stale_checks(db) == 0
+            assert second_worker.process_next()
+            assert processed == [second_id]
+            with factory() as db:
+                active = db.get(PlagiarismCheck, first_id)
+                assert active.status == "processing" and active.attempt_count == 1
+        finally:
+            release.set()
+        assert first_run.result(timeout=10)
+
+    with factory() as db:
+        assert second_worker.recover_stale_checks(db) == 1
+        assert db.get(PlagiarismCheck, first_id).status == "pending"
+
+
+def test_postgresql_child_keeps_ownership_and_a_late_attempt_is_ignored(postgres, monkeypatch):
+    factory = sessionmaker(bind=postgres)
+    now = utc_now()
+    with factory() as db:
+        user = User(identifier="child-only-worker", password="hash", role="mahasiswa")
+        db.add(user)
+        db.flush()
+        document = _add_document(db, user)
+        check = _add_check(db, document, user, status="processing", heartbeat_at=now, attempt_count=1)
+        job = {"check_id": check.id, "document_id": document.id, "attempt_count": 1, "reference_document_id": None}
+        db.commit()
+
+    running, release = Event(), Event()
+    runs = []
+
+    def run_child(**kwargs):
+        runs.append(kwargs["check_id"])
+        running.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(check_job, "run_repository_check_in_background", run_child)
+    worker = CheckQueueWorker(session_factory=factory, runner=lambda **_: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        child = pool.submit(check_job.run_claimed_job, job, session_factory=factory)
+        try:
+            assert running.wait(10)
+            with factory() as db:
+                assert worker.recover_stale_checks(db, force=True) == 0
+        finally:
+            release.set()
+        child.result(timeout=10)
+
+    with factory() as db:
+        assert worker.recover_stale_checks(db, force=True) == 1
+    assert worker.process_next()
+    check_job.run_claimed_job(job, session_factory=factory)
+    assert runs == [job["check_id"]]
+    with factory() as db:
+        check = db.get(PlagiarismCheck, job["check_id"])
+        assert check.status == "processing" and check.attempt_count == 2
+
+
+def test_postgresql_job_connection_cannot_write_after_reconnect(postgres):
+    with hold_check_job(postgres, 1) as connection:
+        assert connection.scalar(select(1)) == 1
+        connection.rollback()
+        connection.invalidate()
+        with pytest.raises(RuntimeError, match="lost its PostgreSQL connection"):
+            connection.scalar(select(1))

@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from threading import Barrier
 
 import pytest
 from sqlalchemy import create_engine
@@ -8,6 +10,7 @@ from app.database.session import Base
 from app.models.schemas import Document, DocumentChunk
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.pdf_service import PDF_EXTRACTION_VERSION
+from test_repository_import_postgresql import postgres
 
 
 class FakePdfService:
@@ -33,6 +36,44 @@ class FakePdfService:
 class FakeSimilarityService:
     def clean_text(self, text):
         return text.lower().replace(".", "")
+
+
+def test_postgresql_workers_only_replace_a_shared_chunk_cache_once(postgres, monkeypatch):
+    factory = sessionmaker(bind=postgres)
+    with factory() as db:
+        document = Document(title="shared.pdf", file_path="shared.pdf", document_type="proposal")
+        db.add(document)
+        db.flush()
+        document_id = document.id
+        db.commit()
+
+    barrier = Barrier(2)
+
+    class ConcurrentExtraction(FakePdfService):
+        def extract_sentences_with_pages(self, file_path, document_type):
+            barrier.wait(timeout=10)
+            return super().extract_sentences_with_pages(file_path, document_type)
+
+    service = DocumentChunkService(pdf_service=ConcurrentExtraction(), similarity_service=FakeSimilarityService())
+    replacements = []
+    delete_existing = service._delete_existing_chunks
+
+    def count_replacement(document, db):
+        replacements.append(document.id)
+        delete_existing(document, db)
+
+    monkeypatch.setattr(service, "_delete_existing_chunks", count_replacement)
+
+    def build_cache():
+        with factory() as db:
+            return service.get_or_build_sentence_chunks(db.get(Document, document_id), db)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(build_cache), pool.submit(build_cache)
+        assert first.result(timeout=20) == second.result(timeout=20)
+    with factory() as db:
+        assert replacements == [document_id]
+        assert db.query(DocumentChunk).filter_by(document_id=document_id).count() == 2
 
 
 def _make_session():

@@ -238,7 +238,8 @@ def main(argv=None) -> int:
         _print({"event": "interrupted", "message": "Jalankan ulang untuk melanjutkan migrasi."})
         return 130
     except Exception as exc:
-        _print({"event": "error", "error_type": type(exc).__name__,
+        detail = exc.diagnostic() if isinstance(exc, pdf_storage.PDFStorageError) else {}
+        _print({"event": "error", "error_type": type(exc).__name__, **detail,
                 "message": "Migrasi tidak dapat dijalankan. Periksa koneksi database, konfigurasi MinIO, dan report."})
         return 2
 

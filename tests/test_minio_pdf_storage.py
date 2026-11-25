@@ -144,6 +144,24 @@ def test_remote_highlight_keeps_owner_checks_and_range(highlight_context, storag
     assert get_pdf(context, "highlighted-pdf", user=context.owner)[0] == 404
 
 
+def test_storage_error_keeps_safe_diagnostics_for_operators(tmp_path, storage, monkeypatch):
+    def deny(*args, **kwargs):
+        raise S3Error(SimpleNamespace(status=403), "AccessDenied", "synthetic internal detail",
+                      "/private-object", "synthetic-request-id", None)
+
+    monkeypatch.setattr(storage.client, "fput_object", deny)
+    path = make_pdf(tmp_path / "source.pdf")
+    with pytest.raises(pdf_storage.PDFStorageError) as error:
+        storage.upload(storage.reference("repository/proposal/example.pdf"), path)
+    assert error.value.diagnostic() == {
+        "storage_operation": "put_object",
+        "storage_error_type": "S3Error",
+        "s3_code": "AccessDenied",
+        "http_status": 403,
+    }
+    assert "synthetic internal detail" not in str(error.value)
+
+
 def test_migration_verifies_references_before_cleaning_local_files(tmp_path, storage, db):
     source = make_pdf(tmp_path / "repository" / "proposal" / "source.pdf")
     highlight = make_pdf(tmp_path / "highlighted" / "result.pdf")

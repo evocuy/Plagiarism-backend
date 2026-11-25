@@ -34,6 +34,8 @@ class DocumentTextService:
             )
             cleaned_text = self.similarity_service.clean_text(extracted["full_text"])
 
+            # Keep metadata that a concurrent chunk build already committed.
+            db.refresh(document, attribute_names=["extraction_metadata"], with_for_update=True)
             document.extracted_text = extracted["full_text"]
             document.cleaned_text = cleaned_text
             document.extraction_metadata = {

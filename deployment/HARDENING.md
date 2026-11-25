@@ -30,7 +30,10 @@ automatic trust in forwarded headers.
    admin `cihuy` already exists. No sample accounts or passwords are created.
 6. Validate with `docker compose config --quiet`, build the API/worker images,
    and recreate the affected services using the existing project and volumes.
-   Do not run `down -v`. Start exactly one worker after the API is healthy.
+   Start the check worker after the API is healthy. When updating from an older
+   release, stop the old worker before starting the new one. Bring every
+   worker that shares the queue onto this release before adding another.
+   Do not run `down -v`.
 7. Verify the public health endpoint, authenticated access, a bounded login
    throttle test, and document upload/check behavior. Keep the prior images and
    backups for rollback. Use the deployment's existing `backend.service` only

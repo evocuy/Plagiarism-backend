@@ -63,10 +63,18 @@ class DocumentChunkService:
             )
 
         try:
+            # Workers can extract the same source concurrently. Recheck under
+            # the document row lock before deleting or inserting its chunks.
+            db.refresh(document, attribute_names=["extraction_metadata"], with_for_update=True)
+            metadata = document.extraction_metadata or {}
+            if not refresh_cache and metadata.get("chunk_extraction_version") == PDF_EXTRACTION_VERSION:
+                chunks = self._format_chunks(self._get_existing_chunks(document, db))
+                db.commit()
+                return chunks
             self._delete_existing_chunks(document, db)
             db.add_all(chunk_records)
             document.extraction_metadata = {
-                **(document.extraction_metadata or {}),
+                **metadata,
                 "chunk_extraction_version": PDF_EXTRACTION_VERSION,
             }
             db.add(document)
