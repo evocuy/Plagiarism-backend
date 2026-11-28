@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -16,9 +15,11 @@ from app.models.schemas import (
     Document,
     PlagiarismCheck,
     REPOSITORY_STATUS_PUBLISHED,
+    SimilarityMatch,
     SimilarityResult,
     utc_now,
 )
+from app.services import pdf_storage
 from app.services.document_chunk_service import DocumentChunkService
 from app.services.document_embedding_service import DocumentEmbeddingService
 from app.services.document_text_service import DocumentTextService
@@ -241,7 +242,7 @@ class RepositoryCheckService:
                     "total_plagiarized_sentences": 0,
                     "highlight_summary": self.similarity_result_service.summarize_highlight_matches([]),
                     "message": "Dokumen berhasil disimpan. Belum ada dokumen lain di repositori kampus untuk dibandingkan.",
-                    "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
+                    "highlighted_pdf_available": pdf_storage.pdf_available(highlighted_file),
                     "chapter_validation": target_data.get("chapter_validation"),
                 }
 
@@ -409,7 +410,7 @@ class RepositoryCheckService:
                 "matches": results,
                 "total_plagiarized_sentences": len(plagiarized_sentences),
                 "highlight_summary": highlight_summary,
-                "highlighted_pdf_available": bool(highlighted_file and os.path.exists(highlighted_file)),
+                "highlighted_pdf_available": pdf_storage.pdf_available(highlighted_file),
                 "chapter_validation": target_data.get("chapter_validation"),
             }
         except Exception as exc:
@@ -592,9 +593,7 @@ class RepositoryCheckService:
                 "status": check_record.status,
                 "total_plagiarized_sentences": len(plagiarized_sentences),
                 "highlight_summary": highlight_summary,
-                "highlighted_pdf_available": bool(
-                    highlighted_file and os.path.exists(highlighted_file)
-                ),
+                "highlighted_pdf_available": pdf_storage.pdf_available(highlighted_file),
                 "chapter_validation": target_data.get("chapter_validation"),
             }
         except Exception as exc:
@@ -831,6 +830,53 @@ class RepositoryCheckService:
             "total_failed": 0,
             "reason": reason,
         }
+
+    def repair_highlighted_pdf(self, check_id: int, db: Session) -> str:
+        """Regenerate a missing artifact from an existing completed check."""
+        check = (
+            db.query(PlagiarismCheck)
+            .join(Document, Document.id == PlagiarismCheck.document_id)
+            .filter(PlagiarismCheck.id == check_id, Document.deleted_at.is_(None))
+            .with_for_update(of=(PlagiarismCheck, Document))
+            .one_or_none()
+        )
+        if check is None:
+            return "not_found"
+        if check.status != "completed":
+            return "not_completed"
+
+        reference = check.highlighted_file_path
+        if pdf_storage.is_minio_reference(reference):
+            available = pdf_storage.get_minio_storage().exists(reference)
+        else:
+            available = pdf_storage.pdf_available(reference)
+        if available:
+            return "already_available"
+
+        stored_matches = (
+            db.query(
+                SimilarityMatch.submitted_text,
+                SimilarityMatch.page_number,
+                SimilarityMatch.page_start_position,
+                SimilarityMatch.page_end_position,
+            )
+            .join(SimilarityResult, SimilarityResult.id == SimilarityMatch.result_id)
+            .filter(SimilarityResult.check_id == check_id)
+            .order_by(SimilarityMatch.id)
+        )
+        matches = ({
+            "sentence": match.submitted_text,
+            "page": match.page_number,
+            "page_start_position": match.page_start_position,
+            "page_end_position": match.page_end_position,
+        } for match in stored_matches)
+        self._generate_highlighted_pdf(
+            check_record=check,
+            target_doc=check.document,
+            plagiarized_sentences=self._deduplicate_visual_highlight_matches(matches),
+            db=db,
+        )
+        return "repaired"
 
     def _generate_highlighted_pdf(
         self,

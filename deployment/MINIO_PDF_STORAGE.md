@@ -25,6 +25,11 @@ MINIO_BUCKET=
 `MINIO_ENABLED` memilih tujuan file baru. Referensi file lama dan MinIO dapat
 dibaca selama transisi. Frontend mengakses PDF melalui FastAPI.
 
+Jika PUT atau verifikasi PDF highlight gagal, worker menyimpan hasil render
+di `uploads/highlighted/`. API dan worker memakai volume `uploads` yang sama
+agar PDF tetap tersedia dari Riwayat. Salinan tersebut dapat dimigrasikan
+dengan command migrasi yang sama setelah koneksi MinIO pulih.
+
 ## Aktifkan versi backend yang mendukung MinIO
 
 Setelah commit tersedia di GitHub, jalankan dari folder backend di VM. Tunggu
@@ -36,6 +41,17 @@ sudo docker compose -p backend build backend check-worker &&
 sudo docker compose -p backend stop check-worker &&
 sudo docker compose -p backend up -d --no-deps --no-build --wait --wait-timeout 120 backend &&
 sudo docker compose -p backend up -d --no-deps --no-build check-worker
+```
+
+## Pulihkan PDF highlight yang hilang
+
+Gunakan ID pengecekan yang sudah selesai, misalnya `123` dan `124`. Command ini
+membuat ulang PDF dari kecocokan yang tersimpan agar skor dan hasil cek tetap
+dipertahankan. Status `already_available` berarti PDF tersebut sudah tersedia.
+
+```bash
+sudo docker compose -p backend run --rm --no-deps -T backend \
+  python -m app.workers.repair_highlighted_pdfs 123 124
 ```
 
 ## Salin dan alihkan PDF lama

@@ -1,5 +1,7 @@
 import hashlib
+import logging
 import re
+import shutil
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +13,7 @@ from app.services.pdf_limits import PDFLimitExceeded, PDFProcessingLimits
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / 'uploads'
 PDF_EXTRACTION_VERSION = 3
+logger = logging.getLogger(__name__)
 
 class PDFService:
     # Only whole structural lines are ignored. These words inside ordinary
@@ -420,21 +423,41 @@ class PDFService:
         return sentences_info
 
     def generate_highlighted_pdf(self, source_pdf_path: str, plagiarized_sentences: list, output_filename: str) -> str:
-        if pdf_storage.minio_enabled():
-            storage = pdf_storage.get_minio_storage()
-            digest = hashlib.sha256(output_filename.encode("utf-8")).hexdigest()
-            reference = storage.reference(f"highlights/{digest}.pdf")
-            with TemporaryDirectory(prefix="highlight-pdf-") as directory:
-                output_path = Path(directory) / "highlight.pdf"
-                self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, output_path)
-                storage.upload(reference, output_path)
-            return reference
+        highlight_dir = UPLOAD_DIR / "highlighted"
+        local_path = highlight_dir / output_filename
+        if not pdf_storage.minio_enabled():
+            highlight_dir.mkdir(parents=True, exist_ok=True)
+            self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, local_path)
+            return str(local_path)
 
-        highlight_dir = UPLOAD_DIR / 'highlighted'
-        highlight_dir.mkdir(parents=True, exist_ok=True)
-        output_path = highlight_dir / output_filename
-        self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, output_path)
-        return str(output_path)
+        storage = pdf_storage.get_minio_storage()
+        object_digest = hashlib.sha256(output_filename.encode("utf-8")).hexdigest()
+        reference = storage.reference(f"highlights/{object_digest}.pdf")
+        with TemporaryDirectory(prefix="highlight-pdf-") as directory:
+            rendered_path = Path(directory) / "highlight.pdf"
+            self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, rendered_path)
+            size, digest = pdf_storage.file_identity(rendered_path)
+            try:
+                storage.upload(reference, rendered_path)
+                if not storage.verify(reference, size, digest):
+                    raise pdf_storage.PDFStorageError(
+                        "Salinan PDF highlight tidak sesuai.", operation="verify_highlight",
+                    )
+                return reference
+            except (pdf_storage.PDFStorageError, FileNotFoundError) as exc:
+                detail = exc.diagnostic() if isinstance(exc, pdf_storage.PDFStorageError) else {}
+                logger.warning("operation=highlight_minio_fallback exception_type=%s storage_detail=%s",
+                               type(exc).__name__, detail)
+
+            # Stage the copy on the shared volume so publishing it is atomic,
+            # even when the worker renders into a separate tmpfs.
+            highlight_dir.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(prefix=".highlight-copy-", dir=highlight_dir) as directory:
+                staged = Path(directory) / "highlight.pdf"
+                shutil.copyfile(rendered_path, staged)
+                staged.chmod(0o600)
+                staged.replace(local_path)
+        return str(local_path)
 
     def _write_highlighted_pdf(self, source: str, plagiarized_sentences: list, output_path: Path) -> None:
         with self._open_pdf(source) as doc:

@@ -10,11 +10,12 @@ from minio.error import S3Error
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.datastructures import Headers
+from urllib3.exceptions import ProtocolError
 
 from app.database.session import Base
-from app.models.schemas import Document, PlagiarismCheck, User
-from app.routes import documents
-from app.services import pdf_storage
+from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User, utc_now
+from app.routes import documents, plagiarism
+from app.services import pdf_service, pdf_storage
 from app.services.repository_check_service import RepositoryCheckService
 from app.services.repository_import_files import discover_pdfs
 from app.services.repository_import_service import RepositoryImportService
@@ -84,7 +85,8 @@ def db():
     engine.dispose()
 
 
-def test_new_upload_import_check_and_watermark_use_minio(tmp_path, monkeypatch, storage, db):
+@pytest.mark.parametrize("highlight_upload", ["ok", "reset", "object_missing"])
+def test_upload_import_check_and_watermark_storage(tmp_path, monkeypatch, storage, db, highlight_upload):
     uploads = tmp_path / "uploads"
     uploads.mkdir()
     source = make_pdf(tmp_path / "inbox" / "proposal" / "alumni.pdf")
@@ -95,6 +97,18 @@ def test_new_upload_import_check_and_watermark_use_minio(tmp_path, monkeypatch, 
     structure = InlineStructure()
     monkeypatch.setattr(documents, "document_structure_service", structure)
     monkeypatch.setattr(documents, "UPLOAD_DIR", uploads)
+    monkeypatch.setattr(pdf_service, "UPLOAD_DIR", uploads)
+    fput_object = storage.client.fput_object
+
+    def put(bucket, key, filename, **kwargs):
+        if key.startswith("plagiarism/highlights/"):
+            if highlight_upload == "reset":
+                raise ProtocolError("synthetic transport failure", ConnectionResetError())
+            if highlight_upload == "object_missing":
+                return None
+        return fput_object(bucket, key, filename, **kwargs)
+
+    monkeypatch.setattr(storage.client, "fput_object", put)
 
     importer = RepositoryImportService(db, uploads, min_free_bytes=0, structure_service=structure)
     inputs = discover_pdfs(tmp_path / "inbox")
@@ -111,20 +125,69 @@ def test_new_upload_import_check_and_watermark_use_minio(tmp_path, monkeypatch, 
     ))
     target = db.get(Document, accepted["document_id"])
     assert "/student-uploads/" in target.file_path
-    RepositoryCheckService().run_repository_check(
+    result = RepositoryCheckService().run_repository_check(
         document_id=target.id, requester_user_id=student.id, existing_check_id=accepted["check_id"],
         db=db, auto_index_embeddings=False,
     )
     check = db.get(PlagiarismCheck, accepted["check_id"])
     assert check.status == "completed" and check.overall_similarity > 0.99
-    assert "/highlights/" in check.highlighted_file_path
+    assert result["highlighted_pdf_available"] is True
+    history = plagiarism.get_check_history(current_user=student, db=db)
+    assert history[0]["highlighted_pdf_available"] is True
+    assert history[0]["highlighted_pdf_url"] == f"/api/plagiarism/check/{check.id}/download-highlighted"
+    if highlight_upload == "ok":
+        assert "/highlights/" in check.highlighted_file_path
+        assert list(uploads.rglob("*.pdf")) == []
+    else:
+        highlight = Path(check.highlighted_file_path)
+        assert highlight.parent == uploads / "highlighted"
+        assert list(uploads.rglob("*.pdf")) == [highlight]
+        assert list(highlight.parent.iterdir()) == [highlight]
+        with pymupdf.open(highlight) as pdf:
+            assert any(page.first_annot for page in pdf)
+        response = plagiarism.download_highlighted_pdf(check.id, current_user=student, db=db)
+        assert response.path == str(highlight)
     watermark = WatermarkService(uploads)
     watermarked_ref = watermark.get_pdf(alumni.file_path)
     assert "/watermark-cache/" in watermarked_ref
     assert watermark.get_pdf(alumni.file_path) == watermarked_ref
     with storage.materialize(watermarked_ref) as path, pymupdf.open(path) as marked:
         assert len(marked[0].get_images()) == 1
-    assert list(uploads.rglob("*.pdf")) == []
+
+
+def test_repair_preserves_matches_and_restores_download(highlight_context, tmp_path, storage):
+    context = highlight_context
+    body = "Sistem informasi akademik mengelola catatan mahasiswa."
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((72, 180), body)
+        source = tmp_path / "unmarked.pdf"
+        pdf.save(source)
+    context.document.file_path = str(source)
+    context.check.highlighted_file_path = None
+    context.check.completed_at = utc_now()
+    completed_at = context.check.completed_at
+    result = SimilarityResult(check_id=context.check.id, source_document_id=context.document.id, similarity_score=0.2)
+    context.db.add(result)
+    context.db.flush()
+    context.db.add(SimilarityMatch(result_id=result.id, source_text=body, submitted_text=body,
+                                  similarity_score=1.0, page_number=1,
+                                  page_start_position=0, page_end_position=len(body)))
+    context.db.commit()
+
+    service = RepositoryCheckService()
+    assert get_pdf(context, "highlighted-pdf", user=context.owner)[0] == 404
+    assert service.repair_highlighted_pdf(context.check.id, context.db) == "repaired"
+    check = context.check
+    assert check.status == "completed" and check.overall_similarity == 0.2
+    assert check.completed_at == completed_at
+    assert len(check.similarity_results[0].matches) == 1
+    assert plagiarism.get_check_history(current_user=context.owner, db=context.db)[0]["highlighted_pdf_available"]
+    status, _, data = get_pdf(context, "highlighted-pdf", user=context.owner)
+    assert status == 200
+    with pymupdf.open(stream=data, filetype="pdf") as pdf:
+        assert pdf[0].first_annot is not None
+    assert get_pdf(context, "highlighted-pdf", user=context.outsider)[0] == 403
+    assert service.repair_highlighted_pdf(check.id, context.db) == "already_available"
 
 
 def test_remote_highlight_keeps_owner_checks_and_range(highlight_context, storage):
