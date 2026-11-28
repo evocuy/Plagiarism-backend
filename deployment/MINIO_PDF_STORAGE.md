@@ -25,10 +25,12 @@ MINIO_BUCKET=
 `MINIO_ENABLED` memilih tujuan file baru. Referensi file lama dan MinIO dapat
 dibaca selama transisi. Frontend mengakses PDF melalui FastAPI.
 
-Jika PUT atau verifikasi PDF highlight gagal, worker menyimpan hasil render
-di `uploads/highlighted/`. API dan worker memakai volume `uploads` yang sama
-agar PDF tetap tersedia dari Riwayat. Salinan tersebut dapat dimigrasikan
-dengan command migrasi yang sama setelah koneksi MinIO pulih.
+Jika PUT atau verifikasi ke MinIO gagal, API menyimpan PDF unggahan mahasiswa
+yang sudah valid di `uploads/student-uploads/` agar pekerjaan dapat masuk
+antrean. Worker menyimpan PDF highlight yang sudah dirender di
+`uploads/highlighted/` jika penyimpanan MinIO gagal. API dan worker memakai
+volume `uploads` yang sama. Salinan ini bisa dimigrasikan setelah koneksi
+MinIO pulih.
 
 ## Aktifkan versi backend yang mendukung MinIO
 

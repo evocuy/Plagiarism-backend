@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pymupdf
 import pytest
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from minio.error import S3Error
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -16,6 +16,7 @@ from app.database.session import Base
 from app.models.schemas import Document, PlagiarismCheck, SimilarityMatch, SimilarityResult, User, utc_now
 from app.routes import documents, plagiarism
 from app.services import pdf_service, pdf_storage
+from app.services.check_queue_service import CheckQueueService
 from app.services.repository_check_service import RepositoryCheckService
 from app.services.repository_import_files import discover_pdfs
 from app.services.repository_import_service import RepositoryImportService
@@ -188,6 +189,75 @@ def test_repair_preserves_matches_and_restores_download(highlight_context, tmp_p
         assert pdf[0].first_annot is not None
     assert get_pdf(context, "highlighted-pdf", user=context.outsider)[0] == 403
     assert service.repair_highlighted_pdf(check.id, context.db) == "already_available"
+
+
+@pytest.mark.parametrize(("storage_failure", "queue_fails"), [
+    ("reset", False),
+    ("object_missing", False),
+    ("reset", True),
+])
+def test_student_upload_falls_back_and_keeps_queue_consistent(
+    tmp_path, monkeypatch, storage, db, storage_failure, queue_fails,
+):
+    uploads = tmp_path / "uploads"
+    source = make_pdf(tmp_path / "student.pdf")
+    pdf_bytes = source.read_bytes()
+    student = User(identifier="student", password="unused", role="mahasiswa")
+    db.add(student)
+    db.commit()
+    monkeypatch.setattr(documents, "UPLOAD_DIR", uploads)
+    monkeypatch.setattr(documents, "document_structure_service", InlineStructure())
+    upload = UploadFile(BytesIO(pdf_bytes), filename="student.pdf",
+                        headers=Headers({"content-type": "application/pdf"}))
+    real_put = storage.client.fput_object
+
+    def failed_student_put(bucket, key, filename, **kwargs):
+        if key.startswith("plagiarism/student-uploads/"):
+            if storage_failure == "object_missing":
+                return None
+            # The SDK can lose the response after the server has written the object.
+            real_put(bucket, key, filename, **kwargs)
+            raise ProtocolError("synthetic write failure", ConnectionResetError())
+        return real_put(bucket, key, filename, **kwargs)
+
+    monkeypatch.setattr(storage.client, "fput_object", failed_student_put)
+
+    def upload_and_check():
+        return asyncio.run(documents.upload_and_check_document(
+            file=upload, document_type="proposal", user_id=None, candidate_limit=20,
+            auto_index_embeddings=False, auto_index_repository_limit=0, current_user=student, db=db,
+        ))
+
+    if queue_fails:
+        def reject_enqueue(*_args, **_kwargs):
+            raise HTTPException(status_code=409, detail="synthetic queue rejection")
+
+        monkeypatch.setattr(CheckQueueService, "enqueue", reject_enqueue)
+        with pytest.raises(HTTPException) as error:
+            upload_and_check()
+        assert error.value.status_code == 409
+        assert db.query(Document).count() == db.query(PlagiarismCheck).count() == 0
+        assert list(uploads.rglob("*.pdf")) == []
+        assert storage.client.files == {}
+        return
+
+    accepted = upload_and_check()
+    target = db.get(Document, accepted["document_id"])
+    check = db.get(PlagiarismCheck, accepted["check_id"])
+    assert check.status == "pending" and check.document_id == target.id
+    assert target.source_origin == "student" and target.repository_status == "draft"
+    assert target.user_id == student.id == check.user_id
+    local_pdf = Path(target.file_path)
+    assert local_pdf.parent == uploads / "student-uploads"
+    assert local_pdf.read_bytes() == pdf_bytes
+    assert target.content_sha256 == pdf_storage.file_identity(local_pdf)[1]
+    assert storage.client.files == {}
+
+    RepositoryCheckService().run_repository_check(
+        document_id=target.id, requester_user_id=student.id, existing_check_id=check.id,
+        db=db, auto_index_embeddings=False,
+    )
+    assert check.status == "completed" and pdf_storage.pdf_available(check.highlighted_file_path)
 
 
 def test_remote_highlight_keeps_owner_checks_and_range(highlight_context, storage):

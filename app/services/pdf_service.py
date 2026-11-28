@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import re
-import shutil
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -438,25 +437,13 @@ class PDFService:
             self._write_highlighted_pdf(source_pdf_path, plagiarized_sentences, rendered_path)
             size, digest = pdf_storage.file_identity(rendered_path)
             try:
-                storage.upload(reference, rendered_path)
-                if not storage.verify(reference, size, digest):
-                    raise pdf_storage.PDFStorageError(
-                        "Salinan PDF highlight tidak sesuai.", operation="verify_highlight",
-                    )
+                storage.upload_verified(reference, rendered_path, size=size, sha256=digest)
                 return reference
-            except (pdf_storage.PDFStorageError, FileNotFoundError) as exc:
-                detail = exc.diagnostic() if isinstance(exc, pdf_storage.PDFStorageError) else {}
+            except pdf_storage.PDFStorageError as exc:
                 logger.warning("operation=highlight_minio_fallback exception_type=%s storage_detail=%s",
-                               type(exc).__name__, detail)
+                               type(exc).__name__, exc.diagnostic())
 
-            # Stage the copy on the shared volume so publishing it is atomic,
-            # even when the worker renders into a separate tmpfs.
-            highlight_dir.mkdir(parents=True, exist_ok=True)
-            with TemporaryDirectory(prefix=".highlight-copy-", dir=highlight_dir) as directory:
-                staged = Path(directory) / "highlight.pdf"
-                shutil.copyfile(rendered_path, staged)
-                staged.chmod(0o600)
-                staged.replace(local_path)
+            pdf_storage.store_local_pdf(rendered_path, local_path)
         return str(local_path)
 
     def _write_highlighted_pdf(self, source: str, plagiarized_sentences: list, output_path: Path) -> None:

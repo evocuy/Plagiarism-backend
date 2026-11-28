@@ -243,17 +243,33 @@ async def _store_uploaded_document(
         is_alumni_import = source_origin == "alumni" and user_id is None
         if not is_alumni_import:
             repository_status = REPOSITORY_STATUS_DRAFT
+        sha256 = content_digest.hexdigest()
         if use_minio:
             storage = pdf_storage.get_minio_storage()
             prefix = f"repository/{clean_type}" if is_alumni_import else "student-uploads"
             stored_reference = storage.reference(f"{prefix}/{upload_id}.pdf")
-            await run_in_threadpool(storage.upload, stored_reference, file_path)
+            if is_alumni_import:
+                await run_in_threadpool(storage.upload, stored_reference, file_path)
+            else:
+                try:
+                    await run_in_threadpool(storage.upload_verified, stored_reference, file_path,
+                                            size=total_bytes, sha256=sha256)
+                except pdf_storage.PDFStorageError as exc:
+                    logger.warning("operation=student_upload_minio_fallback exception_type=%s storage_detail=%s",
+                                   type(exc).__name__, exc.diagnostic())
+                    minio_reference = stored_reference
+                    local_path = UPLOAD_DIR / "student-uploads" / f"{upload_id}.pdf"
+                    stored_reference = str(local_path)
+                    try:
+                        await run_in_threadpool(pdf_storage.store_local_pdf, file_path, local_path)
+                    finally:
+                        await run_in_threadpool(_delete_managed_upload_file, minio_reference)
         db_doc = Document(
             user_id=user_id,
             title=original_filename,
             document_type=clean_type,
             file_path=stored_reference,
-            content_sha256=content_digest.hexdigest(),
+            content_sha256=sha256,
             source_origin="alumni" if is_alumni_import else "student",
             repository_status=repository_status,
             repository_published_at=(

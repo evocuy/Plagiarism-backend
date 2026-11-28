@@ -110,6 +110,17 @@ def _storage_errors(operation: str):
         raise PDFStorageError("Penyimpanan PDF sementara tidak dapat diakses.", operation=operation) from None
 
 
+def store_local_pdf(source: Path, target: Path) -> None:
+    """Publish a private PDF atomically on the destination volume."""
+    with _storage_errors("store_local_pdf"):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".pdf-copy-", dir=target.parent) as directory:
+            staged = Path(directory) / "document.pdf"
+            shutil.copyfile(source, staged)
+            staged.chmod(0o600)
+            staged.replace(target)
+
+
 def close_object(response) -> None:
     try:
         response.close()
@@ -140,6 +151,15 @@ class MinioPDFStorage:
         with _storage_errors("put_object"):
             self.client.fput_object(self.bucket, key, str(path), content_type="application/pdf",
                                     num_parallel_uploads=1)
+
+    def upload_verified(self, reference: str, path: Path, *, size: int, sha256: str) -> None:
+        try:
+            self.upload(reference, path)
+            verified = self.verify(reference, size, sha256)
+        except FileNotFoundError as exc:
+            raise PDFStorageError("PDF tidak ditemukan setelah diunggah.", operation="verify_object") from exc
+        if not verified:
+            raise PDFStorageError("Salinan PDF tidak sesuai.", operation="verify_object")
 
     def exists(self, reference: str) -> bool:
         key = self.object_key(reference)
